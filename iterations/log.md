@@ -8,4 +8,4 @@ which means the run was usable but didn't clear the vault's WFO acceptance bar.
 
 | # | Date | Idea | Source | Status | OOS Sharpe | Efficiency | Trades | Commit |
 |---|------|------|--------|--------|-----------|------------|--------|--------|
-| 1 | 2026-08-08 | Bollinger Mid-Band Fade (ES 15min, sigma-scaled stop) | wiki:mean-reversion.md | rejected | -2.87 | n/a (IS CAGR negative) | 461 | _pending_ |
+| 1 | 2026-08-08 | Bollinger Mid-Band Fade (ES 15min, sigma-scaled stop) | wiki:mean-reversion.md | rejected | -2.87 | n/a (IS CAGR negative) | 461 | `e4bdbba` |
