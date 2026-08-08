@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol ES --timeframe 1h --session "London" \\
-        --donchian-n 10,20,30 --atr-mult 1.0,1.5,2.0 --train-weeks 8 --test-weeks 2
+        --bb-period 20,30 --bb-std-mult 1.5,2.0 --stop-std-mult 1.0,1.5 --train-weeks 8 --test-weeks 2
 
     # yfinance source, daily bars, no session filter
     python cli.py --source yfinance --symbol NQ=F --timeframe 1d
@@ -62,13 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-from", default=None, help="YYYY-MM-DD, defaults to earliest available")
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
-    strat = p.add_argument_group("strategy grid (Donchian breakout + VWAP filter)")
+    strat = p.add_argument_group("strategy grid (Bollinger Band mean-reversion fade)")
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--atr-period", type=int, default=14, help="fixed, not grid-searched")
-    strat.add_argument("--donchian-n", default="10,20,30,50,80", help="comma-separated lookback bars")
-    strat.add_argument("--atr-mult", default="1.0,1.5,2.0,3.0", help="comma-separated ATR stop multipliers")
-    strat.add_argument("--target-mode", default="channel,atr", help="comma-separated subset of: channel,atr")
+    strat.add_argument("--bb-period", default="20,30,40", help="comma-separated band lookback bars")
+    strat.add_argument("--bb-std-mult", default="1.5,2.0,2.5", help="comma-separated band-width std multipliers")
+    strat.add_argument("--stop-std-mult", default="1.0,1.5,2.0", help="comma-separated stop-distance std multipliers")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -119,10 +118,10 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        donchian_ns = parse_num_list(args.donchian_n, int)
-        atr_mults = parse_num_list(args.atr_mult, float)
-        target_modes = [m.strip() for m in args.target_mode.split(",") if m.strip()]
-        grid = build_grid(donchian_ns, atr_mults, args.atr_period, target_modes or ["channel"], session)
+        bb_periods = parse_num_list(args.bb_period, int)
+        bb_std_mults = parse_num_list(args.bb_std_mult, float)
+        stop_std_mults = parse_num_list(args.stop_std_mult, float)
+        grid = build_grid(bb_periods, bb_std_mults, stop_std_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -163,12 +162,13 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        n_vals = sorted({p["donchian_n"] for p in chosen})
-        k_vals = sorted({p["atr_mult"] for p in chosen})
-        tm_vals = sorted({p["target_mode"] for p in chosen})
+        period_vals = sorted({p["bb_period"] for p in chosen})
+        band_vals = sorted({p["bb_std_mult"] for p in chosen})
+        stop_vals = sorted({p["stop_std_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(n_vals)} distinct Donchian N {n_vals}, "
-            f"{len(k_vals)} distinct ATR mult {k_vals}, target mode split {tm_vals}"
+            f"Fold param stability: {len(period_vals)} distinct BB period {period_vals}, "
+            f"{len(band_vals)} distinct BB std mult {band_vals}, "
+            f"{len(stop_vals)} distinct stop std mult {stop_vals}"
         )
 
     if args.out_dir:
@@ -180,9 +180,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "donchian_n": f.best_params.get("donchian_n"),
-                "atr_mult": f.best_params.get("atr_mult"),
-                "target_mode": f.best_params.get("target_mode"),
+                "bb_period": f.best_params.get("bb_period"),
+                "bb_std_mult": f.best_params.get("bb_std_mult"),
+                "stop_std_mult": f.best_params.get("stop_std_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }

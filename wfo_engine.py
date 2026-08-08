@@ -34,15 +34,14 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(donchian_ns, atr_mults, atr_period, target_modes, session) -> list[dict]:
+def build_grid(bb_periods, bb_std_mults, stop_std_mults, session) -> list[dict]:
     grid = []
-    for n, k, tm in product(donchian_ns, atr_mults, target_modes):
+    for period, band_mult, stop_mult in product(bb_periods, bb_std_mults, stop_std_mults):
         grid.append(
             {
-                "donchian_n": int(n),
-                "atr_mult": float(k),
-                "atr_period": int(atr_period),
-                "target_mode": tm,
+                "bb_period": int(period),
+                "bb_std_mult": float(band_mult),
+                "stop_std_mult": float(stop_mult),
                 "session": session,
             }
         )
