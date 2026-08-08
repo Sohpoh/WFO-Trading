@@ -1,0 +1,15 @@
+# Local futures data — large (hundreds of MB), never belongs in git.
+Data/
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# Per-run WFO output: comparison.csv and fold_table.csv are small and committed
+# deliberately (they're what the iteration log points back to), but trade-level
+# and equity-curve CSVs are bulky and regeneratable from a committed strategy.py
+# at the logged commit, so they're excluded to keep the repo from ballooning
+# across dozens of iterations.
+results/*/oos_trades.csv
+results/*/insample_trades.csv
+results/*/equity_curves.csv
