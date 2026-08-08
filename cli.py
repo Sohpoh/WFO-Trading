@@ -11,7 +11,8 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol ES --timeframe 1h --session "London" \\
-        --bb-period 20,30 --bb-std-mult 1.5,2.0 --stop-std-mult 1.0,1.5 --train-weeks 8 --test-weeks 2
+        --mom-lookback 8,12 --thrust-mult 1.75,2.25 --stop-atr-mult 1.0,1.5 \\
+        --target-atr-mult 2.5,3.5 --train-weeks 24 --test-weeks 6
 
     # yfinance source, daily bars, no session filter
     python cli.py --source yfinance --symbol NQ=F --timeframe 1d
@@ -62,12 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-from", default=None, help="YYYY-MM-DD, defaults to earliest available")
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
-    strat = p.add_argument_group("strategy grid (Bollinger Band mean-reversion fade)")
+    strat = p.add_argument_group("strategy grid (ATR-normalized momentum thrust)")
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--bb-period", default="20,30,40", help="comma-separated band lookback bars")
-    strat.add_argument("--bb-std-mult", default="1.5,2.0,2.5", help="comma-separated band-width std multipliers")
-    strat.add_argument("--stop-std-mult", default="1.0,1.5,2.0", help="comma-separated stop-distance std multipliers")
+    strat.add_argument("--mom-lookback", default="6,8,12,16",
+                        help="comma-separated momentum/ATR lookback bars (one window, matched horizons)")
+    strat.add_argument("--thrust-mult", default="1.25,1.75,2.25",
+                        help="comma-separated thrust z-score thresholds to cross for an entry")
+    strat.add_argument("--stop-atr-mult", default="1.0,1.5,2.0", help="comma-separated stop-distance ATR multipliers")
+    strat.add_argument("--target-atr-mult", default="1.5,2.5,3.5", help="comma-separated target-distance ATR multipliers")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -118,10 +122,11 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        bb_periods = parse_num_list(args.bb_period, int)
-        bb_std_mults = parse_num_list(args.bb_std_mult, float)
-        stop_std_mults = parse_num_list(args.stop_std_mult, float)
-        grid = build_grid(bb_periods, bb_std_mults, stop_std_mults, session)
+        mom_lookbacks = parse_num_list(args.mom_lookback, int)
+        thrust_mults = parse_num_list(args.thrust_mult, float)
+        stop_atr_mults = parse_num_list(args.stop_atr_mult, float)
+        target_atr_mults = parse_num_list(args.target_atr_mult, float)
+        grid = build_grid(mom_lookbacks, thrust_mults, stop_atr_mults, target_atr_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -162,13 +167,15 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        period_vals = sorted({p["bb_period"] for p in chosen})
-        band_vals = sorted({p["bb_std_mult"] for p in chosen})
-        stop_vals = sorted({p["stop_std_mult"] for p in chosen})
+        lookback_vals = sorted({p["mom_lookback"] for p in chosen})
+        thrust_vals = sorted({p["thrust_mult"] for p in chosen})
+        stop_vals = sorted({p["stop_atr_mult"] for p in chosen})
+        target_vals = sorted({p["target_atr_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(period_vals)} distinct BB period {period_vals}, "
-            f"{len(band_vals)} distinct BB std mult {band_vals}, "
-            f"{len(stop_vals)} distinct stop std mult {stop_vals}"
+            f"Fold param stability: {len(lookback_vals)} distinct mom lookback {lookback_vals}, "
+            f"{len(thrust_vals)} distinct thrust mult {thrust_vals}, "
+            f"{len(stop_vals)} distinct stop ATR mult {stop_vals}, "
+            f"{len(target_vals)} distinct target ATR mult {target_vals}"
         )
 
     if args.out_dir:
@@ -180,9 +187,10 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "bb_period": f.best_params.get("bb_period"),
-                "bb_std_mult": f.best_params.get("bb_std_mult"),
-                "stop_std_mult": f.best_params.get("stop_std_mult"),
+                "mom_lookback": f.best_params.get("mom_lookback"),
+                "thrust_mult": f.best_params.get("thrust_mult"),
+                "stop_atr_mult": f.best_params.get("stop_atr_mult"),
+                "target_atr_mult": f.best_params.get("target_atr_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }
