@@ -34,23 +34,31 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session) -> list[dict]:
+def build_grid(atr_period, breakout_atr_buffers, stop_atr_mults, target_rs, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    `band_lookback` is cast to a plain int on purpose: it's a genuine bar-count
-    lookback (it windows both the Bollinger mid-band and its sigma), so it
-    *should* feed `_max_lookback_bars()`'s warm-up buffer. `entry_z` and
-    `stop_sigma_mult` are cast to float for the same reason in reverse — they're
-    sigma multiples, not bar counts, and must never inflate that buffer.
+    `atr_period` is fixed (not searched) and cast to a plain int on purpose:
+    it's a genuine bar-count lookback (the True Range averaging window), so it
+    *should* feed `_max_lookback_bars()`'s warm-up buffer. The three searched
+    params are cast to float for the same reason in reverse — they're ATR
+    multiples and an R-multiple, not bar counts, and must never inflate that
+    buffer (a `target_r` of 3 buffering 3 extra bars would be meaningless).
+
+    Note the strategy's day-anchored range has no bar-count param at all — its
+    lookback is "since the start of the UTC day". That's covered generically by
+    `run_walk_forward`'s existing `day_bars + 5` floor on the warm-up buffer
+    (see `_bars_per_day`), which is why no param here encodes it.
+
     `session` is fixed, never searched.
     """
     grid = []
-    for lookback, entry_z, stop_mult in product(band_lookbacks, entry_zs, stop_sigma_mults):
+    for buffer_mult, stop_mult, target_r in product(breakout_atr_buffers, stop_atr_mults, target_rs):
         grid.append(
             {
-                "band_lookback": int(lookback),
-                "entry_z": float(entry_z),
-                "stop_sigma_mult": float(stop_mult),
+                "atr_period": int(atr_period),
+                "breakout_atr_buffer": float(buffer_mult),
+                "stop_atr_mult": float(stop_mult),
+                "target_r": float(target_r),
                 "session": session,
             }
         )
