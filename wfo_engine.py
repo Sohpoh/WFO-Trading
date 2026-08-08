@@ -34,25 +34,23 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(mom_lookbacks, thrust_mults, stop_atr_mults, target_atr_mults, session) -> list[dict]:
+def build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    `mom_lookback` is cast to a plain int on purpose: it's a genuine bar-count
-    lookback (it windows both the momentum return and the ATR), so it *should*
-    feed `_max_lookback_bars()`'s warm-up buffer. The three multipliers are cast
-    to float for the same reason in reverse — they're not bar counts and must
-    never inflate that buffer. `session` is fixed, never searched.
+    `band_lookback` is cast to a plain int on purpose: it's a genuine bar-count
+    lookback (it windows both the Bollinger mid-band and its sigma), so it
+    *should* feed `_max_lookback_bars()`'s warm-up buffer. `entry_z` and
+    `stop_sigma_mult` are cast to float for the same reason in reverse — they're
+    sigma multiples, not bar counts, and must never inflate that buffer.
+    `session` is fixed, never searched.
     """
     grid = []
-    for lookback, thrust_mult, stop_mult, target_mult in product(
-        mom_lookbacks, thrust_mults, stop_atr_mults, target_atr_mults
-    ):
+    for lookback, entry_z, stop_mult in product(band_lookbacks, entry_zs, stop_sigma_mults):
         grid.append(
             {
-                "mom_lookback": int(lookback),
-                "thrust_mult": float(thrust_mult),
-                "stop_atr_mult": float(stop_mult),
-                "target_atr_mult": float(target_mult),
+                "band_lookback": int(lookback),
+                "entry_z": float(entry_z),
+                "stop_sigma_mult": float(stop_mult),
                 "session": session,
             }
         )

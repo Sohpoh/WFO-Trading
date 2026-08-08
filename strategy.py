@@ -1,47 +1,57 @@
-"""ATR-normalized momentum thrust, with ATR-scaled stop and target.
+"""Bollinger mid-band fade, with a sigma-scaled stop and the mid-band as target.
 
-Rules (see momentum-formulas.md eq. 269's risk-adjusted momentum
-R_risk_adj = R_mean / sigma, applied time-series style to one instrument):
+Rules (mean-reversion.md, "Simple Mean Reversion Strategies": *enter a short
+when price touches the upper band, expecting reversion to the middle; exit at
+the middle or the opposite band; reverse for longs at the lower band*):
 
-  - thrust = (Close - Close.shift(n)) / (ATR(n) * sqrt(n)), where
-    n = `mom_lookback`. The n-bar return is divided by how big this market
-    normally moves over one bar, and the sqrt(n) rescales that to a
-    sigma-comparable z-score so `thrust_mult` means the same selectivity at
-    every lookback — the grid can't win a fold on a pure scaling artifact.
-  - Entry is a CROSSING, not a level: LONG when thrust crosses up through
-    +thrust_mult, SHORT when it crosses down through -thrust_mult. This
-    matters because `session.apply_session_constraint_with_stops()` skips
-    same-bar re-entry after a stop (`continue`) but re-evaluates on the very
-    next bar — a persistent level condition (`thrust >= mult`) would re-open
-    the same failing move bar after bar, while a crossing gives exactly one
-    entry per excursion. Zero-param structural guard, same spirit as the
-    prior strategy's hardcoded trend guard.
+  - mean = Close.rolling(band_lookback).mean(),
+    sigma = Close.rolling(band_lookback).std(),
+    z = (Close - mean) / sigma. Non-positive/degenerate sigma is dropped to
+    NaN so it can never produce an infinite z or a zero-width stop.
+  - Entry is a CROSSING of the band, not a level: LONG when z crosses *down*
+    through -entry_z (z <= -entry_z with the prior bar above it, i.e. the bar
+    price pushes through the lower band), SHORT when z crosses *up* through
+    +entry_z (upper band). This matters because
+    `session.apply_session_constraint_with_stops()` skips same-bar re-entry
+    after a stop (`continue`) but re-evaluates on the very next bar — a
+    persistent level condition (`z <= -entry_z`) would re-open the same
+    losing fade bar after bar all the way down a trend, which is exactly the
+    high-turnover-fade failure the prior strategies were built to avoid. A
+    crossing gives exactly one entry per excursion. Zero-param structural
+    guard.
   - No flip on an opposite signal: the walk only opens when flat, so an
-    opposing thrust while in a trade is a no-op.
+    opposing band touch while in a trade is a no-op.
   - Exits are path-dependent and owned entirely by session.py's walk:
-    a stop `stop_atr_mult * ATR(n)` from the entry Close, a target
-    `target_atr_mult * ATR(n)` beyond the entry Close (direction-resolved
-    here, since the walk validates that a long's target sits above and a
-    short's below that bar's Close), and the forced flatten on the session's
-    last bar.
+    a stop `stop_sigma_mult * sigma` from the entry Close, a target at the
+    mid-band (`mean`) as of the entry bar, and the forced flatten on the
+    session's last bar.
 
-Design intent: few, selective entries with a move-to-cost ratio well above
-1 — on NQ 1h, ATR is roughly 0.35% of price, so a 2.5-ATR target is ~0.9%
-gross against `metrics.py`'s ~0.10% round trip. This is deliberately the
-opposite trade profile from a high-turnover fade, which dies of costs.
+Why the target needs no direction-resolution: a long can only fire when
+z <= -entry_z < 0, so mean - Close = -z * sigma >= entry_z * sigma > 0 and
+the mid-band necessarily sits *above* that bar's Close; symmetrically a short
+only fires with the mid-band below it. So passing `mean` straight through as
+`target_price` satisfies the walk's side-validity check on both sides without
+a `.where()` split (unlike the prior ATR strategy, whose symmetric
+`close +/- k*ATR` target genuinely needed one).
 
-ATR is a simple rolling mean of the standard true range
-TR = max(H-L, |H-C_prev|, |L-C_prev|) over the same n as the momentum
-lookback (matched horizons — deliberately not Wilder smoothing, whose
-effective lookback is ~2n-1 and would break both the matched horizon and
-the sqrt(n) z-score scaling). It is deliberately NOT shifted by one bar:
-the numerator already uses the current Close and the entry fills at that
-same Close, so including the current bar's true range is not look-ahead.
-Don't "fix" it to `.shift(1)`.
+Both the entry threshold and the stop are quoted in the *same* rolling-sigma
+units — deliberately not ATR — so the stop:target ratio does not silently
+rescale as `band_lookback` changes and the grid cannot win a fold on a pure
+scaling artifact.
 
-Like this codebase's prior strategies, ATR and thrust are computed on the
-full continuous-Globex df rather than session-scoped, so an early-session
-signal's lookback can reach back into the prior evening's bars. Intentional.
+Design intent: a low-turnover fade with a move-to-cost ratio well above 1. A
+2.0-3.0 sigma entry puts the mid-band target roughly 0.3-0.5% away on ES
+15min against `metrics.py`'s ~0.102% round trip — a 3-5x ratio, versus
+transaction-costs.md's warning that a 5bp edge dies on 4bp of costs.
+
+sigma/mean are deliberately NOT shifted by one bar: the numerator already
+uses the current Close and the entry fills at that same Close, so including
+the current bar in the rolling window is not look-ahead. Don't "fix" it to
+`.shift(1)`.
+
+Like this codebase's prior strategies, the bands are computed on the full
+continuous-Globex df rather than session-scoped, so an early-session signal's
+lookback can reach back into the prior evening's bars. Intentional.
 
 This module only decides *when the strategy wants to enter and where its
 stop/target sit*; it has no session awareness of its own. See
@@ -55,65 +65,50 @@ a stop does not cap the realized loss on the triggering bar — see
 `apply_session_constraint_with_stops()` for details before describing
 results as risk-capped.
 """
-import numpy as np
 import pandas as pd
 
 from session import apply_session_constraint_with_stops
 
 
-def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
-    """Simple rolling mean of the standard true range over `period` bars.
+def compute_bands(df: pd.DataFrame, band_lookback: int) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """(z-score, mid-band, sigma) for the given rolling Bollinger lookback.
 
     Includes the current bar (see module docstring: not look-ahead, since
-    entries fill at that bar's Close). Non-positive/degenerate values are
-    dropped to NaN so they can never produce an infinite thrust.
+    entries fill at that bar's Close). sigma is masked to NaN where it is
+    non-positive or still warming up, which propagates into both `z` (no
+    signal) and the stop distance (`stop_ok` False in the walk) from one
+    place.
     """
-    prev_close = df["Close"].shift(1)
-    tr = pd.concat(
-        [
-            df["High"] - df["Low"],
-            (df["High"] - prev_close).abs(),
-            (df["Low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(period, min_periods=period).mean()
-    return atr.where(atr > 0)
-
-
-def compute_thrust(df: pd.DataFrame, mom_lookback: int) -> tuple[pd.Series, pd.Series]:
-    """(thrust z-score, ATR) for the given lookback."""
-    atr = compute_atr(df, mom_lookback)
-    momentum = df["Close"] - df["Close"].shift(mom_lookback)
-    thrust = momentum / (atr * np.sqrt(mom_lookback))
-    return thrust, atr
+    close = df["Close"]
+    mean = close.rolling(band_lookback, min_periods=band_lookback).mean()
+    sigma = close.rolling(band_lookback, min_periods=band_lookback).std()
+    sigma = sigma.where(sigma > 0)
+    z = (close - mean) / sigma
+    return z, mean, sigma
 
 
 def generate_positions(
     df: pd.DataFrame,
-    mom_lookback: int,
-    thrust_mult: float,
-    stop_atr_mult: float,
-    target_atr_mult: float,
+    band_lookback: int,
+    entry_z: float,
+    stop_sigma_mult: float,
     session: str | None = "New York",
 ) -> pd.Series:
     close = df["Close"]
-    thrust, atr = compute_thrust(df, mom_lookback)
-    prior = thrust.shift(1)
+    z, mean, sigma = compute_bands(df, band_lookback)
+    prior = z.shift(1)
 
     # Crossing, not level — one entry per excursion (see module docstring).
-    long_signal = ((thrust >= thrust_mult) & (prior < thrust_mult)).fillna(False)
-    short_signal = ((thrust <= -thrust_mult) & (prior > -thrust_mult)).fillna(False)
+    # Long fades the lower band, short fades the upper band.
+    long_signal = ((z <= -entry_z) & (prior > -entry_z)).fillna(False)
+    short_signal = ((z >= entry_z) & (prior < entry_z)).fillna(False)
 
-    stop_distance = stop_atr_mult * atr
+    stop_distance = stop_sigma_mult * sigma
 
-    # Absolute, direction-resolved target: strictly beyond the entry Close on
-    # the correct side, so the walk's target-side validity check passes for
-    # both longs and shorts (a single unconditional `close + k*atr` series
-    # would silently reject every short).
-    long_target = close + target_atr_mult * atr
-    short_target = close - target_atr_mult * atr
-    target_price = long_target.where(long_signal, short_target.where(short_signal))
+    # The mid-band is the target for both sides and is direction-correct by
+    # construction (mean > Close on every long signal, mean < Close on every
+    # short), so it needs no per-side resolution here.
+    target_price = mean
 
     return apply_session_constraint_with_stops(
         close=close,
@@ -128,9 +123,8 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    "mom_lookback": 8,
-    "thrust_mult": 1.75,
-    "stop_atr_mult": 1.5,
-    "target_atr_mult": 2.5,
+    "band_lookback": 30,
+    "entry_z": 2.5,
+    "stop_sigma_mult": 1.5,
     "session": "New York",
 }
