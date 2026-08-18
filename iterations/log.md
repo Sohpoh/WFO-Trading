@@ -13,4 +13,4 @@ which means the run was usable but didn't clear the vault's WFO acceptance bar.
 | 3 | 2026-08-18 | Overnight Gap Fade with MA-Reclaim Confirmation (NQ 15min, target = prior-day anchor) | invented_variation_of:strategy-development.md | rejected | -1.52 | n/a (IS CAGR negative) | 358 | `2497ee9` |
 | 4 | 2026-08-18 | Multi-Day Range Breakout, Flip Exit (NQ 15min, no stop/target) | invented_variation_of:overnight_range_breakout\|day_anchored_range_atr_stop_r_target | error | n/a | n/a | n/a | `ad0b3ca` |
 | 5 | 2026-08-18 | Rolling N-Bar Range Breakout, Flip Exit (NQ 15min, no stops) | invented_variation_of:overnight_range_breakout\|day_anchored_range_atr_stop_r_target | rejected | 0.32 | 0.4845 | 285 | `9df5124` |
-| 6 | 2026-08-18 | Rolling Range Breakout + Volatility-Regime Gate (NQ 15min, zero-param ATR-ratio filter) | invented_variation_of:volatility.md | accepted | 0.86 | 1.5355 | 183 | `pending` |
+| 6 | 2026-08-18 | Rolling Range Breakout + Volatility-Regime Gate (NQ 15min, zero-param ATR-ratio filter) | invented_variation_of:volatility.md | accepted | 0.86 | 1.5355 | 183 | `2ca6297` |
