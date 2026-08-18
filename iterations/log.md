@@ -11,4 +11,4 @@ which means the run was usable but didn't clear the vault's WFO acceptance bar.
 | 1 | 2026-08-08 | Bollinger Mid-Band Fade (ES 15min, sigma-scaled stop) | wiki:mean-reversion.md | rejected | -2.87 | n/a (IS CAGR negative) | 461 | `e4bdbba` |
 | 2 | 2026-08-08 | Overnight-Range Breakout (NQ 15min, day-anchored range, ATR stop, R-multiple target) | invented_variation_of:es-futures.md / nq-futures.md | rejected | -1.25 | n/a (IS CAGR negative) | 810 | `f948984` |
 | 3 | 2026-08-18 | Overnight Gap Fade with MA-Reclaim Confirmation (NQ 15min, target = prior-day anchor) | invented_variation_of:strategy-development.md | rejected | -1.52 | n/a (IS CAGR negative) | 358 | `2497ee9` |
-| 4 | 2026-08-18 | Multi-Day Range Breakout, Flip Exit (NQ 15min, no stop/target) | invented_variation_of:overnight_range_breakout\|day_anchored_range_atr_stop_r_target | error | n/a | n/a | n/a | (pending) |
+| 4 | 2026-08-18 | Multi-Day Range Breakout, Flip Exit (NQ 15min, no stop/target) | invented_variation_of:overnight_range_breakout\|day_anchored_range_atr_stop_r_target | error | n/a | n/a | n/a | `ad0b3ca` |
