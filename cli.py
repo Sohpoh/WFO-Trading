@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --min-gap-pct 0.0035,0.005 --stop-gap-frac 0.5,0.75 --confirm-ma 5,10 \\
+        --range-lookback 24,48 --buffer-frac 0.0,0.05 \\
         --train-weeks 24 --test-weeks 8
 
     # yfinance source, daily bars, no session filter
@@ -63,17 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-from", default=None, help="YYYY-MM-DD, defaults to earliest available")
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
-    strat = p.add_argument_group("strategy grid (overnight gap fade, MA-reclaim confirmed)")
+    strat = p.add_argument_group("strategy grid (rolling N-bar range breakout, flip exit)")
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--min-gap-pct", default="0.0035,0.005,0.007,0.010",
-                        help="comma-separated minimum displacement from the prior-day close, as a fraction "
-                             "(0.005 = 0.5%%), before a fade qualifies")
-    strat.add_argument("--stop-gap-frac", default="0.5,0.75,1.0,1.5",
-                        help="comma-separated stop distances as a fraction of that trade's reward leg "
-                             "(distance to the anchor) — realized R:R is 1/this")
-    strat.add_argument("--confirm-ma", default="5,10,20",
-                        help="comma-separated moving-average windows in bars that price must reclaim to confirm the turn")
+    strat.add_argument("--range-lookback", default="24,48,96,192",
+                        help="comma-separated breakout channel lengths in bars (rolling high/low window, "
+                             "shifted one bar so the current bar can't define its own level)")
+    strat.add_argument("--buffer-frac", default="0.0,0.05,0.10,0.15",
+                        help="comma-separated breakout buffers as a fraction of the channel width "
+                             "(0 = plain touch of the level)")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -124,10 +122,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        min_gap_pcts = parse_num_list(args.min_gap_pct, float)
-        stop_gap_fracs = parse_num_list(args.stop_gap_frac, float)
-        confirm_mas = parse_num_list(args.confirm_ma, int)
-        grid = build_grid(min_gap_pcts, stop_gap_fracs, confirm_mas, session)
+        range_lookbacks = parse_num_list(args.range_lookback, int)
+        buffer_fracs = parse_num_list(args.buffer_frac, float)
+        grid = build_grid(range_lookbacks, buffer_fracs, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -168,13 +165,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        gap_vals = sorted({p["min_gap_pct"] for p in chosen})
-        stop_vals = sorted({p["stop_gap_frac"] for p in chosen})
-        ma_vals = sorted({p["confirm_ma"] for p in chosen})
+        lookback_vals = sorted({p["range_lookback"] for p in chosen})
+        buffer_vals = sorted({p["buffer_frac"] for p in chosen})
         print(
-            f"Fold param stability: {len(gap_vals)} distinct min gap pct {gap_vals}, "
-            f"{len(stop_vals)} distinct stop gap frac {stop_vals}, "
-            f"{len(ma_vals)} distinct confirm MA {ma_vals}"
+            f"Fold param stability: {len(lookback_vals)} distinct range lookback {lookback_vals}, "
+            f"{len(buffer_vals)} distinct buffer frac {buffer_vals}"
         )
 
     if args.out_dir:
@@ -186,9 +181,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "min_gap_pct": f.best_params.get("min_gap_pct"),
-                "stop_gap_frac": f.best_params.get("stop_gap_frac"),
-                "confirm_ma": f.best_params.get("confirm_ma"),
+                "range_lookback": f.best_params.get("range_lookback"),
+                "buffer_frac": f.best_params.get("buffer_frac"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }

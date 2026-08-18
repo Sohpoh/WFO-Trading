@@ -34,33 +34,25 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(min_gap_pcts, stop_gap_fracs, confirm_mas, session) -> list[dict]:
+def build_grid(range_lookbacks, buffer_fracs, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    All three params are searched. `confirm_ma` is cast to a plain int on
-    purpose: it's a genuine bar-count lookback (the confirmation moving
-    average's window), so it *should* feed `_max_lookback_bars()`'s warm-up
-    buffer. `min_gap_pct` and `stop_gap_frac` are cast to float for the same
-    reason in reverse — they're a percentage threshold and a fraction of the
-    reward leg, not bar counts, and must never inflate that buffer (a
-    `stop_gap_frac` of 1.0 arriving as an int and buffering an extra bar would
-    be meaningless, and a whole-number one would be actively misleading).
-
-    Note the strategy's day-anchored reference (the prior UTC day's close) has
-    no bar-count param at all — its lookback is "back across the UTC day
-    boundary". That's covered generically by `run_walk_forward`'s existing
-    `day_bars + 5` floor on the warm-up buffer (see `_bars_per_day`), which is
-    why no param here encodes it.
+    Both params are searched. `range_lookback` is cast to a plain int on
+    purpose: it's a genuine bar-count lookback (the breakout channel's rolling
+    window), so it *should* feed `_max_lookback_bars()`'s warm-up buffer.
+    `buffer_frac` is cast to float for the same reason in reverse — it's a
+    fraction of the channel width, not a bar count, and must never inflate
+    that buffer (a `buffer_frac` of 1.0 arriving as an int and buying an extra
+    bar of warm-up would be meaningless).
 
     `session` is fixed, never searched.
     """
     grid = []
-    for min_gap, stop_frac, ma_len in product(min_gap_pcts, stop_gap_fracs, confirm_mas):
+    for lookback, buf in product(range_lookbacks, buffer_fracs):
         grid.append(
             {
-                "min_gap_pct": float(min_gap),
-                "stop_gap_frac": float(stop_frac),
-                "confirm_ma": int(ma_len),
+                "range_lookback": int(lookback),
+                "buffer_frac": float(buf),
                 "session": session,
             }
         )
