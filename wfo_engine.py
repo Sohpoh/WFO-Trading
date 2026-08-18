@@ -34,31 +34,33 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(atr_period, breakout_atr_buffers, stop_atr_mults, target_rs, session) -> list[dict]:
+def build_grid(min_gap_pcts, stop_gap_fracs, confirm_mas, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    `atr_period` is fixed (not searched) and cast to a plain int on purpose:
-    it's a genuine bar-count lookback (the True Range averaging window), so it
-    *should* feed `_max_lookback_bars()`'s warm-up buffer. The three searched
-    params are cast to float for the same reason in reverse — they're ATR
-    multiples and an R-multiple, not bar counts, and must never inflate that
-    buffer (a `target_r` of 3 buffering 3 extra bars would be meaningless).
+    All three params are searched. `confirm_ma` is cast to a plain int on
+    purpose: it's a genuine bar-count lookback (the confirmation moving
+    average's window), so it *should* feed `_max_lookback_bars()`'s warm-up
+    buffer. `min_gap_pct` and `stop_gap_frac` are cast to float for the same
+    reason in reverse — they're a percentage threshold and a fraction of the
+    reward leg, not bar counts, and must never inflate that buffer (a
+    `stop_gap_frac` of 1.0 arriving as an int and buffering an extra bar would
+    be meaningless, and a whole-number one would be actively misleading).
 
-    Note the strategy's day-anchored range has no bar-count param at all — its
-    lookback is "since the start of the UTC day". That's covered generically by
-    `run_walk_forward`'s existing `day_bars + 5` floor on the warm-up buffer
-    (see `_bars_per_day`), which is why no param here encodes it.
+    Note the strategy's day-anchored reference (the prior UTC day's close) has
+    no bar-count param at all — its lookback is "back across the UTC day
+    boundary". That's covered generically by `run_walk_forward`'s existing
+    `day_bars + 5` floor on the warm-up buffer (see `_bars_per_day`), which is
+    why no param here encodes it.
 
     `session` is fixed, never searched.
     """
     grid = []
-    for buffer_mult, stop_mult, target_r in product(breakout_atr_buffers, stop_atr_mults, target_rs):
+    for min_gap, stop_frac, ma_len in product(min_gap_pcts, stop_gap_fracs, confirm_mas):
         grid.append(
             {
-                "atr_period": int(atr_period),
-                "breakout_atr_buffer": float(buffer_mult),
-                "stop_atr_mult": float(stop_mult),
-                "target_r": float(target_r),
+                "min_gap_pct": float(min_gap),
+                "stop_gap_frac": float(stop_frac),
+                "confirm_ma": int(ma_len),
                 "session": session,
             }
         )
