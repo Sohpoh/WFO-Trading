@@ -64,8 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (rolling N-bar range breakout + vol-regime gate + variance-ratio "
-        "persistence gate, flip exit)"
+        "strategy grid (rolling N-bar range breakout + vol-regime gate, failed-breakout "
+        "stop at half the channel width, no target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -74,10 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "shifted one bar so the current bar can't define its own level)")
     strat.add_argument("--buffer-frac", default="0.0,0.05,0.10,0.15",
                         help="comma-separated breakout buffers as a fraction of the channel width "
-                             "(0 = plain touch of the level). Restored byte-identical to the last "
-                             "accepted iteration's grid: the widened 0.15-0.35 variant was tested "
-                             "and failed, so this is the control against which the new hardcoded "
-                             "variance-ratio persistence gate is the only moving part")
+                             "(0 = plain touch of the level). Byte-identical to the last accepted "
+                             "iteration's grid, as is --range-lookback, so that the new "
+                             "failed-breakout stop (hardcoded at strategy.STOP_WIDTH_FRAC = 0.5 "
+                             "channel widths, deliberately not grid-searched) is the only moving "
+                             "part this iteration")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
