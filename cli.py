@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --mom-lookback 24,48 --entry-t 1.0,1.5 \\
+        --range-lookback 24,48 --buffer-frac 0.15,0.25 \\
         --train-weeks 24 --test-weeks 8
 
     # yfinance source, daily bars, no session filter
@@ -63,15 +63,17 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-from", default=None, help="YYYY-MM-DD, defaults to earliest available")
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
-    strat = p.add_argument_group("strategy grid (vol-normalized drift momentum, flip exit)")
+    strat = p.add_argument_group("strategy grid (rolling N-bar range breakout + vol-regime gate, flip exit)")
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--mom-lookback", default="24,48,96,192",
-                        help="comma-separated momentum lookbacks in bars (window for the mean/std of log "
-                             "returns behind the drift t-stat)")
-    strat.add_argument("--entry-t", default="0.5,1.0,1.5,2.0",
-                        help="comma-separated entry thresholds on the drift t-stat, in units of its own "
-                             "volatility (long at >= +t, short at <= -t)")
+    strat.add_argument("--range-lookback", default="24,48,96,192",
+                        help="comma-separated breakout channel lengths in bars (rolling high/low window, "
+                             "shifted one bar so the current bar can't define its own level)")
+    strat.add_argument("--buffer-frac", default="0.15,0.20,0.25,0.35",
+                        help="comma-separated breakout buffers as a fraction of the channel width "
+                             "(0 = plain touch of the level). Default grid opens territory above the "
+                             "previous 0.15 ceiling, which the optimizer pinned to in 31/65 folds; "
+                             "0.15 is retained as the control anchor")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -122,9 +124,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        mom_lookbacks = parse_num_list(args.mom_lookback, int)
-        entry_ts = parse_num_list(args.entry_t, float)
-        grid = build_grid(mom_lookbacks, entry_ts, session)
+        range_lookbacks = parse_num_list(args.range_lookback, int)
+        buffer_fracs = parse_num_list(args.buffer_frac, float)
+        grid = build_grid(range_lookbacks, buffer_fracs, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -165,11 +167,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        lookback_vals = sorted({p["mom_lookback"] for p in chosen})
-        entry_t_vals = sorted({p["entry_t"] for p in chosen})
+        lookback_vals = sorted({p["range_lookback"] for p in chosen})
+        buffer_vals = sorted({p["buffer_frac"] for p in chosen})
         print(
-            f"Fold param stability: {len(lookback_vals)} distinct mom lookback {lookback_vals}, "
-            f"{len(entry_t_vals)} distinct entry t {entry_t_vals}"
+            f"Fold param stability: {len(lookback_vals)} distinct range lookback {lookback_vals}, "
+            f"{len(buffer_vals)} distinct buffer frac {buffer_vals}"
         )
 
     if args.out_dir:
@@ -181,8 +183,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "mom_lookback": f.best_params.get("mom_lookback"),
-                "entry_t": f.best_params.get("entry_t"),
+                "range_lookback": f.best_params.get("range_lookback"),
+                "buffer_frac": f.best_params.get("buffer_frac"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }

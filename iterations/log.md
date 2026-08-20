@@ -15,3 +15,4 @@ which means the run was usable but didn't clear the vault's WFO acceptance bar.
 | 5 | 2026-08-18 | Rolling N-Bar Range Breakout, Flip Exit (NQ 15min, no stops) | invented_variation_of:overnight_range_breakout\|day_anchored_range_atr_stop_r_target | rejected | 0.32 | 0.4845 | 285 | `9df5124` |
 | 6 | 2026-08-18 | Rolling Range Breakout + Volatility-Regime Gate (NQ 15min, zero-param ATR-ratio filter) | invented_variation_of:volatility.md | accepted | 0.86 | 1.5355 | 183 | `2ca6297` |
 | 7 | 2026-08-20 | Vol-Normalized Intraday Drift Momentum (NQ 15min, t-stat entry, flip exit, iter-6 vol gate retained) | invented_variation_of:momentum-formulas.md | rejected | -0.30 | -2.5687 | 235 | `7e2200b` |
+| 8 | 2026-08-20 | Rolling Range Breakout + Vol-Regime Gate, Wide-Buffer Grid (NQ 15min, buffer_frac pushed above the old 0.15 ceiling) | invented_variation_of:overnight_range_breakout\|flip_exit_vol_regime_gate_atr_ratio | rejected | 0.40 | 0.6348 | 100 | PENDING |
