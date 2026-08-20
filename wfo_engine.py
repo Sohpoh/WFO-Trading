@@ -34,25 +34,25 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(range_lookbacks, buffer_fracs, session) -> list[dict]:
+def build_grid(mom_lookbacks, entry_ts, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Both params are searched. `range_lookback` is cast to a plain int on
-    purpose: it's a genuine bar-count lookback (the breakout channel's rolling
-    window), so it *should* feed `_max_lookback_bars()`'s warm-up buffer.
-    `buffer_frac` is cast to float for the same reason in reverse — it's a
-    fraction of the channel width, not a bar count, and must never inflate
-    that buffer (a `buffer_frac` of 1.0 arriving as an int and buying an extra
-    bar of warm-up would be meaningless).
+    Both params are searched. `mom_lookback` is cast to a plain int on
+    purpose: it's a genuine bar-count lookback (the rolling window the drift
+    t-stat's mean/std are computed over), so it *should* feed
+    `_max_lookback_bars()`'s warm-up buffer. `entry_t` is cast to float for
+    the same reason in reverse — it's a threshold in t-units, not a bar
+    count, and must never inflate that buffer (an `entry_t` of 2 arriving as
+    an int and buying two bars of warm-up would be meaningless).
 
     `session` is fixed, never searched.
     """
     grid = []
-    for lookback, buf in product(range_lookbacks, buffer_fracs):
+    for lookback, t in product(mom_lookbacks, entry_ts):
         grid.append(
             {
-                "range_lookback": int(lookback),
-                "buffer_frac": float(buf),
+                "mom_lookback": int(lookback),
+                "entry_t": float(t),
                 "session": session,
             }
         )
