@@ -48,9 +48,8 @@ def folds_to_table(folds) -> pd.DataFrame:
                 "Train End": f.train_end.date(),
                 "Test Start": f.test_start.date(),
                 "Test End": f.test_end.date(),
-                "Donchian N": f.best_params.get("donchian_n"),
-                "ATR Mult (k)": f.best_params.get("atr_mult"),
-                "Target Mode": f.best_params.get("target_mode"),
+                "Range Lookback": f.best_params.get("range_lookback"),
+                "Buffer Frac": f.best_params.get("buffer_frac"),
                 "Train Sharpe": round(f.train_sharpe, 3),
                 "Test Bars": f.n_test_bars,
             }
@@ -59,18 +58,17 @@ def folds_to_table(folds) -> pd.DataFrame:
 
 
 def param_stability_caption(folds) -> str:
-    """Per the strategy brief: fold-to-fold stability of the winning N/k is a
+    """Fold-to-fold stability of the winning range_lookback/buffer_frac is a
     stronger robustness signal than any single fold's in-sample Sharpe."""
     chosen = [f.best_params for f in folds if f.best_params]
     if not chosen:
         return "No fold produced a valid parameter set."
-    n_vals = sorted({p["donchian_n"] for p in chosen})
-    k_vals = sorted({p["atr_mult"] for p in chosen})
-    tm_vals = sorted({p["target_mode"] for p in chosen})
+    lookback_vals = sorted({p["range_lookback"] for p in chosen})
+    buffer_vals = sorted({p["buffer_frac"] for p in chosen})
     return (
-        f"Across {len(chosen)} folds: {len(n_vals)} distinct Donchian N chosen ({n_vals}), "
-        f"{len(k_vals)} distinct ATR multiplier k chosen ({k_vals}), "
-        f"target mode split {tm_vals}. Fewer distinct values = more stable parameters."
+        f"Across {len(chosen)} folds: {len(lookback_vals)} distinct range lookback chosen ({lookback_vals}), "
+        f"{len(buffer_vals)} distinct buffer frac chosen ({buffer_vals}). "
+        f"Fewer distinct values = more stable parameters."
     )
 
 
@@ -111,7 +109,7 @@ st.sidebar.caption(f"{len(df):,} bars loaded — {df.index.min().date()} to {df.
 # ---------------------------------------------------------------------------
 # Sidebar — strategy parameters
 # ---------------------------------------------------------------------------
-st.sidebar.header("Strategy: Donchian Breakout + VWAP Filter")
+st.sidebar.header("Strategy: Rolling Range Breakout + Vol-Regime Gate + Failed-Breakout Stop")
 
 session_names = list(SESSION_CONFIG.keys())
 session_choice = st.sidebar.selectbox("Day-Trade Session", session_names, index=session_names.index("New York"))
@@ -125,35 +123,37 @@ if timeframe == "1d":
     st.sidebar.warning("Daily bars have one price per day, so session filtering doesn't apply — it's ignored at this bar size.")
     session = None
 
-atr_period = st.sidebar.number_input("ATR Period (fixed, not searched)", min_value=2, max_value=100, value=14, step=1)
-donchian_n_text = st.sidebar.text_input("Donchian Lookback N (bars, comma-separated)", value="10, 20, 30, 50, 80")
-atr_mult_text = st.sidebar.text_input("ATR Stop Multiplier k (comma-separated)", value="1.0, 1.5, 2.0, 3.0")
-target_modes = st.sidebar.multiselect(
-    "Target Mode(s) to Search", options=["channel", "atr"], default=["channel", "atr"],
-    help="'channel' = measured-move off Donchian channel height; 'atr' = 2k×ATR. "
-    "Both searched by default so walk-forward picks whichever travels better per fold.",
+range_lookback_text = st.sidebar.text_input(
+    "Breakout Channel Lookback (bars, comma-separated)", value="24, 48, 96, 192",
+    help="Rolling high/low window (shifted one bar so the current bar can't define its own level).",
+)
+buffer_frac_text = st.sidebar.text_input(
+    "Breakout Buffer (fraction of channel width, comma-separated)", value="0.0, 0.05, 0.10, 0.15",
+    help="Required overshoot past the channel as a fraction of its width (0 = plain touch of the level).",
 )
 st.sidebar.caption(
-    "VWAP is a free directional filter (no extra grid dimension): long only above session VWAP, "
-    "short only below it. Session VWAP resets each CME/Globex trading day (18:00 ET), not at midnight."
+    "A zero-parameter volatility-regime gate (96-bar ATR ≥ 384-bar ATR, hardcoded — not searched) "
+    "suppresses entries while realized volatility is contracting."
 )
 st.sidebar.caption(
-    "Stop/target are detected off intrabar High/Low but priced at that bar's Close (no finer price "
-    "series available) — they cap *when* a trade exits, not the realized loss on the triggering bar."
+    "Exit is a failed-breakout stop at half the channel width (hardcoded, not searched): a breakout that "
+    "gives back that much is cut. Otherwise the position rides to the opposite breakout or the session's "
+    "forced flatten — stops are detected intrabar off High/Low but priced at that bar's Close, so they cap "
+    "*when* a trade exits, not the realized loss on the triggering bar."
 )
 
 try:
-    donchian_ns = parse_num_list(donchian_n_text, int)
-    atr_mults = parse_num_list(atr_mult_text, float)
-    grid = build_grid(donchian_ns, atr_mults, atr_period, target_modes or ["channel"], session)
+    range_lookbacks = parse_num_list(range_lookback_text, int)
+    buffer_fracs = parse_num_list(buffer_frac_text, float)
+    grid = build_grid(range_lookbacks, buffer_fracs, session)
 except ValueError:
     st.sidebar.error("Could not parse parameter lists — use comma-separated numbers.")
     st.stop()
 
 if not grid:
-    st.sidebar.error("Parameter grid is empty — provide at least one Donchian N, ATR multiplier, and target mode.")
+    st.sidebar.error("Parameter grid is empty — provide at least one range lookback and buffer fraction.")
     st.stop()
-st.sidebar.caption(f"Grid size: {len(grid)} Donchian/ATR parameter combinations per fold")
+st.sidebar.caption(f"Grid size: {len(grid)} range-lookback/buffer-frac parameter combinations per fold")
 
 # ---------------------------------------------------------------------------
 # Sidebar — walk-forward settings
@@ -175,10 +175,10 @@ run_clicked = st.sidebar.button("Run Walk-Forward Analysis", type="primary", use
 # ---------------------------------------------------------------------------
 st.title("Walk-Forward Trading App")
 st.caption(
-    f"{symbol} · {timeframe} bars · Donchian({', '.join(str(n) for n in donchian_ns)}) breakout "
-    f"with a session-VWAP directional filter and ATR(k={', '.join(str(k) for k in atr_mults)}) stop/target, "
-    f"day trades only ({session_choice if session else 'no session filter — 1d bars'}), optimized on a rolling "
-    f"{train_weeks}-week train / {test_weeks}-week blind test walk-forward schedule."
+    f"{symbol} · {timeframe} bars · Rolling range breakout (lookback ∈ {{{', '.join(str(n) for n in range_lookbacks)}}} bars, "
+    f"buffer ∈ {{{', '.join(str(b) for b in buffer_fracs)}}}) with a volatility-regime gate and a "
+    f"failed-breakout stop, day trades only ({session_choice if session else 'no session filter — 1d bars'}), "
+    f"optimized on a rolling {train_weeks}-week train / {test_weeks}-week blind test walk-forward schedule."
 )
 
 if run_clicked:
@@ -197,7 +197,7 @@ if run_clicked:
         )
 
     try:
-        with st.spinner("Optimizing Donchian/ATR parameters on each rolling training window..."):
+        with st.spinner("Optimizing range-breakout parameters on each rolling training window..."):
             oos_returns, oos_trades, folds = run_walk_forward(
                 df, train_weeks, test_weeks, grid, ann_factor, progress_callback=on_fold_done
             )
