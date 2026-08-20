@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --range-lookback 24,48 --buffer-frac 0.15,0.25 \\
+        --range-lookback 24,48 --buffer-frac 0.0,0.05 \\
         --train-weeks 24 --test-weeks 8
 
     # yfinance source, daily bars, no session filter
@@ -63,17 +63,21 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-from", default=None, help="YYYY-MM-DD, defaults to earliest available")
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
-    strat = p.add_argument_group("strategy grid (rolling N-bar range breakout + vol-regime gate, flip exit)")
+    strat = p.add_argument_group(
+        "strategy grid (rolling N-bar range breakout + vol-regime gate + variance-ratio "
+        "persistence gate, flip exit)"
+    )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
     strat.add_argument("--range-lookback", default="24,48,96,192",
                         help="comma-separated breakout channel lengths in bars (rolling high/low window, "
                              "shifted one bar so the current bar can't define its own level)")
-    strat.add_argument("--buffer-frac", default="0.15,0.20,0.25,0.35",
+    strat.add_argument("--buffer-frac", default="0.0,0.05,0.10,0.15",
                         help="comma-separated breakout buffers as a fraction of the channel width "
-                             "(0 = plain touch of the level). Default grid opens territory above the "
-                             "previous 0.15 ceiling, which the optimizer pinned to in 31/65 folds; "
-                             "0.15 is retained as the control anchor")
+                             "(0 = plain touch of the level). Restored byte-identical to the last "
+                             "accepted iteration's grid: the widened 0.15-0.35 variant was tested "
+                             "and failed, so this is the control against which the new hardcoded "
+                             "variance-ratio persistence gate is the only moving part")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
