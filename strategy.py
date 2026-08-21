@@ -1,145 +1,124 @@
-"""Rolling N-bar range breakout + vol-regime gate, failed-breakout stop at half
-the channel width — no profit target.
+"""With-trend pullback reclaim — trend-gated z-dip re-entry, sigma stop, no target.
 
-Bar-indexed Donchian channel on the full continuous frame: long when Close
-breaks out above the prior `range_lookback` bars' high (plus a buffer), short
-on the mirror-image break below, both ANDed with a single hardcoded
-volatility-regime gate.
+The market side is unchanged from the last accepted iterations: this is a
+*continuation* strategy, long in uptrends and short in downtrends. What changes
+is the entry primitive. Instead of "buy the new extreme" (a channel breakout),
+this buys the *dip inside an already-established trend* and only at the moment
+the dip is being reclaimed. Buying a pullback rather than a breakout buys a
+materially better entry price, which in turn lets the stop sit much closer than
+a channel-width stop could.
 
-The entry side — signal, both searched grids, and the ATR-ratio gate — is
-byte-identical to the last *accepted* iteration of this family (rolling range
-breakout + volatility-regime gate, flip exit). Exactly one thing changes this
-iteration: **the exit**. The variance-ratio persistence gate tried in the
-immediately preceding iteration is removed outright (it cut trade count
-further and came back with a worse overfit gap), so this run is attributable
-to the new exit alone.
+Read the exit framing before reading this as a fade: the pullback is only the
+*entry timing*; the trend is the *P&L source*. There is therefore no
+mean-reversion profit target — winners run to the forced session flatten,
+exactly as in the accepted breakout iterations.
 
-Why change the exit and nothing else. The two levers already spent off the
-accepted iteration are exhausted in the same direction: a wider `buffer_frac`
-grid and then a second (persistence) gate both traded fewer, more selective
-breakouts, and both cut OOS trade count hard while getting worse — "be more
-selective about which breakouts to take" is now tested and failed twice. The
-opposite lever is ruled out by arithmetic on this family's own results: the
-vol-regime gate removed roughly a third of the ungated iteration's trades and
-about a tenth of its total return, i.e. ~-0.10% net per removed trade, which
-after backing out the ~0.102% round-trip toll charged in `metrics.py` is ~0.00%
-gross. Those trades carried no directional information in *either* direction,
-so neither loosening the gate nor fading them can pay. What is left is gross
-P&L per trade on the entries already being taken — i.e. the exit.
-
-And the accepted iteration's exit was, in practice, no exit: reading its OOS
-trade log, essentially every trade closes at the forced session flatten. The
-flip almost never fires, so losers are held exactly as long as winners and the
-left tail runs past -1.7%.
+The discriminating difference versus this repo's earlier, no-edge
+bollinger-band-fade iteration is regime gating, which is pitfall #1 in
+mean-reversion.md: "Mean reversion only works in choppy markets. In a strong
+uptrend, shorting strength is a losing strategy." That earlier iteration ran
+the z-dip *ungated*, so it faded strength as readily as it bought weakness.
+Here the z-dip is only ever taken *in the direction of* the prevailing trend
+and never against it.
 
 Rules (all computed with no session awareness of their own):
 
-  - Channel, shifted so the current bar can never define the level it must
-    break (that `.shift(1)` is load-bearing — without it the bar's own High
-    is part of `upper` and the comparison is lookahead):
-        upper = High.rolling(range_lookback).max().shift(1)
-        lower = Low.rolling(range_lookback).min().shift(1)
-        width = upper - lower
-  - Raw breakout signals:
-        long  where Close >  upper + buffer_frac * width
-        short where Close <  lower - buffer_frac * width
-    `buffer_frac` scales the required overshoot by the channel's own width,
-    so the filter is volatility-adaptive and scale-free rather than a fixed
-    number of points. `buffer_frac = 0` is the plain touch-the-level break.
-  - The trigger is Close-based on purpose: this codebase has no intrabar price
-    series, every bar is priced off its Close, so a High-touch trigger would
-    book a fill at a price the bar's own high says was already exceeded.
-  - Long and short are mutually exclusive for free: `upper >= lower` always
-    and `buffer_frac >= 0`, so `upper + buffer_frac*width >= lower -
-    buffer_frac*width` and a single Close cannot satisfy both inequalities.
-    The gate below only ever *removes* signals, so it cannot break that.
-  - Volatility-regime gate (hardcoded, NOT grid-searched):
-        TR       = max(High-Low, |High-Close_prev|, |Low-Close_prev|)
-        atr_fast = TR.rolling(ATR_FAST_BARS).mean()
-        atr_slow = TR.rolling(ATR_SLOW_BARS).mean()
-        vol_ok   = atr_fast >= atr_slow
-    Why a ratio rather than an absolute vol threshold: a ratio is scale-free
-    (no points/percent constant to fit or to re-fit as NQ's price level
-    doubles) and, because volatility clusters, the fast/slow crossing is a
-    multi-day regime switch rather than a bar-by-bar chop filter. Strict
-    `min_periods` on both legs so an unwarmed gate is NaN and therefore False
-    — it fails *closed* (suppress the trade) rather than degrading to an
-    always-true no-op.
-  - The gate's windows are hardcoded module constants, deliberately outside
-    the grid, so it adds zero degrees of freedom for the optimizer to overfit.
+  - Trend filter, a single slow SMA:
+        sma_trend = SMA(Close, trend_ma)
+        uptrend   = Close >  sma_trend
+        downtrend = Close <  sma_trend
+    These are exact complements on the same MA (the only overlap case, Close
+    == sma_trend exactly, makes both False), so long and short can never fire
+    on the same bar — the mutual-exclusivity property the stop/target walk
+    relies on.
 
-Exit — NEW this iteration: a failed-breakout stop, no target.
+  - Dip measure, a residual z-score against a fast SMA:
+        resid = Close - SMA(Close, Z_LOOKBACK)
+        sigma = rolling std(resid, Z_LOOKBACK)
+        z     = resid / sigma
+    `Z_LOOKBACK` is a hardcoded module constant (20), deliberately NOT
+    grid-searched — see the constant's own note for why that ratio to
+    `trend_ma` matters.
 
-  - stop_distance = STOP_WIDTH_FRAC * width, with STOP_WIDTH_FRAC = 0.5 a
+  - Entries are the *reclaim crossing*, not the level:
+        LONG  where uptrend   AND z.shift(1) <= -entry_z AND z > -entry_z
+        SHORT where downtrend AND z.shift(1) >= +entry_z AND z < +entry_z
+    Using the crossing rather than "z is currently beyond the level" is what
+    stops one deep dip re-triggering bar after bar for as long as it stays
+    extended — the same fix an earlier iteration in this repo introduced for
+    exactly this failure mode. It also means the entry is timed to the moment
+    the pullback stops working against the trend, not to the moment it starts.
+
+  - Strict `min_periods` on all three rolling windows (the trend SMA, the fast
+    SMA, and the residual std), so an unwarmed bar is NaN. Every comparison
+    against NaN is False in pandas, so an unwarmed bar produces no signal —
+    the filter fails *closed* (suppress the trade) rather than open.
+
+Exit — a residual-sigma stop, no target.
+
+  - stop_distance = STOP_SIGMA_MULT * sigma, with STOP_SIGMA_MULT = 1.5 a
     module constant that is *not* grid-searched (zero added degrees of
-    freedom, and no grid/CLI plumbing change). The economic reading: a
-    breakout that immediately gives back half the channel it just broke out
-    of is a failed breakout, and is cut. Quoting it in channel widths keeps
-    it in the same unit `buffer_frac` already uses, so it is volatility- and
-    price-level-adaptive by construction rather than a fitted point value.
-  - Sizing sanity on this dataset: ATR96 runs ~0.13% of price (checked on
-    both a 2023 and a 2025 slice), so a ~24h channel gives a stop of roughly
-    0.5-0.7% of price. That sits deliberately *between* the accepted
-    iteration's ordinary noise losers (-0.03% to -0.3%, which should survive
-    untouched) and its tail losers (-0.5% to -1.8%, which should be cut).
+    freedom, and no grid/CLI plumbing change). The economic reading: a reclaim
+    that then extends 1.5 further residual-sigma against the entry was not a
+    pullback, it was the trend breaking, and it is cut.
+  - Quoting the stop in the *same sigma unit the entry already uses* makes it
+    volatility- and price-level-adaptive by construction, rather than a fitted
+    point value that would have to be re-fit as NQ's price level moves.
   - No profit target. `apply_session_constraint_with_stops()` requires a
     non-NaN, correctly-sided target on every entry bar, so the target is set
-    to a deliberately unreachable 100 * stop_distance from the entry Close.
-    One session cannot travel 50 channel widths, so the profit side is
-    unchanged from the accepted iteration: winners still run to the forced
-    session-close flatten.
-  - Consequence for reversals, stated explicitly: the stop/target walk never
-    flips directly from long to short — it only opens when flat. But a stop
-    at half the channel width always triggers long before price could reach
-    the opposite band, so what used to be a single flip now shows up as a
-    stop-out followed by a fresh opposite entry: two trades, and the same two
-    cost legs. Nothing is silently held through a reversal.
+    to a deliberately unreachable `UNREACHABLE_TARGET_MULT` stop-distances
+    from the entry Close. One session cannot travel 150 residual sigma, so the
+    profit side is governed only by the session flatten.
+  - Degenerate bars fail closed for free, and both guards agree: NaN or zero
+    `sigma` makes `stop_distance` NaN/0, and the delegate refuses to open
+    without a strictly positive stop distance; the same NaN/0 also makes the
+    target NaN or exactly equal to Close, which fails the delegate's strict
+    sidedness test. No redundant masking is added here for that.
   - Fill-price honesty (see the delegate's own docstring): a stop hit is
     *detected* intrabar on High/Low against the stored level, but the exit is
     priced at that bar's Close. So the stop caps *when* you exit, not the
     realized loss on the triggering bar — results must not be described as
     guaranteeing a maximum loss of stop_distance.
-  - Why the earlier abandoned stop attempt in this repo does not transfer:
-    that one hung the stop off a static day-anchored range level that was
-    re-triggerable at the same price all session, so it churned. This channel
-    ratchets after every breakout — a re-entry needs a *new* extreme beyond
-    the run's peak — so the same-price churn path is closed.
-  - Degenerate bars fail closed for free: an unwarmed or zero `width` makes
-    stop_distance NaN/0 and the target NaN, and the delegate refuses to open
-    a position without a strictly positive stop distance and a valid,
-    correctly-sided target.
+  - Consequence for reversals, stated explicitly: the stop/target walk never
+    flips directly from long to short — it only opens when flat. A stop-out
+    followed by an opposite-side entry is two trades and two round-trip cost
+    legs, not one flip.
 
-Pre-registered direction (so the read of the result is not made after the
-fact): OOS trade count should come in at or *above* the accepted iteration's,
-since stops add exits and permit later re-entries within the same session. A
-count materially below it is an implementation smell — most likely a NaN/zero
-width suppressing entries, or a mis-sided target series — not a verdict on the
-stop.
+An ATR-ratio volatility-regime gate (used by the accepted breakout iterations)
+is deliberately NOT included here, so this family's first run is clean and
+attributable to the trend-gated pullback entry alone. It is a reserved
+zero-param lever for a later in-family variation.
+
+Warm-up arithmetic. Two independent chains:
+  - the trend SMA needs `trend_ma` bars. That's a genuine bar-count lookback,
+    so it is passed as a plain `int` from `build_grid()` and correctly sizes
+    the engine's pre-test-window buffer.
+  - the z chain needs SMA(Z_LOOKBACK) -> resid -> rolling std(Z_LOOKBACK)
+    -> one bar of `.shift(1)`, i.e. 20 + 19 + 1 = 40 bars. This chain is
+    invisible to `wfo_engine._max_lookback_bars()` (module constants are not
+    grid params), so it is counted by hand here.
+`entry_z` is a z-score threshold, not a bar count, and is passed as a `float`
+so it can never inflate that buffer. With the intended grid topping out at
+trend_ma = 384, the engine buffers max((384 + 5) * 3, day_bars + 5) = 1167
+bars, comfortably above both 384 and 40, so every indicator is fully warm at
+each test window's first bar. Caveat for whoever changes the grid next: the
+binding floor on the longest searched `trend_ma` is (max_lookback + 5) * 3 >=
+max_lookback, which always holds, so the trend MA is safe at any grid size;
+raise the buffer rather than loosening `min_periods` if that ever changes.
 
 Cost note: `metrics.py` charges ~0.102% round-trip off Close, unchanged here
-and out of scope for this file. Note that this iteration *adds* cost legs (a
-stopped-out trade that re-enters pays two round trips where the flip version
-paid one), so the stop has to save more than that to show up as an
-improvement.
-
-Warm-up: `range_lookback` bars for the rolling extremes plus the one-bar
-shift. That's a genuine bar-count lookback, so it is passed as a plain `int`
-from `build_grid()` and correctly sizes the engine's pre-test-window buffer;
-`buffer_frac` is a fraction and is passed as a `float` so it cannot inflate
-that buffer. `STOP_WIDTH_FRAC` never enters the grid at all, so it is
-invisible to the buffer arithmetic — correctly, since it introduces no new
-lookback (it reuses the channel width already computed).
-
-The gate's own warm-up is likewise invisible to
-`wfo_engine._max_lookback_bars()` (module constants aren't grid params), so
-check it by hand: with the persistence gate gone the binding leg is
-ATR_SLOW_BARS = 384 bars exactly (TR's first bar degrades to High-Low rather
-than NaN, so `Close.shift(1)` costs nothing). With the intended grid the
-engine buffers max((192 + 5) * 3, day_bars + 5) = 591 bars > 384, so the gate
-is fully warm before the first test-window bar. Caveat for whoever changes the
-grid next: keep 192 at the top of the `range_lookback` grid (the binding floor
-on the longest searched lookback is 123) or raise the buffer, rather than
-loosening `min_periods`.
+and out of scope for this file. Sizing sanity, measured on NQ 15min (checked on
+both a 2023 and a 2025 slice, which agree closely): `STOP_SIGMA_MULT * sigma`
+runs a median ~0.19% of price, with a 10th-90th percentile band of roughly
+0.07%-0.56%. So the typical stop is only ~1.9x the round-trip toll, and in the
+quietest decile of bars the stop is *narrower than the toll itself* — a much
+tighter stop than the breakout iterations' channel-width one. Two consequences
+worth stating up front rather than discovering in the results: the per-trade
+edge has very little room above costs, and low-volatility bars are structurally
+the worst trades here (small sigma tightens the stop faster than it shrinks the
+cost, which is fixed in percentage terms). A volatility floor is one obvious
+zero-param lever for a later in-family variation, but is deliberately not
+included in this first run.
 
 This module decides only *when* the strategy wants to be long or short. All
 day-trade gating and the end-of-session flatten are delegated to
@@ -150,91 +129,76 @@ import pandas as pd
 
 from session import apply_session_constraint_with_stops
 
-# Volatility-regime gate windows, in bars. Hardcoded on purpose: the gate adds
-# no searchable degrees of freedom. Sized for 15min bars — 96 bars is ~one
-# full 24h Globex day and 384 is ~four of them, i.e. a slow, multi-day regime
-# switch rather than a bar-by-bar chop filter.
-ATR_FAST_BARS = 96
-ATR_SLOW_BARS = 384
+# Lookback, in bars, for the fast SMA and the residual standard deviation that
+# together define the dip z-score. Hardcoded on purpose, NOT grid-searched:
+# fixing it keeps the search at 2 dimensions (matching every accepted run in
+# this log, and strategy-development.md's "complexity usually signals weak
+# edge"), leaves one param slot free for the next in-family variation, and
+# holds trend_ma / Z_LOOKBACK >= 4.8 at every intended grid point so the two
+# windows measure genuinely different horizons — a multi-day trend versus a
+# few-hours pullback — rather than two noisy views of the same one.
+Z_LOOKBACK = 20
 
-# Failed-breakout stop, quoted as a fraction of the breakout channel's own
-# width. Hardcoded, NOT grid-searched: 0.5 is the "gave back half of what it
-# broke out of" boundary, chosen for its economic reading rather than fitted,
+# Stop distance, quoted in the same residual-sigma unit the entry threshold
+# uses. Hardcoded, NOT grid-searched: 1.5 is the "this was not a pullback, the
+# trend broke" boundary, chosen for its economic reading rather than fitted,
 # so it costs zero degrees of freedom.
-STOP_WIDTH_FRAC = 0.5
+STOP_SIGMA_MULT = 1.5
 
 # Multiple of the stop distance used as the (deliberately unreachable) profit
 # target. The stop/target walk requires a non-NaN, correctly-sided target on
-# every entry bar; 100 stop-widths inside one session is not attainable, so
-# this reproduces "no target — winners run to the session flatten".
+# every entry bar; 100 stop-widths (= 150 residual sigma) inside one session is
+# not attainable, so this reproduces "no target — winners run to the session
+# flatten".
 UNREACHABLE_TARGET_MULT = 100.0
 
 
-def true_range(df: pd.DataFrame) -> pd.Series:
-    """Wilder's True Range: max(H-L, |H-C_prev|, |L-C_prev|).
+def dip_zscore(close: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Residual z-score of Close against its own `Z_LOOKBACK`-bar SMA.
 
-    `prev_close` is NaN on the first bar, so two of the three legs are NaN
-    there; `.max(axis=1)` skips NaNs by default, leaving TR[0] = High - Low.
-    That degenerate-but-sane first value is intentional (no fillna needed),
-    which is why this gate's warm-up is exactly `ATR_SLOW_BARS` bars, not one
-    more.
+    Returns `(z, sigma)`: sigma is handed back as well because the exit stop is
+    quoted in the very same unit, so it must not be recomputed from a different
+    window.
+
+    Strict `min_periods` (pandas' default = window) on both rolling windows, so
+    an unwarmed bar is NaN in `sigma` and therefore NaN in `z`. Comparisons
+    against NaN are False, so an unwarmed bar can produce no entry — it fails
+    closed. A degenerate flat window (sigma == 0) yields inf/NaN in `z` and a
+    zero stop distance, which the delegate refuses.
     """
-    prev_close = df["Close"].shift(1)
-    return pd.concat(
-        [
-            df["High"] - df["Low"],
-            (df["High"] - prev_close).abs(),
-            (df["Low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-
-def vol_regime_ok(df: pd.DataFrame) -> pd.Series:
-    """True where fast realized vol >= slow realized vol (expanding regime).
-
-    Strict `min_periods` (pandas' default = window) so an unwarmed slow leg is
-    NaN and the comparison is False — the gate fails closed (suppress) rather
-    than open (trade ungated), which is the conservative direction.
-    """
-    tr = true_range(df)
-    atr_fast = tr.rolling(ATR_FAST_BARS, min_periods=ATR_FAST_BARS).mean()
-    atr_slow = tr.rolling(ATR_SLOW_BARS, min_periods=ATR_SLOW_BARS).mean()
-    return (atr_fast >= atr_slow).fillna(False)
-
-
-def donchian_channel(df: pd.DataFrame, range_lookback: int) -> tuple[pd.Series, pd.Series]:
-    """Prior-`range_lookback`-bar high/low, shifted one bar.
-
-    The shift excludes the current bar from its own breakout level — without
-    it, `Close > upper` would be comparing against a maximum that already
-    contains this bar's High (lookahead).
-    """
-    upper = df["High"].rolling(range_lookback, min_periods=range_lookback).max().shift(1)
-    lower = df["Low"].rolling(range_lookback, min_periods=range_lookback).min().shift(1)
-    return upper, lower
+    sma_fast = close.rolling(Z_LOOKBACK, min_periods=Z_LOOKBACK).mean()
+    resid = close - sma_fast
+    sigma = resid.rolling(Z_LOOKBACK, min_periods=Z_LOOKBACK).std()
+    return resid / sigma, sigma
 
 
 def generate_positions(
     df: pd.DataFrame,
-    range_lookback: int,
-    buffer_frac: float,
+    trend_ma: int,
+    entry_z: float,
     session: str | None = "New York",
 ) -> pd.Series:
     close = df["Close"]
-    upper, lower = donchian_channel(df, range_lookback)
-    width = upper - lower
 
-    # Mutually exclusive by construction (upper >= lower, buffer_frac >= 0);
-    # the gate only ever removes signals, so it preserves that.
-    vol_ok = vol_regime_ok(df)
-    long_signal = (close > upper + buffer_frac * width).fillna(False) & vol_ok
-    short_signal = (close < lower - buffer_frac * width).fillna(False) & vol_ok
+    # Trend gate — exact complements on one MA, so the two sides below are
+    # mutually exclusive by construction.
+    sma_trend = close.rolling(trend_ma, min_periods=trend_ma).mean()
+    uptrend = close > sma_trend
+    downtrend = close < sma_trend
 
-    # Failed-breakout stop: half the channel width, symmetric, resolved to a
-    # side by the delegate. NaN/0 width (warm-up or a degenerate flat channel)
-    # propagates here and makes the delegate refuse the entry.
-    stop_distance = STOP_WIDTH_FRAC * width
+    z, sigma = dip_zscore(close)
+    z_prev = z.shift(1)
+
+    # The *reclaim crossing*, not the level: the dip must have been beyond the
+    # threshold on the prior bar and be back inside it now. A dip that stays
+    # extended therefore fires exactly once, on the bar it is reclaimed.
+    long_signal = (uptrend & (z_prev <= -entry_z) & (z > -entry_z)).fillna(False)
+    short_signal = (downtrend & (z_prev >= entry_z) & (z < entry_z)).fillna(False)
+
+    # Stop in the same residual-sigma unit the entry threshold uses. NaN/0
+    # sigma (warm-up, or a degenerate flat window) propagates here and makes
+    # the delegate refuse the entry.
+    stop_distance = STOP_SIGMA_MULT * sigma
 
     # No real target — an unreachable level on the correct side of the entry
     # Close, so the profit side is governed only by the session flatten. Only
@@ -259,7 +223,7 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    "range_lookback": 48,
-    "buffer_frac": 0.05,
+    "trend_ma": 192,
+    "entry_z": 1.0,
     "session": "New York",
 }

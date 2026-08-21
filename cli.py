@@ -11,8 +11,8 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --range-lookback 24,48 --buffer-frac 0.0,0.05 \\
-        --train-weeks 24 --test-weeks 8
+        --trend-ma 96,192 --entry-z 1.0,1.5 \\
+        --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
     python cli.py --source yfinance --symbol NQ=F --timeframe 1d
@@ -64,21 +64,22 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (rolling N-bar range breakout + vol-regime gate, failed-breakout "
-        "stop at half the channel width, no target)"
+        "strategy grid (with-trend pullback reclaim: trend-gated z-dip re-entry, "
+        "1.5-sigma stop, no target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--range-lookback", default="24,48,96,192",
-                        help="comma-separated breakout channel lengths in bars (rolling high/low window, "
-                             "shifted one bar so the current bar can't define its own level)")
-    strat.add_argument("--buffer-frac", default="0.0,0.05,0.10,0.15",
-                        help="comma-separated breakout buffers as a fraction of the channel width "
-                             "(0 = plain touch of the level). Byte-identical to the last accepted "
-                             "iteration's grid, as is --range-lookback, so that the new "
-                             "failed-breakout stop (hardcoded at strategy.STOP_WIDTH_FRAC = 0.5 "
-                             "channel widths, deliberately not grid-searched) is the only moving "
-                             "part this iteration")
+    strat.add_argument("--trend-ma", default="96,192,288,384",
+                        help="comma-separated slow trend SMA lengths in bars; Close above it gates longs, "
+                             "below it gates shorts (exact complements, so the two sides can never fire "
+                             "on the same bar)")
+    strat.add_argument("--entry-z", default="0.75,1.0,1.5,2.0",
+                        help="comma-separated pullback depths, in residual standard deviations of Close "
+                             "against its 20-bar SMA. Entry is the *reclaim crossing* back inside the "
+                             "threshold, not the level itself, so one dip fires once. The dip window "
+                             "(strategy.Z_LOOKBACK = 20) and the stop (strategy.STOP_SIGMA_MULT = 1.5 "
+                             "of that same sigma) are hardcoded, deliberately not grid-searched, "
+                             "keeping the search at two dimensions")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -129,9 +130,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        range_lookbacks = parse_num_list(args.range_lookback, int)
-        buffer_fracs = parse_num_list(args.buffer_frac, float)
-        grid = build_grid(range_lookbacks, buffer_fracs, session)
+        trend_mas = parse_num_list(args.trend_ma, int)
+        entry_zs = parse_num_list(args.entry_z, float)
+        grid = build_grid(trend_mas, entry_zs, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -172,11 +173,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        lookback_vals = sorted({p["range_lookback"] for p in chosen})
-        buffer_vals = sorted({p["buffer_frac"] for p in chosen})
+        trend_ma_vals = sorted({p["trend_ma"] for p in chosen})
+        entry_z_vals = sorted({p["entry_z"] for p in chosen})
         print(
-            f"Fold param stability: {len(lookback_vals)} distinct range lookback {lookback_vals}, "
-            f"{len(buffer_vals)} distinct buffer frac {buffer_vals}"
+            f"Fold param stability: {len(trend_ma_vals)} distinct trend MA {trend_ma_vals}, "
+            f"{len(entry_z_vals)} distinct entry z {entry_z_vals}"
         )
 
     if args.out_dir:
@@ -188,8 +189,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "range_lookback": f.best_params.get("range_lookback"),
-                "buffer_frac": f.best_params.get("buffer_frac"),
+                "trend_ma": f.best_params.get("trend_ma"),
+                "entry_z": f.best_params.get("entry_z"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }
