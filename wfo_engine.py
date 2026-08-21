@@ -34,30 +34,32 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(range_lookbacks, target_fracs, session) -> list[dict]:
+def build_grid(atr_periods, expansion_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Both params are searched. `range_lookback` is cast to a plain int on
-    purpose: it's a genuine bar-count lookback (the Donchian channel's rolling
-    window), so it *should* feed `_max_lookback_bars()`'s warm-up buffer.
-    `target_frac` is cast to float for the same reason in reverse — it's a
-    fraction of the channel width, not a bar count, and must never inflate that
-    buffer (a `target_frac` of 1.0 arriving as an int and buying an extra bar
-    of warm-up would be meaningless).
+    Both params are searched. `atr_period` is cast to a plain int on purpose:
+    it's a genuine bar-count lookback (the rolling window behind the ATR
+    baseline), so it *should* feed `_max_lookback_bars()`'s warm-up buffer.
+    `expansion_mult` is cast to float for the same reason in reverse — it's a
+    ratio of bar range to ATR, not a bar count, and must never inflate that
+    buffer (an `expansion_mult` of 3 arriving as an int and buying extra
+    warm-up bars would be meaningless).
 
-    The strategy's stop, `strategy.STOP_WIDTH_FRAC`, is a hardcoded module
-    constant and deliberately never enters the grid — it introduces no new
-    lookback (it reuses the channel width already computed), so it is correctly
-    invisible to the buffer arithmetic.
+    The strategy's exit constants — `strategy.STOP_BAR_MULT`,
+    `strategy.TARGET_BAR_MULT` — and its close-location thresholds
+    (`CLOSE_LOC_TOP`/`CLOSE_LOC_BOT`) are hardcoded module constants and
+    deliberately never enter the grid: they introduce no new lookback (they
+    reuse the trigger bar's own range), so they are correctly invisible to the
+    buffer arithmetic.
 
     `session` is fixed, never searched.
     """
     grid = []
-    for lookback, frac in product(range_lookbacks, target_fracs):
+    for period, mult in product(atr_periods, expansion_mults):
         grid.append(
             {
-                "range_lookback": int(lookback),
-                "target_frac": float(frac),
+                "atr_period": int(period),
+                "expansion_mult": float(mult),
                 "session": session,
             }
         )

@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 5min --session London \\
-        --range-lookback 288,576 --target-frac 0.25,0.50 \\
+        --atr-period 96,288 --expansion-mult 2.0,2.8 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,23 +64,22 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (quiet-session band rejection fade: Donchian wick rejection, "
-        "quarter-width stop, channel-fraction target)"
+        "strategy grid (volatility-ignition continuation: expansion-bar entry, "
+        "trigger-bar stop, no target)"
     )
     strat.add_argument("--session", default="London", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--range-lookback", default="144,288,432,576",
-                        help="comma-separated Donchian channel lengths in bars (shifted one bar, so the "
-                             "current bar is excluded from its own level). A SHORT fires where the bar's "
-                             "High pokes above the upper band but the Close is back below it; a LONG is "
-                             "the mirror on the lower band")
-    strat.add_argument("--target-frac", default="0.15,0.25,0.35,0.50",
-                        help="comma-separated profit targets, as a fraction of the channel width measured "
-                             "back inside the rejected edge (short -> upper - frac*width, long -> "
-                             "lower + frac*width). Doubles as a don't-chase filter: the delegate skips any "
-                             "entry whose Close is already past its own target. The stop "
-                             "(strategy.STOP_WIDTH_FRAC = 0.25 of that same width) is hardcoded, "
-                             "deliberately not grid-searched, keeping the search at two dimensions")
+    strat.add_argument("--atr-period", default="48,96,192,288",
+                        help="comma-separated ATR baseline lengths in bars (shifted one bar, so the current "
+                             "bar is excluded from the average it is compared against). This is the "
+                             "prevailing-volatility yardstick the ignition bar has to clear")
+    strat.add_argument("--expansion-mult", default="2.0,2.4,2.8,3.2",
+                        help="comma-separated ignition thresholds: a bar fires when High-Low >= mult*ATR. "
+                             "Direction comes from where it closed inside its own range — LONG in the top "
+                             "quartile, SHORT in the bottom (strategy.CLOSE_LOC_TOP/CLOSE_LOC_BOT = "
+                             "0.75/0.25, hardcoded). The stop (strategy.STOP_BAR_MULT = 1.0 x the trigger "
+                             "bar's own range) and the deliberately unreachable 'no target' are likewise "
+                             "hardcoded, keeping the search at two dimensions")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -131,9 +130,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        range_lookbacks = parse_num_list(args.range_lookback, int)
-        target_fracs = parse_num_list(args.target_frac, float)
-        grid = build_grid(range_lookbacks, target_fracs, session)
+        atr_periods = parse_num_list(args.atr_period, int)
+        expansion_mults = parse_num_list(args.expansion_mult, float)
+        grid = build_grid(atr_periods, expansion_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -174,11 +173,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        lookback_vals = sorted({p["range_lookback"] for p in chosen})
-        target_frac_vals = sorted({p["target_frac"] for p in chosen})
+        atr_period_vals = sorted({p["atr_period"] for p in chosen})
+        expansion_mult_vals = sorted({p["expansion_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(lookback_vals)} distinct range lookback {lookback_vals}, "
-            f"{len(target_frac_vals)} distinct target frac {target_frac_vals}"
+            f"Fold param stability: {len(atr_period_vals)} distinct atr period {atr_period_vals}, "
+            f"{len(expansion_mult_vals)} distinct expansion mult {expansion_mult_vals}"
         )
 
     if args.out_dir:
@@ -190,8 +189,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "range_lookback": f.best_params.get("range_lookback"),
-                "target_frac": f.best_params.get("target_frac"),
+                "atr_period": f.best_params.get("atr_period"),
+                "expansion_mult": f.best_params.get("expansion_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }
