@@ -34,39 +34,46 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(drift_lookbacks, drift_mults, session) -> list[dict]:
+def build_grid(rvol_mults, thrust_lookbacks, rvol_baseline_bars, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Both params are searched. `drift_lookback` is cast to a plain int on
-    purpose: it's a genuine bar-count lookback (the horizon the drift is
-    measured over), so it *should* feed `_max_lookback_bars()`'s warm-up
-    buffer. `drift_mult` is cast to float for the same reason in reverse — it's
-    a threshold in random-walk-sigma units, not a bar count, and must never
-    inflate that buffer (an int 1 there would be harmless, but an int-valued
-    entry in a param dict is exactly the class of bug that silently
-    mis-sizes warm-up, so the cast is unconditional).
+    Two params are searched (`rvol_mult` x `thrust_lookback`); two are fixed
+    (`rvol_baseline_bars`, `session`) and simply threaded through onto every
+    combo.
 
-    The strategy's volatility scale (`strategy.ATR_BARS` = 288 bars, 24h at
-    5min) is a hardcoded module constant and deliberately never enters the
-    grid, which keeps the search at two dimensions.
+    Types are deliberate, because `_max_lookback_bars()` sizes the warm-up
+    buffer from every plain int in the grid:
 
-    Caveat worth knowing when narrowing the grid by hand: because `ATR_BARS`
-    is a module constant rather than a param, it is invisible to
-    `_max_lookback_bars()`. The warm-up buffer is sized purely by the largest
-    int here, so the intended grid top of 432 (giving (432+5)*3 = 1311 >= the
-    433 bars the drift window needs, comfortably above ATR's 290) is what keeps
-    both legs warm at each test window's open. Searching only lookbacks below
-    ~96 would starve the ATR scale rather than speed things up — the
-    one-full-day floor covers it by only three bars at 5min.
+      - `thrust_lookback` -> int. A genuine bar-count lookback (the horizon the
+        trailing return is measured over), so it *should* feed the buffer.
+      - `rvol_baseline_bars` -> int, and this is the one that actually binds.
+        The strategy's volume baseline is expressed as a bar count (960)
+        rather than an observation count precisely so it is visible here: it
+        gives buffer_bars = max((960 + 5) * 3, day_bars + 5) = 2895, roughly 30
+        same-ET-slot observations against the 11 the rolling median needs, so
+        the baseline is warm at every test window's first bar. Passing it as a
+        float (to silence check_strategy.py's "suspiciously large int"
+        warning) would drop the buffer to the largest `thrust_lookback`, ~111
+        bars — about one same-slot observation — leaving the baseline NaN and
+        the signal closed across every test window. The warning is expected
+        here and must not be acted on.
+      - `rvol_mult` -> float. A dimensionless volume ratio threshold, not a bar
+        count; the cast is unconditional so an integer-valued entry (3, 4, 5)
+        can never silently inflate the warm-up buffer.
+
+    `strategy.BARS_PER_DAY` (96) stays a hardcoded module constant and is
+    deliberately NOT a param here — turning a bars-per-day constant into a grid
+    param was iteration 4's error.
 
     `session` is fixed, never searched.
     """
     grid = []
-    for lookback, mult in product(drift_lookbacks, drift_mults):
+    for mult, lookback in product(rvol_mults, thrust_lookbacks):
         grid.append(
             {
-                "drift_lookback": int(lookback),
-                "drift_mult": float(mult),
+                "rvol_mult": float(mult),
+                "thrust_lookback": int(lookback),
+                "rvol_baseline_bars": int(rvol_baseline_bars),
                 "session": session,
             }
         )

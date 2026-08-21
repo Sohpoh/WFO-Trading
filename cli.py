@@ -6,12 +6,12 @@ Useful for batch runs, cron/CI, or piping results into other tools instead of
 clicking through the sidebar every time.
 
 Examples:
-    # quick run with defaults (NQ, 1h, London session)
+    # quick run with defaults (NQ, 1h, New York session)
     python cli.py
 
     # override strategy/grid + walk-forward schedule
-    python cli.py --symbol NQ --timeframe 5min --session London \\
-        --drift-lookback 72,144,288,432 --drift-mult 0.75,1.0,1.25,1.6 \\
+    python cli.py --symbol NQ --timeframe 15min --session "New York" \\
+        --rvol-mult 3.0,4.0,5.0,6.5 --thrust-lookback 4,8,16,32 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,29 +64,33 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (overnight-drift hold: sqrt(L)-scaled drift state signal, "
-        "plain flip exit, no stop and no target)"
+        "strategy grid (relative-volume surge continuation: ET-slot-normalized volume "
+        "trigger, trailing-return direction, plain flip exit, no stop and no target)"
     )
-    strat.add_argument("--session", default="London", choices=list(SESSION_CONFIG.keys()) + ["none"],
+    strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--drift-lookback", default="72,144,288,432",
-                        help="comma-separated drift horizons in bars: drift = Close - Close.shift(N). "
-                             "Defaults are sized for 5min bars (72/144/288/432 = 6h/12h/24h/36h); every "
-                             "value is at least 2x the 3h London window so the trailing window can't fully "
-                             "roll over mid-session and cost two extra legs. NOTE: this is also what sizes "
-                             "the engine's warm-up buffer — the hardcoded 288-bar ATR scale "
-                             "(strategy.ATR_BARS) is a module constant and invisible to that arithmetic, so "
-                             "don't drop the top of this list below ~96 or that scale starts each test "
-                             "window cold (NaN, fails closed, no signals)")
-    strat.add_argument("--drift-mult", default="0.75,1.0,1.25,1.6",
-                        help="comma-separated entry thresholds on z = drift / (ATR * sqrt(N)), i.e. the "
-                             "trailing drift measured in random-walk-typical-move units: LONG when "
-                             "z >= mult, SHORT when z <= -mult, no signal in between. Under a random walk "
-                             "E|z| ~ 0.8, so these defaults qualify roughly 45%%/32%%/23%%/11%% of bars — "
-                             "every setting selects an at-or-above-typical overnight move. Because z is a "
-                             "persistent state rather than an event it is usually already true at the "
-                             "window's first bar, which is what produces the intended one-round-trip-per-"
-                             "session cost profile (open on the first in-session bar, hold to the flatten)")
+    strat.add_argument("--rvol-mult", default="3.0,4.0,5.0,6.5",
+                        help="comma-separated relative-volume trigger thresholds. rvol = Volume / "
+                             "(rolling median of the prior N same-Eastern-Time-slot volumes), so 4.0 means "
+                             "'this bar traded 4x its usual volume for this time of day'. A bar fires only "
+                             "when rvol >= mult; direction then comes from --thrust-lookback, not from the "
+                             "surge bar itself. Thresholds are dimensionless ratios and are passed as floats "
+                             "so they can never inflate the engine's warm-up buffer")
+    strat.add_argument("--thrust-lookback", default="4,8,16,32",
+                        help="comma-separated direction horizons in bars: d = Close - Close.shift(N). "
+                             "On a qualifying surge bar the position goes LONG if d > 0 and SHORT if d < 0 "
+                             "(d == 0 fails closed). Defaults are sized for 15min bars (4/8/16/32 = 1h/2h/"
+                             "4h/8h) — a pre-existing trailing move, deliberately orthogonal to the volume "
+                             "trigger rather than read off the trigger bar's own shape")
+    strat.add_argument("--rvol-baseline-bars", type=int, default=960,
+                        help="FIXED, never grid-searched: length of the relative-volume baseline expressed "
+                             "as a bar count. The number of prior same-ET-slot observations the rolling "
+                             "median uses is this divided by strategy.BARS_PER_DAY (960 // 96 = 10). It is "
+                             "stated in bars, and passed to the engine as a plain int, precisely so "
+                             "wfo_engine._max_lookback_bars() can see it and size the warm-up buffer to "
+                             "(960+5)*3 = 2895 bars (~30 same-slot observations) — a module constant here, "
+                             "or a float, would leave the baseline NaN and the signal closed across most of "
+                             "every test window")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -137,9 +141,14 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        drift_lookbacks = parse_num_list(args.drift_lookback, int)
-        drift_mults = parse_num_list(args.drift_mult, float)
-        grid = build_grid(drift_lookbacks, drift_mults, session)
+        rvol_mults = parse_num_list(args.rvol_mult, float)
+        thrust_lookbacks = parse_num_list(args.thrust_lookback, int)
+        grid = build_grid(
+            rvol_mults=rvol_mults,
+            thrust_lookbacks=thrust_lookbacks,
+            rvol_baseline_bars=args.rvol_baseline_bars,
+            session=session,
+        )
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -180,11 +189,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        drift_lookback_vals = sorted({p["drift_lookback"] for p in chosen})
-        drift_mult_vals = sorted({p["drift_mult"] for p in chosen})
+        rvol_mult_vals = sorted({p["rvol_mult"] for p in chosen})
+        thrust_lookback_vals = sorted({p["thrust_lookback"] for p in chosen})
         print(
-            f"Fold param stability: {len(drift_lookback_vals)} distinct drift lookback {drift_lookback_vals}, "
-            f"{len(drift_mult_vals)} distinct drift mult {drift_mult_vals}"
+            f"Fold param stability: {len(rvol_mult_vals)} distinct rvol mult {rvol_mult_vals}, "
+            f"{len(thrust_lookback_vals)} distinct thrust lookback {thrust_lookback_vals}"
         )
 
     if args.out_dir:
@@ -196,8 +205,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "drift_lookback": f.best_params.get("drift_lookback"),
-                "drift_mult": f.best_params.get("drift_mult"),
+                "rvol_mult": f.best_params.get("rvol_mult"),
+                "thrust_lookback": f.best_params.get("thrust_lookback"),
+                "rvol_baseline_bars": f.best_params.get("rvol_baseline_bars"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }
