@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 5min --session London \\
-        --range-lookback 72,144,288,576 --buffer-frac 0.05,0.10,0.15,0.20 \\
+        --drift-lookback 72,144,288,432 --drift-mult 0.75,1.0,1.25,1.6 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,27 +64,29 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (overnight-range breakout: Donchian channel + vol-regime "
-        "gate, failed-breakout stop, no target)"
+        "strategy grid (overnight-drift hold: sqrt(L)-scaled drift state signal, "
+        "plain flip exit, no stop and no target)"
     )
     strat.add_argument("--session", default="London", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--range-lookback", default="72,144,288,576",
-                        help="comma-separated Donchian channel lengths in bars, shifted one bar so the "
-                             "current bar is excluded from the channel it has to break. Defaults are sized "
-                             "for 5min bars (72/144/288/576 = 6h/12h/24h/48h). NOTE: this is also what "
-                             "sizes the engine's warm-up buffer — the hardcoded 1152-bar slow leg of the "
-                             "volatility-regime gate is a module constant and invisible to that arithmetic, "
-                             "so keep the top of this list at 576 or the gate starts each test window cold "
-                             "(fails closed, no signals)")
-    strat.add_argument("--buffer-frac", default="0.05,0.10,0.15,0.20",
-                        help="comma-separated breakout buffers as a fraction of channel width: LONG when "
-                             "Close > upper + frac*width, SHORT when Close < lower - frac*width. Both sides "
-                             "are AND-ed with the zero-parameter vol-regime gate (strategy.ATR_FAST_BARS / "
-                             "ATR_SLOW_BARS = 288/1152 bars, i.e. 24h vs 96h at 5min). The stop "
-                             "(strategy.STOP_WIDTH_MULT = 0.5 x the trigger bar's channel width) and the "
-                             "deliberately unreachable 'no target' are likewise hardcoded, keeping the "
-                             "search at two dimensions")
+    strat.add_argument("--drift-lookback", default="72,144,288,432",
+                        help="comma-separated drift horizons in bars: drift = Close - Close.shift(N). "
+                             "Defaults are sized for 5min bars (72/144/288/432 = 6h/12h/24h/36h); every "
+                             "value is at least 2x the 3h London window so the trailing window can't fully "
+                             "roll over mid-session and cost two extra legs. NOTE: this is also what sizes "
+                             "the engine's warm-up buffer — the hardcoded 288-bar ATR scale "
+                             "(strategy.ATR_BARS) is a module constant and invisible to that arithmetic, so "
+                             "don't drop the top of this list below ~96 or that scale starts each test "
+                             "window cold (NaN, fails closed, no signals)")
+    strat.add_argument("--drift-mult", default="0.75,1.0,1.25,1.6",
+                        help="comma-separated entry thresholds on z = drift / (ATR * sqrt(N)), i.e. the "
+                             "trailing drift measured in random-walk-typical-move units: LONG when "
+                             "z >= mult, SHORT when z <= -mult, no signal in between. Under a random walk "
+                             "E|z| ~ 0.8, so these defaults qualify roughly 45%%/32%%/23%%/11%% of bars — "
+                             "every setting selects an at-or-above-typical overnight move. Because z is a "
+                             "persistent state rather than an event it is usually already true at the "
+                             "window's first bar, which is what produces the intended one-round-trip-per-"
+                             "session cost profile (open on the first in-session bar, hold to the flatten)")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -135,9 +137,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        range_lookbacks = parse_num_list(args.range_lookback, int)
-        buffer_fracs = parse_num_list(args.buffer_frac, float)
-        grid = build_grid(range_lookbacks, buffer_fracs, session)
+        drift_lookbacks = parse_num_list(args.drift_lookback, int)
+        drift_mults = parse_num_list(args.drift_mult, float)
+        grid = build_grid(drift_lookbacks, drift_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -178,11 +180,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
-        buffer_frac_vals = sorted({p["buffer_frac"] for p in chosen})
+        drift_lookback_vals = sorted({p["drift_lookback"] for p in chosen})
+        drift_mult_vals = sorted({p["drift_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(range_lookback_vals)} distinct range lookback {range_lookback_vals}, "
-            f"{len(buffer_frac_vals)} distinct buffer frac {buffer_frac_vals}"
+            f"Fold param stability: {len(drift_lookback_vals)} distinct drift lookback {drift_lookback_vals}, "
+            f"{len(drift_mult_vals)} distinct drift mult {drift_mult_vals}"
         )
 
     if args.out_dir:
@@ -194,8 +196,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "range_lookback": f.best_params.get("range_lookback"),
-                "buffer_frac": f.best_params.get("buffer_frac"),
+                "drift_lookback": f.best_params.get("drift_lookback"),
+                "drift_mult": f.best_params.get("drift_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }

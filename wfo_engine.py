@@ -34,38 +34,39 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(range_lookbacks, buffer_fracs, session) -> list[dict]:
+def build_grid(drift_lookbacks, drift_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Both params are searched. `range_lookback` is cast to a plain int on
-    purpose: it's a genuine bar-count lookback (the Donchian channel window),
-    so it *should* feed `_max_lookback_bars()`'s warm-up buffer.
-    `buffer_frac` is cast to float for the same reason in reverse — it's a
-    fraction of channel width, not a bar count, and must never inflate that
-    buffer.
+    Both params are searched. `drift_lookback` is cast to a plain int on
+    purpose: it's a genuine bar-count lookback (the horizon the drift is
+    measured over), so it *should* feed `_max_lookback_bars()`'s warm-up
+    buffer. `drift_mult` is cast to float for the same reason in reverse — it's
+    a threshold in random-walk-sigma units, not a bar count, and must never
+    inflate that buffer (an int 1 there would be harmless, but an int-valued
+    entry in a param dict is exactly the class of bug that silently
+    mis-sizes warm-up, so the cast is unconditional).
 
-    The strategy's zero-parameter overlays — the volatility-regime gate windows
-    (`strategy.ATR_FAST_BARS` / `strategy.ATR_SLOW_BARS`) and the exit
-    constants (`strategy.STOP_WIDTH_MULT` / `strategy.TARGET_WIDTH_MULT`) — are
-    hardcoded module constants and deliberately never enter the grid, which
-    keeps the search at two dimensions.
+    The strategy's volatility scale (`strategy.ATR_BARS` = 288 bars, 24h at
+    5min) is a hardcoded module constant and deliberately never enters the
+    grid, which keeps the search at two dimensions.
 
-    Caveat worth knowing when narrowing the grid by hand: because
-    `ATR_SLOW_BARS` (1152) is a module constant rather than a param, it is
-    invisible to `_max_lookback_bars()`. The warm-up buffer is sized purely by
-    the largest int here, so the intended grid top of 576 (giving
-    (576+5)*3 = 1743 >= the 1154 bars the gate needs) is what keeps the gate
-    warm at each test window's open. Searching only small lookbacks would
-    starve the gate rather than speed things up.
+    Caveat worth knowing when narrowing the grid by hand: because `ATR_BARS`
+    is a module constant rather than a param, it is invisible to
+    `_max_lookback_bars()`. The warm-up buffer is sized purely by the largest
+    int here, so the intended grid top of 432 (giving (432+5)*3 = 1311 >= the
+    433 bars the drift window needs, comfortably above ATR's 290) is what keeps
+    both legs warm at each test window's open. Searching only lookbacks below
+    ~96 would starve the ATR scale rather than speed things up — the
+    one-full-day floor covers it by only three bars at 5min.
 
     `session` is fixed, never searched.
     """
     grid = []
-    for lookback, frac in product(range_lookbacks, buffer_fracs):
+    for lookback, mult in product(drift_lookbacks, drift_mults):
         grid.append(
             {
-                "range_lookback": int(lookback),
-                "buffer_frac": float(frac),
+                "drift_lookback": int(lookback),
+                "drift_mult": float(mult),
                 "session": session,
             }
         )
