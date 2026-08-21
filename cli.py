@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 5min --session London \\
-        --atr-period 96,288 --expansion-mult 2.0,2.8 \\
+        --range-lookback 72,144,288,576 --buffer-frac 0.05,0.10,0.15,0.20 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,22 +64,27 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (volatility-ignition continuation: expansion-bar entry, "
-        "trigger-bar stop, no target)"
+        "strategy grid (overnight-range breakout: Donchian channel + vol-regime "
+        "gate, failed-breakout stop, no target)"
     )
     strat.add_argument("--session", default="London", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--atr-period", default="48,96,192,288",
-                        help="comma-separated ATR baseline lengths in bars (shifted one bar, so the current "
-                             "bar is excluded from the average it is compared against). This is the "
-                             "prevailing-volatility yardstick the ignition bar has to clear")
-    strat.add_argument("--expansion-mult", default="2.0,2.4,2.8,3.2",
-                        help="comma-separated ignition thresholds: a bar fires when High-Low >= mult*ATR. "
-                             "Direction comes from where it closed inside its own range — LONG in the top "
-                             "quartile, SHORT in the bottom (strategy.CLOSE_LOC_TOP/CLOSE_LOC_BOT = "
-                             "0.75/0.25, hardcoded). The stop (strategy.STOP_BAR_MULT = 1.0 x the trigger "
-                             "bar's own range) and the deliberately unreachable 'no target' are likewise "
-                             "hardcoded, keeping the search at two dimensions")
+    strat.add_argument("--range-lookback", default="72,144,288,576",
+                        help="comma-separated Donchian channel lengths in bars, shifted one bar so the "
+                             "current bar is excluded from the channel it has to break. Defaults are sized "
+                             "for 5min bars (72/144/288/576 = 6h/12h/24h/48h). NOTE: this is also what "
+                             "sizes the engine's warm-up buffer — the hardcoded 1152-bar slow leg of the "
+                             "volatility-regime gate is a module constant and invisible to that arithmetic, "
+                             "so keep the top of this list at 576 or the gate starts each test window cold "
+                             "(fails closed, no signals)")
+    strat.add_argument("--buffer-frac", default="0.05,0.10,0.15,0.20",
+                        help="comma-separated breakout buffers as a fraction of channel width: LONG when "
+                             "Close > upper + frac*width, SHORT when Close < lower - frac*width. Both sides "
+                             "are AND-ed with the zero-parameter vol-regime gate (strategy.ATR_FAST_BARS / "
+                             "ATR_SLOW_BARS = 288/1152 bars, i.e. 24h vs 96h at 5min). The stop "
+                             "(strategy.STOP_WIDTH_MULT = 0.5 x the trigger bar's channel width) and the "
+                             "deliberately unreachable 'no target' are likewise hardcoded, keeping the "
+                             "search at two dimensions")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -130,9 +135,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        atr_periods = parse_num_list(args.atr_period, int)
-        expansion_mults = parse_num_list(args.expansion_mult, float)
-        grid = build_grid(atr_periods, expansion_mults, session)
+        range_lookbacks = parse_num_list(args.range_lookback, int)
+        buffer_fracs = parse_num_list(args.buffer_frac, float)
+        grid = build_grid(range_lookbacks, buffer_fracs, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -173,11 +178,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        atr_period_vals = sorted({p["atr_period"] for p in chosen})
-        expansion_mult_vals = sorted({p["expansion_mult"] for p in chosen})
+        range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
+        buffer_frac_vals = sorted({p["buffer_frac"] for p in chosen})
         print(
-            f"Fold param stability: {len(atr_period_vals)} distinct atr period {atr_period_vals}, "
-            f"{len(expansion_mult_vals)} distinct expansion mult {expansion_mult_vals}"
+            f"Fold param stability: {len(range_lookback_vals)} distinct range lookback {range_lookback_vals}, "
+            f"{len(buffer_frac_vals)} distinct buffer frac {buffer_frac_vals}"
         )
 
     if args.out_dir:
@@ -189,8 +194,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "atr_period": f.best_params.get("atr_period"),
-                "expansion_mult": f.best_params.get("expansion_mult"),
+                "range_lookback": f.best_params.get("range_lookback"),
+                "buffer_frac": f.best_params.get("buffer_frac"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }

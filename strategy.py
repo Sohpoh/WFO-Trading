@@ -1,117 +1,125 @@
-"""London volatility-ignition continuation — expansion-bar entry, trigger-bar stop, no target.
+"""London overnight-range breakout — Donchian channel, vol-regime gate, failed-breakout stop.
 
-A *continuation* strategy, deliberately confined to the quiet 02:00-05:00 ET
-London window. Where this repo's retired fade (iteration 13) sold the poke that
-was rejected back inside a channel, this buys the bar that breaks the quiet:
-one bar whose true range is a large multiple of the prevailing baseline.
+A session port of this repo's only demonstrated edge. Accepted iteration 11
+(NQ 15min, New York) paired a Donchian breakout with two *zero-parameter*
+overlays — an ATR volatility-regime gate and a channel-width-quoted
+failed-breakout stop — and produced OOS Sharpe 1.05 / PF 1.44 / efficiency
+2.03. Nothing about that entry primitive is New-York-specific, so this
+iteration changes exactly one economic thing — the session — and holds
+everything else fixed in economic terms.
 
-The edge thesis is volatility.md's clustering claim taken literally — "If
-volatility was high yesterday, it's likely to be elevated today"; "After a gap
-or large move, expect continued volatility before markets settle" — combined
-with its regime table ("Momentum: often works better in higher volatility —
-more pronounced trends"). In a structurally quiet session, a bar that is 2-3x
-the prevailing ATR is not noise, it is the arrival of real order flow, and
-nq-futures.md names exactly this window as an NQ volatility source ("Fed
-announcements (2 AM ET)", "Asian market closes (2-3 AM ET affecting tech)").
+Why the two novel London primitives already burned (iteration 13's fade,
+iteration 14's ignition) do not argue against trying again here: both failed at
+the *gross* level, not the cost level. Backing out `metrics.py`'s ~10.2bps
+round-trip toll leaves gross PF ~1.17 and ~0.88 respectively — the entries
+carried no directional information at all. That's evidence against those two
+entry primitives, not against the London window per se. Porting an entry that
+demonstrably *does* carry information is the cleaner test of the window itself.
 
-Rules (all computed on continuous bars, with no session awareness of their own):
+Why 5min rather than the accepted run's 15min: the London window is 02:00-05:00
+ET, i.e. only 12 bars at 15min. Per-fold train windows that thin would be
+selected on noise and the overfit-gap verdict would be uninformative. Gross
+capture here is bounded by the 05:00 flatten, not by bar size, so the finer bar
+gets in earlier without shrinking per-trade edge. **Every lookback is therefore
+re-expressed at 5min so it spans the identical wall-clock horizon as the
+accepted 15min run** — see the constants below and the `range_lookback` grid
+(72/144/288/576 bars = 6h/12h/24h/48h).
 
-  - True range and its baseline:
-        TR    = max(H - L, |H - C_prev|, |L - C_prev|)
-        ATR   = TR.rolling(atr_period, min_periods=atr_period).mean().shift(1)
-    The shift excludes the current bar from its own baseline — without it, a
-    large bar would inflate the very average it is being compared against
-    (lookahead, and it would mechanically damp its own signal). Strict
-    `min_periods` (pandas' default = window) means an unwarmed bar is NaN and
-    every comparison against it is False: the signal fails *closed*.
+Rules (all computed on continuous, session-unaware bars):
 
-  - Ignition: bar_range = High - Low, and
-        ignition = (bar_range >= expansion_mult * ATR) AND bar_range > 0 AND ATR > 0
-    The two guards are not redundant. `bar_range > 0` is required because the
-    close-location test below degenerates on a flat bar (a Close is
-    simultaneously in the "top quartile" and the "bottom quartile" of a
-    zero-width range), which would break the mutual exclusivity the delegate's
-    stop/target walk documents as an assumption. `ATR > 0` is required because
-    `bar_range >= mult * 0` is true on *every* bar, so a dead-flat baseline
-    (possible on thin overnight tape) would otherwise turn every bar into an
-    ignition.
+  - Donchian channel over the *previous* `range_lookback` bars, current bar
+    excluded:
+        upper = High.rolling(n, min_periods=n).max().shift(1)
+        lower = Low.rolling(n, min_periods=n).min().shift(1)
+        channel_width = upper - lower
+    The shift is what makes it a breakout rather than a tautology — without it
+    the current bar's own High is in its own channel ceiling and Close can
+    never exceed it. Strict `min_periods` (pandas' default = window) leaves
+    unwarmed bars NaN so every comparison against them is False: the signal
+    fails *closed*.
 
-  - Direction from close location *within the ignition bar's own range* — the
-    bar has to have closed where it went, not merely have been wide:
-        LONG  where ignition AND Close >= Low + CLOSE_LOC_TOP * bar_range
-        SHORT where ignition AND Close <= Low + CLOSE_LOC_BOT * bar_range
-    CLOSE_LOC_TOP = 0.75 / CLOSE_LOC_BOT = 0.25 are hardcoded module constants,
-    NOT grid-searched — zero added degrees of freedom. Given the `bar_range > 0`
-    guard the two sides are then mutually exclusive by construction (a Close
-    cannot sit in both the top and the bottom quartile of a strictly positive
-    range), so the delegate's long-first if/elif tie-break never binds.
+  - Breakout with a proportional buffer, so the required push scales with how
+    wide the range already is:
+        LONG  where Close > upper + buffer_frac * channel_width
+        SHORT where Close < lower - buffer_frac * channel_width
+    Mutually exclusive by construction: for any channel_width >= 0 the long
+    threshold sits at or above the short threshold, so a single Close cannot
+    clear both. The delegate's long-first if/elif tie-break never binds.
 
-  - Repeat signals while already in position are no-ops: the delegate's walk
-    only opens when flat, which is also what keeps the {-1,0,1} position
-    contract intact (no pyramiding).
+  - Volatility-regime gate, AND-ed into both sides. Carried over *unchanged in
+    meaning* from accepted iterations 6/10/11, with its two windows scaled 3x
+    for the 5min bar so it still measures 24h against 96h:
+        ATR_fast = mean true range over ATR_FAST_BARS = 288 bars   (24h)
+        ATR_slow = mean true range over ATR_SLOW_BARS = 1152 bars  (96h)
+        gate     = ATR_fast >= ATR_slow
+    Both are hardcoded module constants and NOT grid-searched — zero added
+    degrees of freedom. Leaving them at the 15min-era 96/384 would silently
+    redefine the gate as an 8h-vs-32h measure, which is a different indicator
+    wearing the same name. Strict `min_periods` again means the gate fails
+    closed while unwarmed.
 
-Exit — path-dependent stop, *no* profit target, plus the session flatten, all
-owned by `apply_session_constraint_with_stops()`:
+Exit — path-dependent stop, *no* profit target, plus the forced session
+flatten, all owned by `apply_session_constraint_with_stops()`:
 
-  - stop_distance = STOP_BAR_MULT * bar_range of the trigger bar, with
-    STOP_BAR_MULT = 1.0 a hardcoded module constant that is NOT grid-searched.
-    It is quoted in trigger-bar units rather than ATR units on purpose: entry
-    is at the Close of a bar whose range is >= 2x ATR with the Close in the
-    top/bottom quartile, so a conventional ATR-quoted stop of 1-1.5x ATR would
-    sit *inside* the trigger bar and be hit by that bar's own noise. At
-    STOP_BAR_MULT = 1.0, the long stop lands at `close - bar_range`, i.e. about
-    0.25 * bar_range *below* the trigger bar's Low (since the Close is in the
-    top quartile) — the economic reading is "a full retrace of the ignition bar
-    means the ignition failed" — and it self-scales with `expansion_mult`
-    without needing to be re-fitted. Iterations 10 and 11 were both accepted
-    with a hardcoded width-quoted stop, so this dimension is treated as settled
-    in this repo and no search budget is spent on it.
+  - stop_distance = STOP_WIDTH_MULT * channel_width of the trigger bar, with
+    STOP_WIDTH_MULT = 0.5 a hardcoded module constant that is NOT
+    grid-searched. This is the settled dimension from accepted iterations
+    10/11 and is unchanged in *price* terms here, since channel_width spans
+    the same wall-clock horizon as it did at 15min. The economic reading is
+    "a breakout that gives back half the range it broke out of was a failed
+    breakout", and it self-scales with `range_lookback` without refitting.
 
   - No target. The delegate refuses any entry whose target is NaN or on the
     wrong side of the entry Close, so "no target" has to be expressed as an
     unreachable level rather than omitted:
-        LONG  -> Close + TARGET_BAR_MULT * bar_range
-        SHORT -> Close - TARGET_BAR_MULT * bar_range
-    with TARGET_BAR_MULT = 1000.0. Winners therefore run to the forced session
-    flatten — the exit shape of accepted iterations 10/11. (It is a float
-    constant and never enters the grid; an int 1000 in a param dict would buy
-    3000 bars of meaningless warm-up via `_max_lookback_bars()`.)
+        LONG  -> Close + TARGET_WIDTH_MULT * channel_width
+        SHORT -> Close - TARGET_WIDTH_MULT * channel_width
+    with TARGET_WIDTH_MULT = 1000.0. Winners therefore run to the 05:00 ET
+    session flatten. It is a `float` on purpose and never enters the grid — an
+    int 1000 in a param dict would buy 3000 bars of meaningless warm-up via
+    `_max_lookback_bars()`.
 
-Two behaviours of the delegate, stated rather than assumed:
+Contract notes, stated rather than assumed:
 
-  - Degenerate bars fail closed twice over. An unwarmed ATR makes the ignition
-    comparison False; a zero `bar_range` makes stop_distance 0 and the target
-    exactly equal to the Close, and the delegate refuses to open without a
-    strictly positive stop distance and a strictly correctly-sided target.
+  - Repeat signals while already in position are no-ops: the delegate only
+    opens when flat *and* in-session, which is what keeps the {-1,0,1}
+    position contract intact (no pyramiding, never both sides at once).
 
-  - **Fill-model caveat, stated up front.** A stop hit is *detected* intrabar on
-    High/Low against the stored level, but the exit is priced at that bar's
-    Close. Volatility clustering — the very thesis of this entry — makes the bar
-    following an ignition bar often large too, so realized losses will
-    systematically *exceed* stop_distance. Results must not be described as
-    capping loss at the stop. Relatedly, the walk never flips long->short
-    directly: a stopped-out trade followed by an opposite-side entry is two
-    trades and two round-trip cost legs.
+  - Degenerate bars fail closed. A zero channel_width makes stop_distance 0
+    and puts the target exactly at the Close; the delegate refuses to open
+    without a strictly positive stop distance and a strictly correctly-sided
+    target.
 
-Iteration 6's ATR-ratio volatility-*regime* gate is deliberately omitted so this
-family's first run is attributable to the ignition entry alone; it is the
-reserved zero-param lever for the next in-family variation.
+  - **Fill-model caveat, unchanged and stated up front.** A stop hit is
+    *detected* intrabar on High/Low against the stored level, but the exit is
+    priced at that bar's Close. Realized losses can therefore exceed
+    stop_distance; results must not be described as capping loss at the stop.
+    Relatedly, the walk never flips long->short directly — a stopped-out trade
+    followed by an opposite-side entry is two trades and two round-trip cost
+    legs.
 
-Cost note: `metrics.py` charges ~0.102% round-trip off Close, unchanged here and
-out of scope for this file. Unlike the fade it replaces, the reward leg is not
-structurally capped — there is no target, so a winner's size is bounded only by
-how far the move runs before the London flatten (2-3 hours after entry at most).
+Cost caveat to carry into evaluation (NOT fixed here — `metrics.py` is out of
+scope for this file): the cost model charges a fixed 0.05% slippage regardless
+of session, while transaction-costs.md puts overnight/international spreads at
+5-10x the RTH figure. This backtest therefore *understates* true London cost. A
+marginal pass should be read as an upper bound; a clean failure is near-
+conclusive evidence that the London session itself, not the entry primitive, is
+the binding constraint.
 
-Warm-up: `atr_period` bars for the rolling mean plus the one-bar shift, plus one
-more for TR's own `Close.shift(1)`, i.e. `atr_period + 2`. That's a genuine
-bar-count lookback, so `atr_period` is passed as a plain `int` from
-`build_grid()` and correctly sizes the engine's pre-test-window buffer;
-`expansion_mult` is a ratio and is passed as a `float` so it can never inflate
-that buffer. With the intended grid topping out at atr_period = 288, the engine
-buffers max((288 + 5) * 3, day_bars + 5) = 879 bars, comfortably above the 290
-needed, so the ATR is fully warm at each test window's first bar. The binding
-floor is (max_lookback + 5) * 3 >= max_lookback + 2, which always holds — raise
-the buffer rather than loosening `min_periods` if that ever changes.
+Warm-up: the binding requirement is the *gate*, not the channel —
+ATR_SLOW_BARS (1152) + 1 for the rolling mean's shift + 1 for TR's own
+`Close.shift(1)` = 1154 bars, versus range_lookback + 1 <= 577 for the channel.
+`range_lookback` is a genuine bar-count lookback and is passed as a plain `int`
+from `build_grid()` so it feeds `_max_lookback_bars()`; `buffer_frac` is a
+ratio and is passed as a `float` so it can never inflate that buffer. At the
+intended grid top (range_lookback = 576) the engine buffers
+max((576 + 5) * 3, day_bars + 5) = 1743 bars >= 1154, so the gate is warm at
+every test window's first bar. **Caveat: ATR_SLOW_BARS is a module constant and
+is invisible to that arithmetic** — the buffer is sized entirely by the grid's
+largest int. Narrowing the searched `range_lookback` set below ~380 would drop
+the buffer under 1154 and leave ATR_slow NaN (gate closed, no signals) for the
+first bars of every test window. Keep the grid top at 576, or raise the buffer,
+rather than loosening `min_periods`.
 
 This module decides only *when* the strategy wants to be long or short. All
 day-trade gating and the end-of-session flatten are delegated to
@@ -122,38 +130,32 @@ import pandas as pd
 
 from session import apply_session_constraint_with_stops
 
-# Where the ignition bar's Close has to sit inside its own High-Low range for
-# the move to count as directional. Hardcoded, NOT grid-searched: top/bottom
-# quartile is an economic reading ("it closed where it went"), not a fitted
-# value, so it costs zero degrees of freedom.
-CLOSE_LOC_TOP = 0.75
-CLOSE_LOC_BOT = 0.25
+# Volatility-regime gate windows, in bars. Hardcoded, NOT grid-searched — the
+# zero-parameter overlay carried unchanged from accepted iterations 6/10/11.
+# Scaled 3x from the 15min-era 96/384 so that at 5min they still measure the
+# same wall-clock horizons: 288 bars = 24h, 1152 bars = 96h.
+ATR_FAST_BARS = 288
+ATR_SLOW_BARS = 1152
 
-# Stop distance, quoted in units of the trigger bar's own range (NOT ATR — see
-# the module docstring: an ATR-quoted stop would sit inside the trigger bar).
-# Hardcoded, NOT grid-searched.
-STOP_BAR_MULT = 1.0
+# Failed-breakout stop, quoted in units of the trigger bar's Donchian channel
+# width. Hardcoded, NOT grid-searched — the settled dimension from accepted
+# iterations 10/11.
+STOP_WIDTH_MULT = 0.5
 
 # "No target", expressed as an unreachable level because the delegate refuses
 # any entry with a NaN or wrong-sided target. A float on purpose so it could
 # never be mistaken for a bar-count lookback if it ever entered a param dict.
-TARGET_BAR_MULT = 1000.0
+TARGET_WIDTH_MULT = 1000.0
 
 
-def average_true_range(df: pd.DataFrame, atr_period: int) -> pd.Series:
-    """Wilder true range, simple-mean averaged over `atr_period`, shifted one bar.
+def true_range(df: pd.DataFrame) -> pd.Series:
+    """Wilder true range: max(H-L, |H-C_prev|, |L-C_prev|).
 
-    The shift excludes the current bar from its own baseline — an ignition bar
-    must be measured against the volatility that preceded it, not against an
-    average it has already contributed to.
-
-    `skipna=False` on the row-wise max keeps the first bar's TR NaN (its
-    `Close.shift(1)` is NaN) rather than silently falling back to High-Low, and
-    strict `min_periods` keeps every unwarmed bar NaN, so comparisons against
-    the ATR are False during warm-up and the signal fails closed.
+    `skipna=False` keeps the first bar NaN (its `Close.shift(1)` is NaN) rather
+    than silently falling back to High-Low.
     """
     prev_close = df["Close"].shift(1)
-    tr = pd.concat(
+    return pd.concat(
         [
             df["High"] - df["Low"],
             (df["High"] - prev_close).abs(),
@@ -161,36 +163,58 @@ def average_true_range(df: pd.DataFrame, atr_period: int) -> pd.Series:
         ],
         axis=1,
     ).max(axis=1, skipna=False)
-    return tr.rolling(atr_period, min_periods=atr_period).mean().shift(1)
+
+
+def average_true_range(df: pd.DataFrame, period: int) -> pd.Series:
+    """True range, simple-mean averaged over `period` bars, shifted one bar.
+
+    The shift excludes the current bar from its own average — strictly more
+    conservative than the gate needs (the gate compares two averages, so a
+    same-bar contribution would partially cancel), and it keeps both legs of
+    the ratio anchored to the same as-of-previous-bar information set.
+
+    Strict `min_periods` keeps every unwarmed bar NaN, so comparisons against
+    it are False during warm-up and the gate fails closed.
+    """
+    return true_range(df).rolling(period, min_periods=period).mean().shift(1)
 
 
 def generate_positions(
     df: pd.DataFrame,
-    atr_period: int,
-    expansion_mult: float,
+    range_lookback: int,
+    buffer_frac: float,
     session: str | None = "London",
 ) -> pd.Series:
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
 
-    atr = average_true_range(df, atr_period)
-    bar_range = high - low
+    # Donchian channel over the previous `range_lookback` bars, current bar
+    # excluded by the shift (otherwise Close could never exceed its own High).
+    upper = high.rolling(range_lookback, min_periods=range_lookback).max().shift(1)
+    lower = low.rolling(range_lookback, min_periods=range_lookback).min().shift(1)
+    channel_width = upper - lower
 
-    # Volatility ignition: this bar's range is a large multiple of the
-    # prevailing baseline. Both guards matter — see the module docstring.
-    ignition = (
-        (bar_range >= expansion_mult * atr) & (bar_range > 0) & (atr > 0)
-    ).fillna(False)
+    # Zero-parameter volatility-regime gate: only trade breakouts while
+    # short-horizon volatility is at or above its longer-horizon baseline.
+    atr_fast = average_true_range(df, ATR_FAST_BARS)
+    atr_slow = average_true_range(df, ATR_SLOW_BARS)
+    vol_regime = (atr_fast >= atr_slow).fillna(False)
 
-    # Direction from where the bar closed inside its own range. Mutually
-    # exclusive by construction given `bar_range > 0`.
-    long_signal = ignition & (close >= low + CLOSE_LOC_TOP * bar_range)
-    short_signal = ignition & (close <= low + CLOSE_LOC_BOT * bar_range)
+    # Proportional-buffer breakout. Mutually exclusive by construction for any
+    # channel_width >= 0. `.astype(bool)` is deliberate: the delegate indexes
+    # these arrays with plain truthiness, and a stray object-dtype NaN is
+    # truthy — this is what makes an unwarmed bar fail closed rather than open.
+    long_signal = (
+        (close > upper + buffer_frac * channel_width).fillna(False) & vol_regime
+    ).astype(bool)
+    short_signal = (
+        (close < lower - buffer_frac * channel_width).fillna(False) & vol_regime
+    ).astype(bool)
 
-    # Stop in trigger-bar units — symmetric, resolved to a side by the
-    # delegate. A zero/NaN range makes the delegate refuse the entry.
-    stop_distance = STOP_BAR_MULT * bar_range
+    # Failed-breakout stop, in channel-width units — symmetric, resolved to a
+    # side by the delegate. A zero/NaN width makes the delegate refuse the entry.
+    stop_distance = STOP_WIDTH_MULT * channel_width
 
     # "No target": an unreachable level, so the only exits are the stop and the
     # forced session flatten. Absolute and already direction-resolved, which is
@@ -198,8 +222,8 @@ def generate_positions(
     target_price = pd.Series(
         np.where(
             long_signal,
-            close + TARGET_BAR_MULT * bar_range,
-            close - TARGET_BAR_MULT * bar_range,
+            close + TARGET_WIDTH_MULT * channel_width,
+            close - TARGET_WIDTH_MULT * channel_width,
         ),
         index=df.index,
     )
@@ -217,7 +241,7 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    "atr_period": 96,
-    "expansion_mult": 2.4,
+    "range_lookback": 144,
+    "buffer_frac": 0.10,
     "session": "London",
 }

@@ -34,32 +34,38 @@ class Fold:
     n_test_bars: int = 0
 
 
-def build_grid(atr_periods, expansion_mults, session) -> list[dict]:
+def build_grid(range_lookbacks, buffer_fracs, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Both params are searched. `atr_period` is cast to a plain int on purpose:
-    it's a genuine bar-count lookback (the rolling window behind the ATR
-    baseline), so it *should* feed `_max_lookback_bars()`'s warm-up buffer.
-    `expansion_mult` is cast to float for the same reason in reverse — it's a
-    ratio of bar range to ATR, not a bar count, and must never inflate that
-    buffer (an `expansion_mult` of 3 arriving as an int and buying extra
-    warm-up bars would be meaningless).
+    Both params are searched. `range_lookback` is cast to a plain int on
+    purpose: it's a genuine bar-count lookback (the Donchian channel window),
+    so it *should* feed `_max_lookback_bars()`'s warm-up buffer.
+    `buffer_frac` is cast to float for the same reason in reverse — it's a
+    fraction of channel width, not a bar count, and must never inflate that
+    buffer.
 
-    The strategy's exit constants — `strategy.STOP_BAR_MULT`,
-    `strategy.TARGET_BAR_MULT` — and its close-location thresholds
-    (`CLOSE_LOC_TOP`/`CLOSE_LOC_BOT`) are hardcoded module constants and
-    deliberately never enter the grid: they introduce no new lookback (they
-    reuse the trigger bar's own range), so they are correctly invisible to the
-    buffer arithmetic.
+    The strategy's zero-parameter overlays — the volatility-regime gate windows
+    (`strategy.ATR_FAST_BARS` / `strategy.ATR_SLOW_BARS`) and the exit
+    constants (`strategy.STOP_WIDTH_MULT` / `strategy.TARGET_WIDTH_MULT`) — are
+    hardcoded module constants and deliberately never enter the grid, which
+    keeps the search at two dimensions.
+
+    Caveat worth knowing when narrowing the grid by hand: because
+    `ATR_SLOW_BARS` (1152) is a module constant rather than a param, it is
+    invisible to `_max_lookback_bars()`. The warm-up buffer is sized purely by
+    the largest int here, so the intended grid top of 576 (giving
+    (576+5)*3 = 1743 >= the 1154 bars the gate needs) is what keeps the gate
+    warm at each test window's open. Searching only small lookbacks would
+    starve the gate rather than speed things up.
 
     `session` is fixed, never searched.
     """
     grid = []
-    for period, mult in product(atr_periods, expansion_mults):
+    for lookback, frac in product(range_lookbacks, buffer_fracs):
         grid.append(
             {
-                "atr_period": int(period),
-                "expansion_mult": float(mult),
+                "range_lookback": int(lookback),
+                "buffer_frac": float(frac),
                 "session": session,
             }
         )
