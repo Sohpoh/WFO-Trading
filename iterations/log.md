@@ -21,4 +21,4 @@ which means the run was usable but didn't clear the vault's WFO acceptance bar.
 | 11 | 2026-08-20 | Rolling Range Breakout + Vol-Regime Gate, Failed-Breakout Stop, Narrow-Buffer Grid (NQ 15min, buffer_frac shifted to 0.05-0.20) | manual_cli_sweep | accepted | 1.05 | 2.0276 | 152 | `956324d` |
 | 12 | 2026-08-21 | With-Trend Pullback Reclaim (NQ 15min, trend-gated z-dip re-entry, zero-param sigma stop, no target) | invented_variation_of:mean-reversion.md | rejected | -1.72 | n/a (IS CAGR negative) | 444 | `d47c0d7` |
 | 13 | 2026-08-21 | Quiet-Session Band Rejection Fade (NQ 5min London, Donchian wick rejection, channel-fraction target) | invented_variation_of:volatility.md | rejected | -3.12 | n/a (IS CAGR negative) | 249 | `483af7a` |
-| 14 | 2026-08-21 | London Volatility-Ignition Continuation (NQ 5min, expansion-bar entry, trigger-bar stop, no target) | wiki:volatility.md | rejected | -2.19 | n/a (IS CAGR negative) | 113 | `PENDING` |
+| 14 | 2026-08-21 | London Volatility-Ignition Continuation (NQ 5min, expansion-bar entry, trigger-bar stop, no target) | wiki:volatility.md | rejected | -2.19 | n/a (IS CAGR negative) | 113 | `a84e141` |
