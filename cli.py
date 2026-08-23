@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --rvol-mult 3.0,4.0,5.0,6.5 --thrust-lookback 4,8,16,32 \\
+        --mom-lookback 24,48,96,192 --entry-t 0.5,1.0,1.5,2.0 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,33 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (relative-volume surge continuation: ET-slot-normalized volume "
-        "trigger, trailing-return direction, plain flip exit, no stop and no target)"
+        "strategy grid (skip-period risk-adjusted drift momentum, vol-regime gate, flip exit)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--rvol-mult", default="3.0,4.0,5.0,6.5",
-                        help="comma-separated relative-volume trigger thresholds. rvol = Volume / "
-                             "(rolling median of the prior N same-Eastern-Time-slot volumes), so 4.0 means "
-                             "'this bar traded 4x its usual volume for this time of day'. A bar fires only "
-                             "when rvol >= mult; direction then comes from --thrust-lookback, not from the "
-                             "surge bar itself. Thresholds are dimensionless ratios and are passed as floats "
-                             "so they can never inflate the engine's warm-up buffer")
-    strat.add_argument("--thrust-lookback", default="4,8,16,32",
-                        help="comma-separated direction horizons in bars: d = Close - Close.shift(N). "
-                             "On a qualifying surge bar the position goes LONG if d > 0 and SHORT if d < 0 "
-                             "(d == 0 fails closed). Defaults are sized for 15min bars (4/8/16/32 = 1h/2h/"
-                             "4h/8h) — a pre-existing trailing move, deliberately orthogonal to the volume "
-                             "trigger rather than read off the trigger bar's own shape")
-    strat.add_argument("--rvol-baseline-bars", type=int, default=960,
-                        help="FIXED, never grid-searched: length of the relative-volume baseline expressed "
-                             "as a bar count. The number of prior same-ET-slot observations the rolling "
-                             "median uses is this divided by strategy.BARS_PER_DAY (960 // 96 = 10). It is "
-                             "stated in bars, and passed to the engine as a plain int, precisely so "
-                             "wfo_engine._max_lookback_bars() can see it and size the warm-up buffer to "
-                             "(960+5)*3 = 2895 bars (~30 same-slot observations) — a module constant here, "
-                             "or a float, would leave the baseline NaN and the signal closed across most of "
-                             "every test window")
+    strat.add_argument("--mom-lookback", default="24,48,96,192",
+                        help="comma-separated momentum lookbacks in bars (window for the mean/std of "
+                             "returns behind the drift t-stat). The skip period between that window and "
+                             "the entry bar is NOT settable here — it is derived inside strategy.py as "
+                             "max(1, mom_lookback // 8), i.e. 3/6/12/24 bars for this default grid, so it "
+                             "adds no searchable degree of freedom and the optimizer cannot collapse it "
+                             "toward zero")
+    strat.add_argument("--entry-t", default="0.5,1.0,1.5,2.0",
+                        help="comma-separated entry thresholds on the (skipped) drift t-stat, in units of "
+                             "its own volatility (long at >= +t, short at <= -t)")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -141,14 +128,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        rvol_mults = parse_num_list(args.rvol_mult, float)
-        thrust_lookbacks = parse_num_list(args.thrust_lookback, int)
-        grid = build_grid(
-            rvol_mults=rvol_mults,
-            thrust_lookbacks=thrust_lookbacks,
-            rvol_baseline_bars=args.rvol_baseline_bars,
-            session=session,
-        )
+        mom_lookbacks = parse_num_list(args.mom_lookback, int)
+        entry_ts = parse_num_list(args.entry_t, float)
+        grid = build_grid(mom_lookbacks, entry_ts, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -189,11 +171,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        rvol_mult_vals = sorted({p["rvol_mult"] for p in chosen})
-        thrust_lookback_vals = sorted({p["thrust_lookback"] for p in chosen})
+        lookback_vals = sorted({p["mom_lookback"] for p in chosen})
+        entry_t_vals = sorted({p["entry_t"] for p in chosen})
         print(
-            f"Fold param stability: {len(rvol_mult_vals)} distinct rvol mult {rvol_mult_vals}, "
-            f"{len(thrust_lookback_vals)} distinct thrust lookback {thrust_lookback_vals}"
+            f"Fold param stability: {len(lookback_vals)} distinct mom lookback {lookback_vals}, "
+            f"{len(entry_t_vals)} distinct entry t {entry_t_vals}"
         )
 
     if args.out_dir:
@@ -205,9 +187,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "rvol_mult": f.best_params.get("rvol_mult"),
-                "thrust_lookback": f.best_params.get("thrust_lookback"),
-                "rvol_baseline_bars": f.best_params.get("rvol_baseline_bars"),
+                "mom_lookback": f.best_params.get("mom_lookback"),
+                "entry_t": f.best_params.get("entry_t"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
             }

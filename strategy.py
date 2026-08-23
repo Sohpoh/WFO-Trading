@@ -1,106 +1,159 @@
-"""Relative-volume surge continuation — ET-slot-normalized volume trigger,
-trailing-return direction, plain flip exit.
+"""Skip-period risk-adjusted drift momentum + volatility-regime gate, flip exit.
 
-Seventeen iterations in this repo have mined price and price-volatility only
-(Donchian channels, ATR, drift t-stats, range expansion) — every one of those
-statistics is mechanically correlated with the very move being traded. The
-`Volume` column has never been used once. This iteration spends that unused
-column: `es-futures.md`'s ORB recipe states the confirmation clause plainly —
-"If price breaks above the range high on high volume, go long" — and this lifts
-the volume-confirmation half as the *trigger*, dropping the session-anchored
-opening-range half.
+A time-series-momentum continuation strategy on the full continuous frame,
+traded as a plain flip: long when the trailing N-bar drift is large *relative
+to its own noise*, short on the mirror image, and no exit at all other than
+the opposite-side signal or the session's forced flatten.
 
-Session: New York. Four London primitives (iterations 13/14/15/17) all failed
-at the gross level and iteration 17 met its own pre-registered hurdle for
-retiring the London steer entirely, so this returns to the session where every
-accepted run in the log lives (6, 10, 11), on the continuation side — the only
-side that has ever produced positive IS and OOS here.
+This revives rejected iteration 7 with exactly one economic change: a **skip
+period**. Iteration 7 measured the drift t-stat right up to the entry bar and
+entered on it. `momentum-formulas.md` eq. 267 defines the momentum state with a
+skip S between the end of the measurement window and the entry, and its
+"Skipping the Most Recent Month" section gives the reason: "short-term mean
+reversion dominates over momentum in the 1-month horizon... buys 2-13 month
+winners, not yesterday's winners". Iteration 7 was entering on precisely the
+most-recent-window return the source says to discard — the same shape that
+produced 28%/34%/31% win rates in iterations 14/18/19.
 
-Rules (all computed on continuous, session-unaware bars):
+The invented part is the intraday transplant of that ~1/12 S/T ratio:
 
-  - Relative volume, normalized *within* the Eastern-Time time-of-day slot:
+      skip = max(1, mom_lookback // 8)
 
-        rvol = Volume / median(prior RVOL_OBS same-ET-slot Volumes)
+It is computed *inside this module* from `mom_lookback` and is deliberately
+NOT a `build_grid()` param. That is load-bearing twice over: (a) it adds zero
+searchable degrees of freedom, so this iteration remains a one-change delta on
+iteration 7, and (b) the optimizer cannot collapse the skip toward zero — the
+log shows folds systematically picking the loosest available grid value
+(iter 18 thrust_lookback=4 in 39/65 folds, iter 17 lookback=72 in 33/65), so a
+searchable skip would very likely be optimized straight back into iteration 7.
 
-    Bars are bucketed on their Eastern-Time minute-of-day; inside each bucket
-    the baseline is `rolling(RVOL_OBS, min_periods=RVOL_OBS).shift(1)` median,
-    so the current bar is excluded from its own yardstick and unwarmed buckets
-    stay NaN (fail closed).
+Session is New York — every accepted run in this log (6, 10, 11) lives there,
+and iteration 15 showed London kills even the accepted strategy (OOS PF
+0.125), which is why iteration 17's no-edge verdict on this same drift-state
+primitive is treated as confounded session evidence rather than evidence
+against the primitive itself.
 
-    ET bucketing rather than UTC is load-bearing, not cosmetic: New York's UTC
-    offset moves twice a year, so a UTC-slot baseline would compare open-slot
-    volume against pre-open volume for ~10 sessions after each DST switch,
-    inflating `rvol` and firing on nearly every bar in eight contaminated
-    windows. Bucketing on ET keeps 09:30 compared against 09:30 year-round.
+Rules (all computed with no session awareness of their own):
 
-    This is time-of-day *normalization inside an indicator*. It gates nothing
-    and flattens nothing — `apply_session_constraint()` still owns all session
-    logic, per CLAUDE.md's Day-Trade Session Requirement.
+  - Simple returns and their drift t-statistic:
+        r      = Close.pct_change()
+        mu     = r.rolling(N).mean()
+        sd     = r.rolling(N).std()
+        mom_t  = mu / (sd / sqrt(N))
+    with N = `mom_lookback`. This is the N-bar cumulative move expressed in
+    units of its own realized volatility. The sqrt(N) scaling is what makes
+    it comparable across lookbacks, so one `entry_t` grid is valid for every
+    N rather than needing a per-N threshold. (`mu / (sd / sqrt(N))` is
+    algebraically identical to `(mu / sd) * sqrt(N)`.)
 
-    `.where(baseline > 0)` masks a zero or NaN baseline: without it a zero
-    denominator gives +inf, and +inf clears every threshold in the grid, so a
-    dead slot would fire at every setting.
+    Note vs iteration 7: that iteration used log returns here; this one uses
+    simple returns, per the specified entry rule. At 15min NQ the two differ
+    in the ~1e-5 range and the difference is not the point of this iteration
+    — but it does mean the drift statistic is not *literally* byte-identical
+    to iteration 7's. The vol-regime gate and both grids are.
 
-  - Direction, from a pre-existing trailing return (orthogonal to the trigger):
+  - The skip, applied by shifting the whole statistic:
+        mom_t_skip = mom_t.shift(skip)
+    so the bar that decides the entry is separated from the measurement
+    window by `skip` bars. Shifting the finished statistic (rather than
+    shifting `r` before rolling) is what makes the gap sit between the window
+    and the entry, which is the construction the source describes.
 
-        d = Close - Close.shift(thrust_lookback)
+  - No lookahead: `r` is a backward difference, the rolling window ends on the
+    current bar's own return (knowable at that bar's Close), and `.shift(skip)`
+    only ever moves information *later*. The entry is priced at the decision
+    bar's Close.
 
-    Rejected iteration 14 took direction from close-location-in-bar and won
-    28.3% of trades; the surge bar's own shape is not used here at all.
+  - Raw signals:
+        long  where mom_t_skip >=  entry_t
+        short where mom_t_skip <= -entry_t
+    `entry_t` is strictly positive on the intended grid, so the two are
+    mutually exclusive by construction. (Caveat for the CLI, which will
+    accept it: at `entry_t = 0` exactly, both conditions are true when
+    mom_t_skip == 0 and short wins by assignment order below. The grid never
+    visits that point.)
 
-  - Entries:
-        LONG  where rvol >= rvol_mult and d > 0
-        SHORT where rvol >= rvol_mult and d < 0
-        NaN   elsewhere
-    `d == 0` and any unwarmed/NaN bar fail closed (NaN compares False on both
-    sides). The two sides are mutually exclusive by construction.
+  - Degenerate windows are dropped: a stretch of identical nonzero returns
+    gives sd == 0 and mu/sd == +/-inf, which would fire a signal at *any*
+    threshold. `mom_t` is therefore masked to NaN wherever sd is not
+    strictly positive. (sd == 0 with mu == 0 is already NaN via 0/0, but
+    the explicit mask covers both cases.) This guard is carried over from
+    iteration 7 — it is a correctness mask, not an economic filter.
 
-Exit — plain flip, no stop and no target. The raw entries series is handed
-straight to `apply_session_constraint()` (deliberately NOT the stops variant).
-Position is the forward-fill of the gated entries, so a trade ends only on an
-opposite-direction surge trigger or on the forced New York flatten the delegate
-owns; consecutive same-direction triggers are no-ops. This keeps the first run
-of the family attributable to the entry primitive alone and preserves the
-let-winners-run-to-flatten shape of accepted iteration 6. A failed-breakout-
-style stop is the reserved follow-up lever, exactly as iteration 6 -> 10 spent
-it.
+  - Volatility-regime gate (hardcoded, NOT grid-searched — carried over
+    byte-identical from accepted iteration 6 via iteration 7):
+        TR       = max(High-Low, |High-Close_prev|, |Low-Close_prev|)
+        atr_fast = TR.rolling(ATR_FAST_BARS).mean()
+        atr_slow = TR.rolling(ATR_SLOW_BARS).mean()
+        vol_ok   = atr_fast >= atr_slow
+    A raw signal only becomes an entry where `vol_ok`; elsewhere the bar
+    contributes NaN (no signal), exactly as if the drift hadn't reached the
+    threshold. The gate is applied symmetrically to long and short, and only
+    ever *removes* signals, so it cannot break their mutual exclusivity.
+    Gating only *fresh-from-flat* entries would need the forward-filled
+    position state, which the sparse entries-series contract has no room for
+    — that's `apply_session_constraint()`'s job, not this module's.
 
-Iteration 6's volatility-regime gate is deliberately omitted: iterations 8 and
-9 both tested "trade fewer, more selective" and both came back overfit-gap with
-trade counts collapsing 183 -> 100 -> 74. A volume surge is already a de-facto
-activity filter; stacking a second one is the known failure path.
+  - Why a slow ratio rather than an absolute vol threshold: a ratio is
+    scale-free (no points/percent constant to fit or to re-fit as NQ's price
+    level doubles) and, because volatility clusters, the fast/slow crossing
+    is a multi-day regime switch rather than a bar-by-bar chop filter. It
+    adds zero searchable degrees of freedom.
+
+Exit is a plain flip — deliberately no stop and no target, identical in
+formulation to iteration 7 so the skip is the only exit-side non-change:
+
+  - The raw entries series is handed to `apply_session_constraint()` (NOT the
+    stops variant). The position forward-fills from the entry bar until either
+    the opposite threshold fires (a reversal, 2 cost legs) or the forced
+    flatten on the session's last bar (1 leg). The ffilled 0 then propagates
+    through the overnight gap, so every session starts flat.
+  - Explicit consequence of gating the *exit* side too: when the opposite
+    signal happens in a suppressed (contracting-vol) regime, the position
+    does not reverse — it carries to the session flatten. That is part of
+    the thesis, not an oversight.
+  - A repeat same-direction signal while already positioned is a true no-op
+    with zero extra cost legs (it just re-writes the same 1.0/-1.0 into a
+    series that is already forward-filled to that value), satisfying the
+    single-position contract by construction.
+  - A failed-breakout-style stop is the reserved follow-up lever, exactly as
+    iteration 6 -> 10 spent it.
+
+Cost note: `metrics.py` charges ~0.102% round-trip off Close, unchanged here
+and out of scope for this file. The skip does not change the cost model; it
+shifts *when* entries fire, and if anything slightly reduces flip frequency.
 
 Warm-up and param types:
 
-  - `rvol_baseline_bars` (fixed at 960, one grid value, never searched) is
-    expressed as a *bar count* rather than an observation count precisely so
-    `wfo_engine._max_lookback_bars()` can see it: the observation count is
-    derived as `rvol_baseline_bars // BARS_PER_DAY = 960 // 96 = 10`. It is
-    passed as a plain `int`, giving `buffer_bars = max((960 + 5) * 3, ...) =
-    2895` bars, roughly 30 same-slot observations against the 11 needed — warm
-    at every test window's first bar. Making it a module constant instead would
-    render it invisible to that derivation and leave the baseline NaN (signal
-    closed) for most of every test window; making it a float would starve the
-    buffer down to ~111 bars, i.e. about one same-slot observation, with the
-    same effect. `tools/check_strategy.py` warns about ints > 500 in the grid —
-    here that warning is expected and must not be "fixed".
+  - The drift leg needs `mom_lookback + 1 + skip` bars — N returns for the
+    rolling mean/std, one bar for the `pct_change`, plus the skip's shift.
+    `mom_lookback` is a genuine bar-count lookback, so it is passed as a plain
+    `int` from `build_grid()` and correctly sizes the engine's pre-test-window
+    buffer; `entry_t` is a threshold in t-units, not a bar count, and is passed
+    as a `float` so it cannot inflate that buffer. `skip` is derived here and
+    is invisible to the engine by design.
 
-  - `thrust_lookback` is a genuine bar-count lookback and is a plain `int`.
-  - `rvol_mult` is a dimensionless ratio threshold and is a `float`, so it can
-    never inflate the warm-up buffer.
+  - The gate's own warm-up is 384 bars (`ATR_SLOW_BARS` exactly — TR's first
+    bar degrades to High-Low rather than NaN, so `Close.shift(1)` costs
+    nothing here), and it is likewise *invisible* to
+    `wfo_engine._max_lookback_bars()` because it is a module constant rather
+    than a grid param. That is safe for the intended grid: the longest searched
+    `mom_lookback` is 192, so
+        buffer_bars = max((192 + 5) * 3, day_bars + 5) = 591,
+    which clears both 384 and the drift leg's 192 + 1 + 24 = 217 bars. Because
+    217 < 384, the binding constraint is still the gate, exactly as in
+    iteration 7 — so iteration 7's caveat carries over unchanged: a longest
+    searched `mom_lookback` below 123 shrinks the buffer under 384 and would
+    start every test window with the gate closed, i.e. zero trades with no
+    error to explain it. (The skip raises the drift leg's own need by N//8,
+    which only overtakes 384 for N above ~340 — far outside this grid.) If you
+    do shrink the grid, raise the buffer (e.g. by threading a fixed int
+    lookback param through `build_grid()`) rather than loosening `min_periods`.
 
-  - `BARS_PER_DAY = 96` is a hardcoded module constant and is never a
-    `build_grid()` param — that exact mistake was iteration 4's error. It is
-    also deliberately not derived from the passed `df`: on a 1h run that would
-    make the observation count 41 and leave most of every window cold, whereas
-    the constant keeps it at 10 for any timeframe.
-
-Cost caveat to carry into evaluation (NOT changed here — `metrics.py` is out of
-scope for this file): the model charges a flat 0.05% slippage per leg. A volume
-*surge* bar is, if anything, a bar where liquidity is unusually deep, so the
-constant-slippage assumption is more defensible on this trigger than on the
-quiet-session iterations — but it is still a constant, and no per-bar
-adjustment is made.
+  - All rolling windows use strict `min_periods` on purpose, so an
+    incompletely warmed leg is NaN and both the drift signal and the gate fail
+    *closed* (no entries) rather than silently degrading to an always-true
+    no-op.
 
 This module decides only *when* the strategy wants to be long or short. All
 day-trade gating and the end-of-session flatten are delegated to
@@ -110,56 +163,101 @@ import pandas as pd
 
 from session import apply_session_constraint
 
-# Bars in one 24h day at the intended 15min timeframe. Hardcoded module
-# constant, NEVER a build_grid() param and never derived from the data — it is
-# only the divisor that turns the `rvol_baseline_bars` bar count into a
-# same-slot observation count.
-BARS_PER_DAY = 96
+# Volatility-regime gate windows, in bars. Hardcoded on purpose: the gate adds
+# no searchable degrees of freedom, so the only change versus iteration 7 is
+# the skip period. Sized for 15min bars — 96 bars is ~one full 24h Globex day
+# and 384 is ~four of them, i.e. a slow, multi-day regime switch rather than a
+# bar-by-bar chop filter.
+ATR_FAST_BARS = 96
+ATR_SLOW_BARS = 384
+
+# Ratio between the momentum measurement window and the skip period, lifted
+# from the vault's ~1/12 monthly S/T ratio and rounded to the nearest power of
+# two for the intraday transplant. A module constant, never a build_grid()
+# param — see the module docstring for why the optimizer must not see it.
+SKIP_DIVISOR = 8
 
 
-def relative_volume(df: pd.DataFrame, baseline_bars: int) -> pd.Series:
-    """Volume divided by its own recent median in the same Eastern-Time slot.
+def true_range(df: pd.DataFrame) -> pd.Series:
+    """Wilder's True Range: max(H-L, |H-C_prev|, |L-C_prev|).
 
-    `baseline_bars` is a bar count (so the engine's warm-up derivation can see
-    it); the number of prior same-slot observations used is
-    `baseline_bars // BARS_PER_DAY`, floored at 1.
-
-    Bucketing is on Eastern-Time minute-of-day — an int64 grouper, and DST-safe
-    because `tz_convert` resolves the offset per timestamp rather than assuming
-    a fixed one. Within each bucket the median is rolled over strictly prior
-    observations (`.shift(1)`), with strict `min_periods` so unwarmed buckets
-    stay NaN and every comparison against them is False.
+    `prev_close` is NaN on the first bar, so two of the three legs are NaN
+    there; `.max(axis=1)` skips NaNs by default, leaving TR[0] = High - Low.
+    That degenerate-but-sane first value is intentional (no fillna needed),
+    which is why the gate's warm-up is exactly `ATR_SLOW_BARS` bars, not one
+    more.
     """
-    n_obs = max(1, int(baseline_bars) // BARS_PER_DAY)
+    prev_close = df["Close"].shift(1)
+    return pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
-    volume = df["Volume"].astype(float)
-    et = df.index.tz_convert("America/New_York")
-    slot = et.hour * 60 + et.minute
 
-    baseline = volume.groupby(slot).transform(
-        lambda s: s.rolling(n_obs, min_periods=n_obs).median().shift(1)
-    )
+def vol_regime_ok(df: pd.DataFrame) -> pd.Series:
+    """True where fast realized vol >= slow realized vol (expanding regime).
 
-    # A zero baseline would give +inf, which clears every threshold in the
-    # grid; NaN (warm-up) is masked by the same expression.
-    return (volume / baseline).where(baseline > 0)
+    Strict `min_periods` (pandas' default = window) so an unwarmed slow leg is
+    NaN and the comparison is False — the gate fails closed (suppress) rather
+    than open (trade ungated), which is the conservative direction.
+    """
+    tr = true_range(df)
+    atr_fast = tr.rolling(ATR_FAST_BARS, min_periods=ATR_FAST_BARS).mean()
+    atr_slow = tr.rolling(ATR_SLOW_BARS, min_periods=ATR_SLOW_BARS).mean()
+    return (atr_fast >= atr_slow).fillna(False)
+
+
+def skip_bars(mom_lookback: int) -> int:
+    """Skip period between the measurement window and the entry bar.
+
+    Derived, never searched: `max(1, N // SKIP_DIVISOR)` — 3/6/12/24 bars for
+    the 24/48/96/192-bar grid. Floored at 1 so the entry bar is never the last
+    bar of its own measurement window even for tiny N.
+    """
+    return max(1, int(mom_lookback) // SKIP_DIVISOR)
+
+
+def drift_tstat(close: pd.Series, mom_lookback: int) -> pd.Series:
+    """t-statistic of the trailing `mom_lookback`-bar mean simple return.
+
+    mu / (sd / sqrt(N)) — the N-bar drift measured in units of its own
+    realized volatility, and scale-free across N so a single threshold grid
+    is valid for every lookback.
+
+    `close.diff() / close.shift(1)` rather than `close.pct_change()`: the two
+    are identical, but the bare `pct_change()` call emits a pandas
+    FutureWarning about its `fill_method` default.
+
+    Strict `min_periods` on both legs so an unwarmed window is NaN (no
+    signal) rather than a partially-estimated one. Windows with a
+    non-positive/undefined `sd` are masked out: N identical nonzero returns
+    would otherwise give +/-inf here and fire at any threshold.
+    """
+    r = close.diff() / close.shift(1)
+    mu = r.rolling(mom_lookback, min_periods=mom_lookback).mean()
+    sd = r.rolling(mom_lookback, min_periods=mom_lookback).std()
+    return (mu / (sd / (mom_lookback ** 0.5))).where(sd > 0)
 
 
 def generate_positions(
     df: pd.DataFrame,
-    rvol_mult: float,
-    thrust_lookback: int,
-    rvol_baseline_bars: int = 960,
+    mom_lookback: int,
+    entry_t: float,
     session: str | None = "New York",
 ) -> pd.Series:
-    rvol = relative_volume(df, rvol_baseline_bars)
+    # Skip period: the whole statistic is shifted, so the measurement window
+    # ends `skip` bars before the bar that acts on it.
+    mom_t = drift_tstat(df["Close"], mom_lookback).shift(skip_bars(mom_lookback))
 
-    close = df["Close"]
-    thrust = close - close.shift(thrust_lookback)
-
-    surge = (rvol >= rvol_mult).fillna(False)
-    long_signal = (surge & (thrust > 0)).fillna(False)
-    short_signal = (surge & (thrust < 0)).fillna(False)
+    # Mutually exclusive for entry_t > 0 (the whole intended grid); the gate
+    # only ever removes signals, so it preserves that.
+    vol_ok = vol_regime_ok(df)
+    long_signal = (mom_t >= entry_t).fillna(False) & vol_ok
+    short_signal = (mom_t <= -entry_t).fillna(False) & vol_ok
 
     entries = pd.Series(index=df.index, dtype=float)  # all-NaN = "no signal"
     entries[long_signal] = 1.0
@@ -169,8 +267,7 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    "rvol_mult": 4.0,
-    "thrust_lookback": 8,
-    "rvol_baseline_bars": 960,
+    "mom_lookback": 48,
+    "entry_t": 1.0,
     "session": "New York",
 }
