@@ -178,6 +178,28 @@ def main(argv=None) -> int:
             f"{len(entry_t_vals)} distinct entry t {entry_t_vals}"
         )
 
+    # Per-fold OOS consistency: computed directly from each fold's own stitched
+    # test-window trades (see wfo_engine.Fold), not the OOS/Retail-IS ratio —
+    # that ratio divides by a single whole-period curve fit and degenerates
+    # whenever that fit's CAGR is small or negative. "Active" folds are those
+    # that actually took a trade; folds with a valid param set but zero trades
+    # are excluded from the denominator rather than counted as a loss.
+    active_folds = [f for f in folds if f.best_params and f.n_oos_trades > 0]
+    if active_folds:
+        fold_rets = pd.Series([f.oos_return for f in active_folds])
+        fold_sharpes = pd.Series([f.oos_sharpe for f in active_folds])
+        n_profitable = int((fold_rets > 0).sum())
+        idle_note = (
+            f" ({len(folds) - len(active_folds)} folds took no trades)"
+            if len(active_folds) < len(folds) else ""
+        )
+        print(
+            f"Fold OOS consistency: {n_profitable}/{len(active_folds)} active folds profitable "
+            f"({n_profitable / len(active_folds) * 100:.1f}%), median fold OOS return "
+            f"{fold_rets.median() * 100:.2f}%, median fold OOS Sharpe {fold_sharpes.median():.2f}"
+            f"{idle_note}"
+        )
+
     if args.out_dir:
         import os
         os.makedirs(args.out_dir, exist_ok=True)
@@ -191,6 +213,9 @@ def main(argv=None) -> int:
                 "entry_t": f.best_params.get("entry_t"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
+                "oos_trades": f.n_oos_trades,
+                "oos_return": f.oos_return,
+                "oos_sharpe": f.oos_sharpe,
             }
             for f in folds if f.best_params
         ]

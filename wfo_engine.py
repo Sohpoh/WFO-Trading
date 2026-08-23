@@ -17,7 +17,7 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
-from metrics import bar_returns_with_costs, extract_trades
+from metrics import bar_returns_with_costs, extract_trades, sharpe_ratio, total_return
 from strategy import generate_positions
 
 
@@ -32,6 +32,14 @@ class Fold:
     train_sharpe: float = 0.0
     n_train_bars: int = 0
     n_test_bars: int = 0
+    # Per-fold OOS aggregates — computed here (not reconstructed later by bucketing
+    # oos_trades.csv rows against fold test windows, which is only approximate).
+    # These are what let a caller check "% of folds profitable" and "median fold
+    # OOS return/Sharpe" directly instead of dividing by the single curve-fit
+    # Retail In-Sample number, whose small-CAGR cases make that ratio degenerate.
+    n_oos_trades: int = 0
+    oos_return: float = 0.0
+    oos_sharpe: float = 0.0
 
 
 def build_grid(mom_lookbacks, entry_ts, session) -> list[dict]:
@@ -188,8 +196,14 @@ def run_walk_forward(
         if best_params:
             test_ret, test_pos = _simulate_window(df, fold.test_start, fold.test_end, best_params, buffer_bars)
             fold.n_test_bars = len(test_ret)
+            fold_trades = extract_trades(df["Close"], test_pos)
+            fold_trades = fold_trades.copy()
+            fold_trades["fold"] = fold.index + 1  # 1-based, matches fold_table.csv's "fold" column
+            fold.n_oos_trades = int(len(fold_trades))
+            fold.oos_return = total_return(test_ret)
+            fold.oos_sharpe = sharpe_ratio(test_ret, ann_factor)
             oos_returns.append(test_ret)
-            oos_trades.append(extract_trades(df["Close"], test_pos))
+            oos_trades.append(fold_trades)
 
         if progress_callback:
             progress_callback(fold.index + 1, len(folds), fold)
@@ -197,7 +211,7 @@ def run_walk_forward(
     oos_series = pd.concat(oos_returns).sort_index() if oos_returns else pd.Series(dtype=float)
     oos_series = oos_series[~oos_series.index.duplicated(keep="first")]
     trades_df = pd.concat(oos_trades, ignore_index=True) if oos_trades else pd.DataFrame(
-        columns=["entry_time", "exit_time", "direction", "entry_price", "exit_price", "net_return"]
+        columns=["entry_time", "exit_time", "direction", "entry_price", "exit_price", "net_return", "fold"]
     )
     return oos_series, trades_df, folds
 
