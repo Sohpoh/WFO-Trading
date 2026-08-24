@@ -28,30 +28,41 @@ Two defects:
 factor on what's left — computed directly from each iteration's own `oos_trades.csv`,
 no new data needed):
 
-| iteration | OOS trades | full total return | full PF | ex-top-5 total return | ex-top-5 PF |
-|---|---|---|---|---|---|
-| 6  | 183 | +18.52% | 1.362 | +2.71%  | 1.053 |
-| 10 | 180 | +13.76% | 1.269 | -2.04%  | 0.960 |
-| 11 | 152 | +18.50% | 1.443 | +2.69%  | 1.065 |
+| iteration | OOS trades | full total return | full PF | ex-top-5 total return | ex-top-5 PF | gate v2 `robust` |
+|---|---|---|---|---|---|---|
+| 6  | 183 | +18.52% | 1.362 | +2.71%  | 1.053 | borderline |
+| 10 | 180 | +13.76% | 1.269 | -2.04%  | 0.960 | **false** (sign flip) |
+| 11 | 152 | +18.50% | 1.443 | +2.69%  | 1.065 | borderline |
 
-Every one collapses toward breakeven (or flips negative) once its best 5 trades (out
-of 150-183) are removed. Under gate v2's Step 3, all three would be `rejected` with
-`failure_mode: fragile-concentration`, not `accepted`.
+Iteration 10 fails outright (a straight sign flip once its best 5 trades are removed).
+Iterations 6 and 11 don't cleanly fail the letter of the check — profit factor stays
+just above 1.0 — but both collapse from a strong-looking ~1.4 down to barely-breakeven
+territory, which is exactly what gate v2's `"borderline"` tier exists to name rather
+than either wave through as clean passes (the original draft of this check called all
+three outright failures; that overstated it — see the calibration note in
+`wfo-evaluator.md` Step 3 for why a flat "PF < 1.0" line was replaced with this 3-way
+verdict). None of the three gets a clean `robust: true`. Combined with Step 2/4, gate
+v2 would not have accepted any of them without a lot more supporting margin than they
+actually have — but only iteration 10 is a hard, unambiguous reject on this check
+alone.
 
 **ES pseudo-holdout** (same accepted code, same grid, run unchanged against ES instead
 of NQ — ES was used in only 1 of the first 20 iterations, so it's the closest thing to
 untouched data available today without waiting for a real holdout window; imperfect
 since ES and NQ are correlated, but genuinely not fit to):
 
-| iteration | ES OOS Sharpe | ES OOS PF | ES OOS CAGR | ex-top-5 PF on ES |
-|---|---|---|---|---|
-| 6  | 0.564  | 1.290 | +1.99% | 0.910 |
-| 10 | -0.080 | 0.965 | -0.29% | — (already failing) |
-| 11 | -0.276 | 0.876 | -0.82% | — (already failing) |
+| iteration | ES OOS Sharpe | ES OOS PF | ES OOS total return | ex-top-5 total return on ES | ex-top-5 PF on ES | gate v2 `robust` on ES |
+|---|---|---|---|---|---|---|
+| 6  | 0.564  | 1.290 | +7.73% | -2.40% | 0.910 | **false** (sign flip) |
+| 10 | -0.080 | 0.965 | -1.08% | — | — | already fails Step 4 (Sharpe/PF/CAGR all negative or sub-bar) |
+| 11 | -0.276 | 0.876 | -3.08% | — | — | already fails Step 4 |
 
-Iteration 6 is the closest to holding up (positive across the board, Sharpe just under
-the 0.8 aim) but still fails leave-top-5-out on ES too. Iterations 10 and 11 fail
-outright. Read together with the leave-top-5-out table, this says the entire
+Iteration 6 is the closest to holding up on ES on the absolute numbers alone (positive
+Sharpe/PF/CAGR, Sharpe just under the 0.8 aim) — but its leave-top-5-out check flips
+sign on ES too (+7.73% full → -2.40% ex-top-5), which is a hard `robust: false`
+regardless of the PF number sitting just above 0.9. Iterations 10 and 11 fail the
+absolute checklist outright on ES, before robustness is even the deciding factor. Read
+together with the NQ leave-top-5-out table above, this says the entire
 `overnight_range_breakout` family's three "accepted" results were driven by a small
 number of outsized trades on one instrument, not a repeatable process — the family that
 consumed 9 of 20 iterations and both of the loop's prior pivotal decisions didn't
@@ -94,6 +105,15 @@ reader can tell which gate produced which verdict without re-deriving it.
      comparing prior OOS results against each other rather than by fold-internal
      evidence. `oos_peeked: true` blocks `confirmed` from ever being set by the
      exploration run alone; only Step 7b can confirm it.
+
+   Viability check before trusting this: ran iteration 6's exact grid against
+   `--date-from 2025-01-01` (the full holdout window, 12/3-week schedule) — 13 folds,
+   43 OOS trades. Thinner than the 65-fold/150+-trade exploration runs, but clears
+   rule-of-30 and Step 2's under-powered floor; the confirmation step is viable, not
+   structurally inert. An idea with a much longer `train_weeks` could still eat most
+   of the 52-week holdout and produce too few folds — if that happens, shortening the
+   schedule for the confirmation run specifically (and saying so) is reasonable; don't
+   let it silently degrade into an unrunnable check.
 
 ## What this doesn't fix (out of scope here)
 
