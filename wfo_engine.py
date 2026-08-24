@@ -42,35 +42,42 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(mom_lookbacks, entry_ts, session) -> list[dict]:
+def build_grid(z_lookbacks, entry_zs, target_sigmas, stop_sigma, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Both params are searched. `mom_lookback` is cast to a plain int on
-    purpose: it's a genuine bar-count lookback (the rolling window the drift
-    t-stat's mean/std are computed over), so it *should* feed
-    `_max_lookback_bars()`'s warm-up buffer. `entry_t` is cast to float for
-    the same reason in reverse — it's a threshold in t-units, not a bar
-    count, and must never inflate that buffer (an `entry_t` of 2 arriving as
-    an int and buying two bars of warm-up would be meaningless).
+    Three params are searched: `z_lookback`, `entry_z`, `target_sigma`.
+    `z_lookback` is cast to a plain int on purpose — it's a genuine bar-count
+    lookback (the rolling window behind both the z-score's mean/std and the
+    sigma the stop/target are quoted in), so it *should* feed
+    `_max_lookback_bars()`'s warm-up buffer. `entry_z`, `target_sigma` and
+    `stop_sigma` are cast to float for the same reason in reverse — they are
+    all multiples of a rolling sigma, not bar counts, and must never inflate
+    that buffer (a `target_sigma` of 2 arriving as an int and buying two bars
+    of warm-up would be meaningless).
 
-    The strategy's skip period is deliberately NOT a param here: it is derived
-    inside `strategy.py` as `max(1, mom_lookback // 8)`, so it adds no
-    searchable degree of freedom and the optimizer cannot collapse it toward
-    zero. It is therefore also invisible to `_max_lookback_bars()`, which is
-    safe — the largest searched `mom_lookback` (192) already gives
-    buffer_bars = max((192 + 5) * 3, day_bars + 5) = 591, clearing both the
-    strategy's 384-bar hardcoded vol-regime gate and the drift leg's
-    192 + 1 + 24 = 217 bars. See strategy.py's docstring for the caveat if
-    this grid's largest lookback is ever reduced below 123.
+    `stop_sigma` and `session` are fixed, never searched — both are threaded
+    into every combo as-is. `stop_sigma` is held at 2.0 deliberately: the
+    strategy's stop is a fixed-width sigma stop, and searching it would hand
+    the optimizer a fourth degree of freedom the design closed off.
 
-    `session` is fixed, never searched.
+    The variance-ratio regime measure is deliberately NOT a param here: its
+    window (384), its q (24) and its +/-0.05 deadband around the random-walk
+    boundary are all module constants inside `strategy.py`, so the polarity
+    switch adds no searchable degree of freedom. It is therefore also
+    invisible to `_max_lookback_bars()`, which is safe — the largest searched
+    `z_lookback` (192) already gives
+    buffer_bars = max((192 + 5) * 3, day_bars + 5) = 591, clearing the regime
+    leg's 384 + 24 = 408 bars. See strategy.py's docstring for the caveat if
+    this grid's largest lookback is ever reduced below 131.
     """
     grid = []
-    for lookback, t in product(mom_lookbacks, entry_ts):
+    for lookback, z, tgt in product(z_lookbacks, entry_zs, target_sigmas):
         grid.append(
             {
-                "mom_lookback": int(lookback),
-                "entry_t": float(t),
+                "z_lookback": int(lookback),
+                "entry_z": float(z),
+                "target_sigma": float(tgt),
+                "stop_sigma": float(stop_sigma),
                 "session": session,
             }
         )

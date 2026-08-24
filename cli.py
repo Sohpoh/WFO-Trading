@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --mom-lookback 24,48,96,192 --entry-t 0.5,1.0,1.5,2.0 \\
+        --z-lookback 24,48,96,192 --entry-z 1.0,1.5,2.0 --target-sigma 1.0,1.5,2.0 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,20 +64,27 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (skip-period risk-adjusted drift momentum, vol-regime gate, flip exit)"
+        "strategy grid (variance-ratio regime polarity switch, sigma stop + bounded sigma target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--mom-lookback", default="24,48,96,192",
-                        help="comma-separated momentum lookbacks in bars (window for the mean/std of "
-                             "returns behind the drift t-stat). The skip period between that window and "
-                             "the entry bar is NOT settable here — it is derived inside strategy.py as "
-                             "max(1, mom_lookback // 8), i.e. 3/6/12/24 bars for this default grid, so it "
-                             "adds no searchable degree of freedom and the optimizer cannot collapse it "
-                             "toward zero")
-    strat.add_argument("--entry-t", default="0.5,1.0,1.5,2.0",
-                        help="comma-separated entry thresholds on the (skipped) drift t-stat, in units of "
-                             "its own volatility (long at >= +t, short at <= -t)")
+    strat.add_argument("--z-lookback", default="24,48,96,192",
+                        help="comma-separated lookbacks in bars for the rolling mean/std behind the Close "
+                             "z-score (the same sigma the stop and target are quoted in). Keep the largest "
+                             "value >= 131: the hardcoded variance-ratio regime measure needs 384+24=408 "
+                             "warm-up bars and the engine's buffer is derived from this param")
+    strat.add_argument("--entry-z", default="1.0,1.5,2.0",
+                        help="comma-separated entry thresholds on the Close z-score, in rolling sigmas. "
+                             "In a trending regime (VR>=1.05) the stretch is continued, in a reverting one "
+                             "(VR<=0.95) it is faded; between the two there is no entry")
+    strat.add_argument("--target-sigma", default="1.0,1.5,2.0",
+                        help="comma-separated profit targets in rolling sigmas from the entry Close "
+                             "(bounded exit — target_sigma ~= entry_z on the fade leg is the Bollinger "
+                             "'exit at the middle band' shape)")
+    strat.add_argument("--stop-sigma", type=float, default=2.0,
+                        help="stop distance in rolling sigmas from the entry Close. Fixed, NOT grid-searched "
+                             "— a single float, threaded into every combo, so it adds no searchable degree "
+                             "of freedom")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -128,9 +135,12 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        mom_lookbacks = parse_num_list(args.mom_lookback, int)
-        entry_ts = parse_num_list(args.entry_t, float)
-        grid = build_grid(mom_lookbacks, entry_ts, session)
+        z_lookbacks = parse_num_list(args.z_lookback, int)
+        entry_zs = parse_num_list(args.entry_z, float)
+        target_sigmas = parse_num_list(args.target_sigma, float)
+        # stop_sigma is a single fixed float on purpose — not parse_num_list,
+        # which would let it grid-expand into a searchable param.
+        grid = build_grid(z_lookbacks, entry_zs, target_sigmas, args.stop_sigma, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -171,11 +181,13 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        lookback_vals = sorted({p["mom_lookback"] for p in chosen})
-        entry_t_vals = sorted({p["entry_t"] for p in chosen})
+        lookback_vals = sorted({p["z_lookback"] for p in chosen})
+        entry_z_vals = sorted({p["entry_z"] for p in chosen})
+        target_sigma_vals = sorted({p["target_sigma"] for p in chosen})
         print(
-            f"Fold param stability: {len(lookback_vals)} distinct mom lookback {lookback_vals}, "
-            f"{len(entry_t_vals)} distinct entry t {entry_t_vals}"
+            f"Fold param stability: {len(lookback_vals)} distinct z lookback {lookback_vals}, "
+            f"{len(entry_z_vals)} distinct entry z {entry_z_vals}, "
+            f"{len(target_sigma_vals)} distinct target sigma {target_sigma_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -209,8 +221,10 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "mom_lookback": f.best_params.get("mom_lookback"),
-                "entry_t": f.best_params.get("entry_t"),
+                "z_lookback": f.best_params.get("z_lookback"),
+                "entry_z": f.best_params.get("entry_z"),
+                "target_sigma": f.best_params.get("target_sigma"),
+                "stop_sigma": f.best_params.get("stop_sigma"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
