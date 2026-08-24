@@ -42,42 +42,41 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(z_lookbacks, entry_zs, target_sigmas, stop_sigma, session) -> list[dict]:
+def build_grid(range_lookbacks, fail_windows, target_fracs, stop_width_frac, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched: `z_lookback`, `entry_z`, `target_sigma`.
-    `z_lookback` is cast to a plain int on purpose — it's a genuine bar-count
-    lookback (the rolling window behind both the z-score's mean/std and the
-    sigma the stop/target are quoted in), so it *should* feed
-    `_max_lookback_bars()`'s warm-up buffer. `entry_z`, `target_sigma` and
-    `stop_sigma` are cast to float for the same reason in reverse — they are
-    all multiples of a rolling sigma, not bar counts, and must never inflate
-    that buffer (a `target_sigma` of 2 arriving as an int and buying two bars
-    of warm-up would be meaningless).
+    Three params are searched: `range_lookback`, `fail_window`, `target_frac`.
 
-    `stop_sigma` and `session` are fixed, never searched — both are threaded
-    into every combo as-is. `stop_sigma` is held at 2.0 deliberately: the
-    strategy's stop is a fixed-width sigma stop, and searching it would hand
-    the optimizer a fourth degree of freedom the design closed off.
+    `range_lookback` (the N-bar channel window) and `fail_window` (how many
+    bars back the failed break may have occurred) are both cast to plain int
+    on purpose — both are genuine bar-count lookbacks, so both *should* feed
+    `_max_lookback_bars()`'s warm-up buffer. `target_frac` and
+    `stop_width_frac` are cast to float for the same reason in reverse — they
+    are fractions of the channel's width, not bar counts, and must never
+    inflate that buffer (a `target_frac` of 1 arriving as an int and buying a
+    bar of warm-up would be meaningless).
 
-    The variance-ratio regime measure is deliberately NOT a param here: its
-    window (384), its q (24) and its +/-0.05 deadband around the random-walk
-    boundary are all module constants inside `strategy.py`, so the polarity
-    switch adds no searchable degree of freedom. It is therefore also
-    invisible to `_max_lookback_bars()`, which is safe — the largest searched
-    `z_lookback` (192) already gives
-    buffer_bars = max((192 + 5) * 3, day_bars + 5) = 591, clearing the regime
-    leg's 384 + 24 = 408 bars. See strategy.py's docstring for the caveat if
-    this grid's largest lookback is ever reduced below 131.
+    `stop_width_frac` and `session` are fixed, never searched — both are
+    threaded into every combo as-is. `stop_width_frac` is held at 0.5
+    deliberately: the strategy's stop is a fixed fraction of the channel
+    width, and searching it would hand the optimizer a fourth degree of
+    freedom the design closed off.
+
+    Unlike the previous iteration, every window this strategy uses is a grid
+    param, so nothing is hidden from `_max_lookback_bars()` and there is no
+    floor on how small the grid's largest lookback may be shrunk. With the
+    intended grid the largest int is 192, giving
+    buffer_bars = max((192 + 5) * 3, day_bars + 5) = 591 against an actual
+    need of range_lookback + fail_window + 2 ~= 200.
     """
     grid = []
-    for lookback, z, tgt in product(z_lookbacks, entry_zs, target_sigmas):
+    for lookback, fail_n, tgt in product(range_lookbacks, fail_windows, target_fracs):
         grid.append(
             {
-                "z_lookback": int(lookback),
-                "entry_z": float(z),
-                "target_sigma": float(tgt),
-                "stop_sigma": float(stop_sigma),
+                "range_lookback": int(lookback),
+                "fail_window": int(fail_n),
+                "target_frac": float(tgt),
+                "stop_width_frac": float(stop_width_frac),
                 "session": session,
             }
         )
