@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --range-lookback 24,48,96,192 --fail-window 1,2,3,6 --target-frac 0.25,0.5,1.0 \\
+        --trend-lookback 480,720,960,1440 --skip-period 0,24,48,96 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,26 +64,19 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (failed-breakout reversal, channel-width stop + bounded channel-width target)"
+        "strategy grid (swing-horizon time-series momentum, intraday execution, flip exit)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--range-lookback", default="24,48,96,192",
-                        help="comma-separated N-bar channel lookbacks — the window behind the prior-bars-only "
-                             "Donchian upper/lower extremes whose break is faded, and whose width the stop "
-                             "and target are quoted in")
-    strat.add_argument("--fail-window", default="1,2,3,6",
-                        help="comma-separated counts of how many bars back the break may have occurred: an "
-                             "entry fires when a break happened on any of bars t-1..t-fail_window (strictly "
-                             "in the past) and bar t has closed back inside the channel")
-    strat.add_argument("--target-frac", default="0.25,0.5,1.0",
-                        help="comma-separated profit targets as a fraction of the channel width, measured "
-                             "from the entry Close (bounded exit — 0.5 is roughly the channel middle, i.e. "
-                             "the Bollinger 'exit at the middle band' shape, 1.0 the opposite band)")
-    strat.add_argument("--stop-width-frac", type=float, default=0.5,
-                        help="stop distance as a fraction of the channel width from the entry Close. Fixed, "
-                             "NOT grid-searched — a single float, threaded into every combo, so it adds no "
-                             "searchable degree of freedom")
+    strat.add_argument("--trend-lookback", default="480,720,960,1440",
+                        help="comma-separated formation-window lengths in bars — the cumulative-return "
+                             "(Rcum) horizon whose sign sets the directional state. On 15min bars 480-1440 "
+                             "is roughly 1-3 weeks, the swing horizon the intraday lookbacks in this log "
+                             "have never reached")
+    strat.add_argument("--skip-period", default="0,24,48,96",
+                        help="comma-separated skip lengths in bars — how far in the past the formation "
+                             "window ends (classic momentum's 'skip the most recent period'). 0 is kept in "
+                             "the grid as a no-skip control")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -134,12 +127,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        range_lookbacks = parse_num_list(args.range_lookback, int)
-        fail_windows = parse_num_list(args.fail_window, int)
-        target_fracs = parse_num_list(args.target_frac, float)
-        # stop_width_frac is a single fixed float on purpose — not parse_num_list,
-        # which would let it grid-expand into a searchable param.
-        grid = build_grid(range_lookbacks, fail_windows, target_fracs, args.stop_width_frac, session)
+        trend_lookbacks = parse_num_list(args.trend_lookback, int)
+        skip_periods = parse_num_list(args.skip_period, int)
+        grid = build_grid(trend_lookbacks, skip_periods, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -180,13 +170,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        lookback_vals = sorted({p["range_lookback"] for p in chosen})
-        fail_window_vals = sorted({p["fail_window"] for p in chosen})
-        target_frac_vals = sorted({p["target_frac"] for p in chosen})
+        trend_lookback_vals = sorted({p["trend_lookback"] for p in chosen})
+        skip_period_vals = sorted({p["skip_period"] for p in chosen})
         print(
-            f"Fold param stability: {len(lookback_vals)} distinct range lookback {lookback_vals}, "
-            f"{len(fail_window_vals)} distinct fail window {fail_window_vals}, "
-            f"{len(target_frac_vals)} distinct target frac {target_frac_vals}"
+            f"Fold param stability: {len(trend_lookback_vals)} distinct trend lookback "
+            f"{trend_lookback_vals}, {len(skip_period_vals)} distinct skip period {skip_period_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -220,10 +208,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "range_lookback": f.best_params.get("range_lookback"),
-                "fail_window": f.best_params.get("fail_window"),
-                "target_frac": f.best_params.get("target_frac"),
-                "stop_width_frac": f.best_params.get("stop_width_frac"),
+                "trend_lookback": f.best_params.get("trend_lookback"),
+                "skip_period": f.best_params.get("skip_period"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

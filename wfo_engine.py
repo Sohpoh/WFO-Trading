@@ -42,41 +42,31 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(range_lookbacks, fail_windows, target_fracs, stop_width_frac, session) -> list[dict]:
+def build_grid(trend_lookbacks, skip_periods, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched: `range_lookback`, `fail_window`, `target_frac`.
+    Two params are searched: `trend_lookback` (the swing-horizon formation
+    window, ~1-3 weeks on 15min bars) and `skip_period` (how many bars back
+    the formation window ends — the classic momentum "skip the most recent
+    period", with 0 kept in the grid as a no-skip control).
 
-    `range_lookback` (the N-bar channel window) and `fail_window` (how many
-    bars back the failed break may have occurred) are both cast to plain int
-    on purpose — both are genuine bar-count lookbacks, so both *should* feed
-    `_max_lookback_bars()`'s warm-up buffer. `target_frac` and
-    `stop_width_frac` are cast to float for the same reason in reverse — they
-    are fractions of the channel's width, not bar counts, and must never
-    inflate that buffer (a `target_frac` of 1 arriving as an int and buying a
-    bar of warm-up would be meaningless).
+    Both are cast to plain `int` on purpose: both are genuine bar counts, so
+    both *should* feed `_max_lookback_bars()`'s warm-up buffer. The strategy
+    reaches back `skip_period + trend_lookback` bars, and the buffer is sized
+    off the largest single int times 3, which comfortably covers that sum
+    (96 + 1440 = 1536 needed vs. (1440 + 5) * 3 = 4335 buffered). Nothing
+    else this strategy takes is a bar count, so nothing else is an int — the
+    quarter-horizon confirmation window is derived inside `strategy.py` from
+    `trend_lookback` and is deliberately not a param at all.
 
-    `stop_width_frac` and `session` are fixed, never searched — both are
-    threaded into every combo as-is. `stop_width_frac` is held at 0.5
-    deliberately: the strategy's stop is a fixed fraction of the channel
-    width, and searching it would hand the optimizer a fourth degree of
-    freedom the design closed off.
-
-    Unlike the previous iteration, every window this strategy uses is a grid
-    param, so nothing is hidden from `_max_lookback_bars()` and there is no
-    floor on how small the grid's largest lookback may be shrunk. With the
-    intended grid the largest int is 192, giving
-    buffer_bars = max((192 + 5) * 3, day_bars + 5) = 591 against an actual
-    need of range_lookback + fail_window + 2 ~= 200.
+    `session` is fixed, never searched — threaded into every combo as-is.
     """
     grid = []
-    for lookback, fail_n, tgt in product(range_lookbacks, fail_windows, target_fracs):
+    for lookback, skip in product(trend_lookbacks, skip_periods):
         grid.append(
             {
-                "range_lookback": int(lookback),
-                "fail_window": int(fail_n),
-                "target_frac": float(tgt),
-                "stop_width_frac": float(stop_width_frac),
+                "trend_lookback": int(lookback),
+                "skip_period": int(skip),
                 "session": session,
             }
         )
