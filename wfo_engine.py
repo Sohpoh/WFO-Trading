@@ -42,42 +42,40 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(vwap_lookbacks, entry_devs, target_atr_mults, stop_atr_mult, session) -> list[dict]:
+def build_grid(run_lens, run_move_atrs, target_atr_mults, stop_atr_mult, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched: `vwap_lookback` (the trailing window, in bars,
-    the volume-weighted reference level is computed over), `entry_dev` (how
-    far, in ATRs, the Close must stretch past that level for the continuation
-    crossing to fire) and `target_atr_mult` (the profit target distance, in
-    ATRs, from the entry Close).
+    Three params are searched: `run_len` (how many consecutive same-direction
+    closes make a run), `run_move_atr` (how far, in ATRs, that run must have
+    travelled for it to count as an exhaustion candidate worth fading) and
+    `target_atr_mult` (the profit target distance, in ATRs, from the entry
+    Close).
 
     `stop_atr_mult` and `session` are fixed, never searched — threaded into
     every combo as-is. Holding the stop fixed while the target varies keeps
     the reward:risk ratio the thing being searched, rather than letting both
     legs float and confounding the two.
 
-    (`strategy.ATR_PERIOD` and the volatility-regime gate's
-    `strategy.ATR_FAST_BARS`/`ATR_SLOW_BARS` are module constants, not params,
-    so none of them appears in a combo at all — the gate is deliberately not a
-    searched axis, and being outside the grid it also can't reach
-    `_max_lookback_bars()` below.)
+    (`strategy.ATR_PERIOD` is a module constant, not a param, so it never
+    appears in a combo at all and can't reach `_max_lookback_bars()` below.)
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `vwap_lookback` is cast to plain `int` on purpose — it's a genuine
-        bar-count lookback, so it *should* size the pre-test-window warm-up
+      - `run_len` is cast to plain `int` on purpose — it's a genuine bar-count
+        lookback (the strategy reads `Close.shift(run_len)` and rolls a
+        `run_len`-bar window), so it *should* size the pre-test-window warm-up
         buffer.
-      - `entry_dev`/`target_atr_mult`/`stop_atr_mult` are cast to `float` on
-        purpose — they are unitless ATR multipliers, not bar counts. They're
-        exactly the case the cast protects against: a target of 4.0 would be
-        harmless as an int today, but any integer value would silently start
-        feeding the buffer sizing.
+      - `run_move_atr`/`target_atr_mult`/`stop_atr_mult` are cast to `float`
+        on purpose — they are unitless ATR multipliers, not bar counts.
+        They're exactly the case the cast protects against: a run_move_atr of
+        2.0 would be harmless as an int today, but any integer value would
+        silently start feeding the buffer sizing.
     """
     grid = []
-    for lookback, dev, target in product(vwap_lookbacks, entry_devs, target_atr_mults):
+    for run_len, run_move, target in product(run_lens, run_move_atrs, target_atr_mults):
         grid.append(
             {
-                "vwap_lookback": int(lookback),
-                "entry_dev": float(dev),
+                "run_len": int(run_len),
+                "run_move_atr": float(run_move),
                 "target_atr_mult": float(target),
                 "stop_atr_mult": float(stop_atr_mult),
                 "session": session,

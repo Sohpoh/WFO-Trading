@@ -11,8 +11,8 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 1h --session "New York" \\
-        --vwap-lookback 12,24,48,96 --entry-dev 0.25,0.5,1.0 \\
-        --target-atr-mult 1.5,2.5,4.0 --stop-atr-mult 2.0 \\
+        --run-len 2,3,4 --run-move-atr 0.75,1.25,2.0 \\
+        --target-atr-mult 1.0,1.5,2.5 --stop-atr-mult 1.5 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -65,24 +65,25 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (VWAP-deviation continuation cross: entry when price crosses out past "
-        "+/- entry_dev ATRs from a rolling VWAP, ATR stop and ATR target, both sides gated to "
-        "a high-volatility regime — 24-bar vs 96-bar mean true range — which is hardcoded in "
-        "strategy.py and has no flag)"
+        "strategy grid (run-exhaustion reversal: a run of run_len consecutive same-direction "
+        "closes that has covered at least run_move_atr ATRs is faded once, on the first bar it "
+        "qualifies — long after a down-run, short after an up-run — with an ATR stop and an ATR "
+        "target. The ATR period itself is hardcoded in strategy.py and has no flag)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--vwap-lookback", default="12,24,48,96",
-                        help="comma-separated trailing windows in bars for the rolling volume-weighted "
-                             "average price. At 1h these span roughly half a day to four days")
-    strat.add_argument("--entry-dev", default="0.25,0.5,1.0",
-                        help="comma-separated entry thresholds in ATRs — long when the Close/VWAP "
-                             "deviation crosses up through +this, short when it crosses down through "
-                             "-this. Must stay above 0 so the two sides can't both fire on one bar")
-    strat.add_argument("--target-atr-mult", default="1.5,2.5,4.0",
+    strat.add_argument("--run-len", default="2,3,4",
+                        help="comma-separated run lengths in bars — how many consecutive lower (or "
+                             "higher) closes make a run. At 1h these are 2-4 hours of uninterrupted "
+                             "one-way trade")
+    strat.add_argument("--run-move-atr", default="0.75,1.25,2.0",
+                        help="comma-separated magnitude floors in ATRs — the run's total close-to-close "
+                             "displacement must clear this many ATRs before it is worth fading. Keeps a "
+                             "long but trivial drift from qualifying")
+    strat.add_argument("--target-atr-mult", default="1.0,1.5,2.5",
                         help="comma-separated profit-target distances in ATRs, measured from the entry "
                              "price")
-    strat.add_argument("--stop-atr-mult", type=float, default=2.0,
+    strat.add_argument("--stop-atr-mult", type=float, default=1.5,
                         help="protective stop distance in ATRs, measured from the entry price. Fixed "
                              "(not grid-searched) — threaded into every combo")
 
@@ -135,10 +136,10 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        vwap_lookbacks = parse_num_list(args.vwap_lookback, int)
-        entry_devs = parse_num_list(args.entry_dev, float)
+        run_lens = parse_num_list(args.run_len, int)
+        run_move_atrs = parse_num_list(args.run_move_atr, float)
         target_atr_mults = parse_num_list(args.target_atr_mult, float)
-        grid = build_grid(vwap_lookbacks, entry_devs, target_atr_mults, args.stop_atr_mult, session)
+        grid = build_grid(run_lens, run_move_atrs, target_atr_mults, args.stop_atr_mult, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -179,13 +180,13 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        vwap_lookback_vals = sorted({p["vwap_lookback"] for p in chosen})
-        entry_dev_vals = sorted({p["entry_dev"] for p in chosen})
+        run_len_vals = sorted({p["run_len"] for p in chosen})
+        run_move_atr_vals = sorted({p["run_move_atr"] for p in chosen})
         target_atr_mult_vals = sorted({p["target_atr_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(vwap_lookback_vals)} distinct VWAP lookback "
-            f"{vwap_lookback_vals}, {len(entry_dev_vals)} distinct entry deviation "
-            f"{entry_dev_vals}, {len(target_atr_mult_vals)} distinct target ATR multiple "
+            f"Fold param stability: {len(run_len_vals)} distinct run length "
+            f"{run_len_vals}, {len(run_move_atr_vals)} distinct run magnitude floor "
+            f"{run_move_atr_vals}, {len(target_atr_mult_vals)} distinct target ATR multiple "
             f"{target_atr_mult_vals}"
         )
 
@@ -220,8 +221,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "vwap_lookback": f.best_params.get("vwap_lookback"),
-                "entry_dev": f.best_params.get("entry_dev"),
+                "run_len": f.best_params.get("run_len"),
+                "run_move_atr": f.best_params.get("run_move_atr"),
                 "target_atr_mult": f.best_params.get("target_atr_mult"),
                 "stop_atr_mult": f.best_params.get("stop_atr_mult"),
                 "train_sharpe": f.train_sharpe,
