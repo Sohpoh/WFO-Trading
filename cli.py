@@ -12,7 +12,7 @@ Examples:
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 1h --session "New York" \\
         --vwap-lookback 12,24,48,96 --entry-dev 0.25,0.5,1.0 \\
-        --stop-atr-mult 0.75,1.0,1.5,2.0 \\
+        --target-atr-mult 1.5,2.5,4.0 --stop-atr-mult 2.0 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -66,8 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     strat = p.add_argument_group(
         "strategy grid (VWAP-deviation continuation cross: entry when price crosses out past "
-        "+/- entry_dev ATRs from a rolling VWAP, searched ATR stop and a target pinned at a "
-        "fixed 2R off that stop)"
+        "+/- entry_dev ATRs from a rolling VWAP, ATR stop and ATR target, both sides gated to "
+        "a high-volatility regime — 24-bar vs 96-bar mean true range — which is hardcoded in "
+        "strategy.py and has no flag)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -78,11 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="comma-separated entry thresholds in ATRs — long when the Close/VWAP "
                              "deviation crosses up through +this, short when it crosses down through "
                              "-this. Must stay above 0 so the two sides can't both fire on one bar")
-    strat.add_argument("--stop-atr-mult", default="0.75,1.0,1.5,2.0",
-                        help="comma-separated protective stop distances in ATRs, measured from the "
-                             "entry price. Grid-searched. The profit target is not a separate flag: "
-                             "it is always strategy.RR_MULT (2.0) times whichever stop distance the "
-                             "fold selected")
+    strat.add_argument("--target-atr-mult", default="1.5,2.5,4.0",
+                        help="comma-separated profit-target distances in ATRs, measured from the entry "
+                             "price")
+    strat.add_argument("--stop-atr-mult", type=float, default=2.0,
+                        help="protective stop distance in ATRs, measured from the entry price. Fixed "
+                             "(not grid-searched) — threaded into every combo")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -135,8 +137,8 @@ def main(argv=None) -> int:
     try:
         vwap_lookbacks = parse_num_list(args.vwap_lookback, int)
         entry_devs = parse_num_list(args.entry_dev, float)
-        stop_atr_mults = parse_num_list(args.stop_atr_mult, float)
-        grid = build_grid(vwap_lookbacks, entry_devs, stop_atr_mults, session)
+        target_atr_mults = parse_num_list(args.target_atr_mult, float)
+        grid = build_grid(vwap_lookbacks, entry_devs, target_atr_mults, args.stop_atr_mult, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -179,12 +181,12 @@ def main(argv=None) -> int:
     if chosen:
         vwap_lookback_vals = sorted({p["vwap_lookback"] for p in chosen})
         entry_dev_vals = sorted({p["entry_dev"] for p in chosen})
-        stop_atr_mult_vals = sorted({p["stop_atr_mult"] for p in chosen})
+        target_atr_mult_vals = sorted({p["target_atr_mult"] for p in chosen})
         print(
             f"Fold param stability: {len(vwap_lookback_vals)} distinct VWAP lookback "
             f"{vwap_lookback_vals}, {len(entry_dev_vals)} distinct entry deviation "
-            f"{entry_dev_vals}, {len(stop_atr_mult_vals)} distinct stop ATR multiple "
-            f"{stop_atr_mult_vals}"
+            f"{entry_dev_vals}, {len(target_atr_mult_vals)} distinct target ATR multiple "
+            f"{target_atr_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -220,6 +222,7 @@ def main(argv=None) -> int:
                 "test_start": f.test_start, "test_end": f.test_end,
                 "vwap_lookback": f.best_params.get("vwap_lookback"),
                 "entry_dev": f.best_params.get("entry_dev"),
+                "target_atr_mult": f.best_params.get("target_atr_mult"),
                 "stop_atr_mult": f.best_params.get("stop_atr_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
