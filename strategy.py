@@ -1,93 +1,94 @@
-"""Regression-channel reversion — OLS-residual sigma entry, exit at the fitted line.
+"""Trailing-range location trend-hold — stochastic-location state signal, ATR stop, no target.
 
-`mean-reversion.md` lists exactly three simple mean-reversion recipes; the log
-has mined only one (Bollinger bands, iteration 1). This implements the
-untouched third verbatim — "Linear Regression / Threshold: Fit a line to
-recent prices. When price deviates by N standard deviations from the line,
-assume reversion" — with that page's documented Bollinger exit ("expecting
-reversion to middle. Exit at middle") supplying a zero-parameter target.
+The pivot here is horizon/cost-per-trade, not a new indicator. `metrics.py`
+charges a flat ~10.2bps round trip (0.001% fee + 0.05% slippage per leg,
+2 legs) regardless of timeframe, and all 24 prior iterations ran 5min/15min
+bars — iterations 21/22/24 bled roughly -11bps net per trade on ~0bps gross
+across 383-946 trades. `transaction-costs.md`'s documented remedy ("reduce
+trade frequency; lower-frequency strategies can afford higher per-trade
+costs") has never been applied in this log. At 1h bars the New York session
+holds only ~6 tradable bars, so a wide deadband yields on the order of one
+round trip per session held ~6h against an ES RTH range near 110bps — the
+toll is ~9% of a typical session excursion instead of ~40% at 15min.
 
-Why this is not a seventh z-score fade. Iteration 21 concluded the rolling-
-*mean* z-score is information-free on this data in either polarity (PF 0.675
-IS and OOS with both signs live). But a rolling mean lags inside a drifting
-window, so price sits persistently on one side of it and the fade is really
-fighting local drift — `mean-reversion.md` pitfall #1, "in a strong uptrend,
-shorting strength is a losing strategy". An OLS fit removes the local slope,
-so the quantity being faded (the residual) is closer to stationary, and it
-does so *without* a separate trend filter — which matters because iterations
-8 and 9 showed added conjunctive filters cutting OOS trade count
-183 -> 100 -> 74 and collapsing into an overfit gap.
+The signal is a *level/state*, not an event. Iterations 6/10/11 fired only on
+new extremes and were killed by the gate's leave-top-5-out concentration
+check: a handful of breakout days carried the whole curve. Being long simply
+*because* price currently sits in the top zone of its trailing range trades
+most sessions, so P&L is spread across many trades and deleting the best five
+removes ~1% of the sample rather than ~3%.
 
-It also repairs an unnamed defect in iteration 21: its `entry_z` grid started
-at 1.0, so part of the grid implied a reversion target that could not clear
-`metrics.py`'s ~10.2bps round-trip toll at all. Here `entry_sigma` floors at
-1.5 and `reg_lookback` at 48, putting the smallest implied target at roughly
-3-5x the toll — the discipline iterations 1 and 2 applied and 21 dropped.
+ES rather than NQ (23 of 24 prior iterations used NQ) is the closest thing to
+untouched data against `loop-review.md`'s named multiple-testing problem, and
+ES's tighter spread makes `metrics.py`'s flat 5bps slippage more realistic.
 
 Rules (all computed on the full continuous frame with no session awareness of
-their own; every input is a strictly backward rolling window, so unwarmed
-bars are NaN and the signal fails *closed*):
+their own; every input is a strictly backward rolling window, so unwarmed bars
+are NaN and the signal fails *closed*):
 
-  - For every bar t, fit an ordinary least-squares line of Close on bar index
-    over the trailing `reg_lookback` bars ending at t. Closed form off rolling
-    moments only:
+  - Location inside the trailing range (Lane's stochastic %K, expressed 0-1):
 
-        slope_t     = cov(x, y) / var(x)                  (rolling, window n)
-        line_t      = mean(y) + slope_t * (x_t - mean(x))
-        sigma_t     = sqrt(max(var(y) - slope_t^2 * var(x), 0))
-        z_t         = (Close_t - line_t) / sigma_t
+        lo_t  = rolling_min(Low,  loc_lookback)   ending at t
+        hi_t  = rolling_max(High, loc_lookback)   ending at t
+        loc_t = (Close_t - lo_t) / (hi_t - lo_t)
 
-    `sigma_t` is the residual standard deviation inside that same window, via
-    the OLS identity SSresid = SSyy - slope^2 * SSxx. Nothing after bar t is
-    touched; `line_t` is the fitted value *at* t (the window's right edge), so
-    it is knowable at t's Close and the entry is priced at that same Close.
+    The window ends at t and includes bar t's own High/Low, so `loc_t` is
+    bounded to [0, 1] and is fully knowable at t's Close — nothing after t is
+    touched. Strict `min_periods` keeps unwarmed bars NaN; a degenerate
+    (zero-width) window is masked to NaN too, since it would divide by zero.
 
-    `x` is the positional bar index of the frame handed in. Simple regression
-    is invariant to the origin of a uniformly-spaced x, so the slope/line/
-    sigma at bar t are identical whether the frame is the whole dataset or one
-    of `wfo_engine._simulate_window()`'s buffered slices.
+  - Raw entries, a *level* condition that re-arms every bar rather than a
+    crossing:
+        +1.0 where loc_t >= loc_threshold
+        -1.0 where loc_t <= 1 - loc_threshold
+         NaN in the deadband between them.
+    A repeat same-direction signal while already in that position is a no-op,
+    per the position contract. The two sides are mutually exclusive *because
+    every threshold in the grid is > 0.5* — if the grid is ever widened to
+    include 0.5 or below, both legs could be True on the same bar and this
+    construction would need an explicit tie-break.
 
-  - Raw entries (crossing, not level, so the signal does not re-arm on every
-    bar of a sustained excursion):
-        -1.0 where z_t >  entry_sigma and z_{t-1} <=  entry_sigma
-        +1.0 where z_t < -entry_sigma and z_{t-1} >= -entry_sigma
-         NaN elsewhere.
-    Unwarmed bars leave z NaN, and NaN compares False on both sides, so no
-    entry can fire before the window is full. With pandas' default
-    `min_periods == window`, z first goes non-NaN at position n-1 and
-    z.shift(1) is still NaN there, so the first possible entry is position n.
+  - Stop: `stop_atr_mult * ATR(atr_period)` measured from the entry Close,
+    symmetric — the delegate resolves it below the entry for longs and above
+    for shorts. `volatility.md`'s guidance (scale the stop with measured
+    volatility, wide enough that ordinary noise doesn't trip it) is what a
+    2.0x ATR stop encodes.
 
-  - Target = `line_t`, the fitted line level captured at the entry bar —
-    mean-reversion.md's "exit at middle" read literally, held as a fixed price
-    level for the life of the trade rather than recomputed. By construction a
-    short entry has Close > line and a long entry has Close < line, so the
-    target is always on the correct side of the entry Close, which is what
-    `apply_session_constraint_with_stops()` requires. Implied target distance
-    is entry_sigma * sigma_t.
-
-  - Stop = entry price displaced a further `stop_sigma * sigma_t` *away* from
-    the line (below entry for longs, above for shorts). Stop distance is
-    therefore independent of `entry_sigma`, so reward:risk runs 0.75:1 to
-    1.5:1 across the intended grid. `volatility.md`'s stop guidance (scale the
-    stop with measured volatility, wide enough that whipsaws don't punish it)
-    is satisfied by quoting it in the same residual-sigma unit as the entry.
+  - No profit target. Winners run to the forced session flatten, which is the
+    "trend-hold" half of the idea: at 1h the session is only ~6 bars, so the
+    hold is naturally bounded by the clock rather than by a level. The
+    delegate refuses any entry whose target is NaN or on the wrong side of the
+    entry Close, so "no target" has to be expressed as an unreachable level —
+    the same convention iteration 14 used.
 
 Exit is path-dependent, so this delegates to
 `session.apply_session_constraint_with_stops()` (both legs supplied on every
 entry bar, as that function requires). `session.py`'s forced flatten on the
 session's last bar remains the backstop — no position survives the session.
-The bounded line target (rather than a run-to-session-flatten) is deliberate:
-it keeps P&L from being tail-driven, which is what the gate's
-leave-top-5-out hard check penalizes.
 
-Param types / warm-up:
-  - `reg_lookback` is a genuine bar count, so it is passed as a plain `int`
-    from `build_grid()` and correctly feeds `wfo_engine._max_lookback_bars()`'s
-    pre-test-window buffer (384 -> (384+5)*3 = 1167 bars, ample).
-  - `entry_sigma` and `stop_sigma` are sigma multipliers, not bar counts, so
-    both are passed as `float` and are correctly ignored by that buffer sizing.
+Known divergence from the idea as specified: the spec called for an
+opposite-zone signal to *flip* an open position. The delegate only opens when
+it is flat (by design — it owns the session bookkeeping a flip would have to
+respect), and faking a flip here would require session awareness inside
+`strategy.py`, which the contract forbids. So an opposite-zone signal does not
+reverse an open trade; the trade ends at its ATR stop or at the session
+flatten, and the opposite side can only be taken from flat on a later in-
+session bar. A corollary worth stating plainly: because the signal is a level
+that re-arms every bar, a stopped-out trade whose zone condition still holds
+will simply re-enter the same direction on the next in-session bar, so the
+realized rate can exceed the spec's assumed one round trip per session.
 
-Cost note: `metrics.py`'s ~0.102% round-trip is unchanged and out of scope.
+Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`):
+  - `loc_lookback` and `atr_period` are genuine bar counts, so both are passed
+    as plain `int` and correctly size the pre-test-window warm-up buffer
+    (max 48 -> (48+5)*3 = 159 bars, ample for either).
+  - `loc_threshold` and `stop_atr_mult` are unitless multipliers, not bar
+    counts, so both are passed as `float` and are correctly ignored by that
+    buffer sizing.
+
+Cost note: `metrics.py`'s ~0.102% round-trip is unchanged and out of scope —
+the whole point of moving to 1h is to amortize that fixed toll over a larger
+per-trade excursion, not to re-price it.
 
 This module decides only *when* the strategy wants to be long or short and at
 what levels it wants out. All day-trade gating and the end-of-session flatten
@@ -99,78 +100,96 @@ import pandas as pd
 
 from session import apply_session_constraint_with_stops
 
+# "No target", expressed as an unreachable level because the delegate refuses
+# any entry with a NaN or wrong-sided target. A float on purpose so it could
+# never be mistaken for a bar-count lookback if it ever entered a param dict.
+NO_TARGET_ATR_MULT = 1000.0
 
-def regression_channel(close: pd.Series, reg_lookback: int) -> tuple[pd.Series, pd.Series]:
-    """Rolling OLS fitted value at the window's right edge + residual sigma.
 
-    Returns `(line, sigma)` where `line[t]` is the fitted value at bar t of an
-    OLS fit of Close on bar index over the `reg_lookback` bars *ending at* t,
-    and `sigma[t]` is the standard deviation of that fit's residuals inside
-    the same window. Both are NaN until the window is full (fails closed).
+def average_true_range(df: pd.DataFrame, atr_period: int) -> pd.Series:
+    """Wilder true range, simple-mean averaged over `atr_period`, shifted one bar.
 
-    Computed from rolling moments rather than a per-bar `polyfit`: pandas'
-    `rolling().cov()/.var()` are numerically stable at NQ-scale price levels
-    (a naive mean-of-squares would lose precision on y^2 ~ 4e8), and the OLS
-    identity SSresid = SSyy - slope^2 * SSxx gives the residual sigma without
-    ever materializing the residuals. `var`/`cov` are both ddof=1 here, so the
-    ddof cancels in the slope and `sigma` is sqrt(SSresid / (n - 1)).
+    The shift excludes the current bar from its own volatility baseline, so the
+    stop is sized off strictly prior information — the entry bar's own range
+    can't widen or narrow the stop it is about to be given.
+
+    `skipna=False` on the row-wise max keeps the first bar's TR NaN (its
+    `Close.shift(1)` is NaN) rather than silently falling back to High-Low, and
+    strict `min_periods` keeps every unwarmed bar NaN, so the delegate's
+    `stop_distance > 0` guard refuses entries during warm-up.
     """
-    n = int(reg_lookback)
-    x = pd.Series(np.arange(len(close), dtype=float), index=close.index)
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1, skipna=False)
+    return tr.rolling(atr_period, min_periods=atr_period).mean().shift(1)
 
-    mean_x = x.rolling(n).mean()
-    mean_y = close.rolling(n).mean()
-    var_x = x.rolling(n).var()
-    var_y = close.rolling(n).var()
-    cov_xy = close.rolling(n).cov(x)
 
-    slope = cov_xy / var_x
-    line = mean_y + slope * (x - mean_x)
+def range_location(df: pd.DataFrame, loc_lookback: int) -> pd.Series:
+    """Close's position inside its trailing `loc_lookback`-bar High/Low range, 0-1.
 
-    # OLS identity; clipped at 0 to absorb floating-point noise on a window
-    # whose residuals are (near-)degenerate.
-    resid_var = (var_y - slope**2 * var_x).clip(lower=0.0)
-    sigma = np.sqrt(resid_var)
-
-    # A perfectly-fit (zero-residual) window carries no information and would
-    # divide by zero — mark it unwarmed so the signal fails closed.
-    sigma = sigma.where(sigma > 0)
-
-    return line, sigma
+    Lane's stochastic %K on a 0-1 scale. The rolling window ends at (and
+    includes) the current bar, so the value is bounded to [0, 1] and knowable
+    at that bar's Close. NaN until the window is full, and NaN on a degenerate
+    zero-width range — both cases make every downstream comparison False, so
+    the signal fails closed.
+    """
+    n = int(loc_lookback)
+    lo = df["Low"].rolling(n, min_periods=n).min()
+    hi = df["High"].rolling(n, min_periods=n).max()
+    width = hi - lo
+    return ((df["Close"] - lo) / width).where(width > 0)
 
 
 def generate_positions(
     df: pd.DataFrame,
-    reg_lookback: int,
-    entry_sigma: float,
-    stop_sigma: float,
+    loc_lookback: int,
+    loc_threshold: float,
+    stop_atr_mult: float = 2.0,
+    atr_period: int = 14,
     session: str | None = "New York",
 ) -> pd.Series:
     close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
 
-    line, sigma = regression_channel(close, reg_lookback)
-    z = (close - line) / sigma
-    z_prev = z.shift(1)
+    loc = range_location(df, loc_lookback)
+    thr = float(loc_threshold)
 
-    # Crossing (not level) so a sustained excursion arms the signal once.
-    # NaN on either leg compares False, so unwarmed bars produce no entry.
-    short_signal = (z > entry_sigma) & (z_prev <= entry_sigma)
-    long_signal = (z < -entry_sigma) & (z_prev >= -entry_sigma)
+    # Level (not crossing) conditions: the state re-arms on every bar price
+    # spends in the zone. `fillna(False)` is load-bearing — the delegate reads
+    # these as raw numpy values and `bool(np.nan)` is True, so a NaN left in
+    # the array would fire an entry on an unwarmed bar.
+    # Mutually exclusive only because every grid threshold is > 0.5.
+    long_signal = (loc >= thr).fillna(False)
+    short_signal = (loc <= 1.0 - thr).fillna(False)
 
-    # Target: the fitted line itself, captured at the entry bar and held fixed
-    # for the trade. Long entries sit below the line and shorts above it, so
-    # the level is always on the profitable side of the entry Close.
-    target_price = line
+    # Protective stop only, in ATR units from the entry Close. Symmetric — the
+    # delegate resolves the side. NaN/zero ATR makes it refuse the entry.
+    atr = average_true_range(df, atr_period)
+    stop_distance = float(stop_atr_mult) * atr
 
-    # Stop: a further stop_sigma of residual sigma *away* from the line.
-    # apply_session_constraint_with_stops() resolves the direction (below the
-    # entry for longs, above for shorts) from the sign of the position.
-    stop_distance = float(stop_sigma) * sigma
+    # "No target": an unreachable level, so the only exits are the ATR stop and
+    # the forced session flatten. Absolute and already direction-resolved,
+    # which is the shape the delegate expects. Only read on actual entry bars.
+    target_price = pd.Series(
+        np.where(
+            long_signal,
+            close + NO_TARGET_ATR_MULT * atr,
+            close - NO_TARGET_ATR_MULT * atr,
+        ),
+        index=df.index,
+    )
 
     return apply_session_constraint_with_stops(
         close=close,
-        high=df["High"],
-        low=df["Low"],
+        high=high,
+        low=low,
         long_signal=long_signal,
         short_signal=short_signal,
         stop_distance=stop_distance,
@@ -180,8 +199,9 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    "reg_lookback": 96,
-    "entry_sigma": 2.0,
-    "stop_sigma": 2.0,
+    "loc_lookback": 24,
+    "loc_threshold": 0.80,
+    "stop_atr_mult": 2.0,
+    "atr_period": 14,
     "session": "New York",
 }

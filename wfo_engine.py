@@ -42,32 +42,37 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(reg_lookbacks, entry_sigmas, stop_sigma, session) -> list[dict]:
+def build_grid(loc_lookbacks, loc_thresholds, stop_atr_mult, atr_period, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched: `reg_lookback` (the rolling OLS regression window
-    in bars) and `entry_sigma` (how many residual standard deviations away
-    from the fitted line price must cross for the fade to arm).
+    Two params are searched: `loc_lookback` (the trailing High/Low window, in
+    bars, that price's location is measured inside) and `loc_threshold` (how
+    far into the top/bottom of that range the Close must sit for the
+    directional state to be on).
 
-    `stop_sigma` and `session` are fixed, never searched — threaded into every
-    combo as-is.
+    `stop_atr_mult`, `atr_period` and `session` are fixed, never searched —
+    threaded into every combo as-is. Holding the stop fixed keeps this
+    iteration a clean test of the location signal itself; the stop is the
+    reserved lever for the next one.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `reg_lookback` is cast to plain `int` on purpose — it is a genuine
-        bar-count lookback, so it *should* size the pre-test-window warm-up
-        buffer.
-      - `entry_sigma`/`stop_sigma` are cast to `float` on purpose — they are
-        sigma multipliers, not bar counts. Passing e.g. `2` as an int would
-        be harmless today but would silently start feeding the buffer sizing
-        if the grid ever widened, so the cast is explicit.
+      - `loc_lookback` and `atr_period` are cast to plain `int` on purpose —
+        both are genuine bar-count lookbacks, so both *should* size the
+        pre-test-window warm-up buffer.
+      - `loc_threshold`/`stop_atr_mult` are cast to `float` on purpose — they
+        are unitless multipliers, not bar counts. `stop_atr_mult` is exactly
+        the case the cast protects against: its default 2.0 would be harmless
+        as an int today, but any integer value would silently start feeding
+        the buffer sizing.
     """
     grid = []
-    for lookback, sigma in product(reg_lookbacks, entry_sigmas):
+    for lookback, threshold in product(loc_lookbacks, loc_thresholds):
         grid.append(
             {
-                "reg_lookback": int(lookback),
-                "entry_sigma": float(sigma),
-                "stop_sigma": float(stop_sigma),
+                "loc_lookback": int(lookback),
+                "loc_threshold": float(threshold),
+                "stop_atr_mult": float(stop_atr_mult),
+                "atr_period": int(atr_period),
                 "session": session,
             }
         )

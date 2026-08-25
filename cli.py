@@ -10,8 +10,9 @@ Examples:
     python cli.py
 
     # override strategy/grid + walk-forward schedule
-    python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --reg-lookback 48,96,192,384 --entry-sigma 1.5,2.0,2.5,3.0 --stop-sigma 2.0 \\
+    python cli.py --symbol ES --timeframe 1h --session "New York" \\
+        --loc-lookback 12,18,24,48 --loc-threshold 0.70,0.80,0.90 \\
+        --stop-atr-mult 2.0 --atr-period 14 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,22 +65,24 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (regression-channel reversion: OLS-residual sigma entry, exit at the fitted line, "
-        "fixed sigma stop)"
+        "strategy grid (trailing-range location trend-hold: stochastic-location state entry, "
+        "ATR protective stop, no target, run to the session flatten)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--reg-lookback", default="48,96,192,384",
-                        help="comma-separated rolling OLS regression windows in bars — how much recent "
-                             "price the line is fit to. Floors at 48 so the implied reversion target is "
-                             "several times metrics.py's ~10.2bps round-trip toll")
-    strat.add_argument("--entry-sigma", default="1.5,2.0,2.5,3.0",
-                        help="comma-separated entry thresholds in residual standard deviations — price "
-                             "must cross this far from the fitted line for the fade to arm. Floors at 1.5 "
-                             "so no combo implies a target the cost model can't clear")
-    strat.add_argument("--stop-sigma", type=float, default=2.0,
-                        help="stop distance in residual standard deviations, measured from the entry price "
-                             "*away* from the line. Fixed (not grid-searched) — threaded into every combo")
+    strat.add_argument("--loc-lookback", default="12,18,24,48",
+                        help="comma-separated trailing High/Low windows in bars — the range price's "
+                             "location is measured inside. At 1h these span roughly half a day to two days")
+    strat.add_argument("--loc-threshold", default="0.70,0.80,0.90",
+                        help="comma-separated location thresholds in 0-1 range units — long while "
+                             "location >= this, short while location <= 1 minus this. Must stay above "
+                             "0.5 so the two sides can't both be on for the same bar")
+    strat.add_argument("--stop-atr-mult", type=float, default=2.0,
+                        help="protective stop distance in ATRs, measured from the entry price. Fixed "
+                             "(not grid-searched) — threaded into every combo")
+    strat.add_argument("--atr-period", type=int, default=14,
+                        help="ATR lookback in bars used to size the stop. Fixed (not grid-searched) — "
+                             "threaded into every combo")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -130,9 +133,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        reg_lookbacks = parse_num_list(args.reg_lookback, int)
-        entry_sigmas = parse_num_list(args.entry_sigma, float)
-        grid = build_grid(reg_lookbacks, entry_sigmas, args.stop_sigma, session)
+        loc_lookbacks = parse_num_list(args.loc_lookback, int)
+        loc_thresholds = parse_num_list(args.loc_threshold, float)
+        grid = build_grid(loc_lookbacks, loc_thresholds, args.stop_atr_mult, args.atr_period, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -173,11 +176,12 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        reg_lookback_vals = sorted({p["reg_lookback"] for p in chosen})
-        entry_sigma_vals = sorted({p["entry_sigma"] for p in chosen})
+        loc_lookback_vals = sorted({p["loc_lookback"] for p in chosen})
+        loc_threshold_vals = sorted({p["loc_threshold"] for p in chosen})
         print(
-            f"Fold param stability: {len(reg_lookback_vals)} distinct regression lookback "
-            f"{reg_lookback_vals}, {len(entry_sigma_vals)} distinct entry sigma {entry_sigma_vals}"
+            f"Fold param stability: {len(loc_lookback_vals)} distinct location lookback "
+            f"{loc_lookback_vals}, {len(loc_threshold_vals)} distinct location threshold "
+            f"{loc_threshold_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -211,9 +215,10 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "reg_lookback": f.best_params.get("reg_lookback"),
-                "entry_sigma": f.best_params.get("entry_sigma"),
-                "stop_sigma": f.best_params.get("stop_sigma"),
+                "loc_lookback": f.best_params.get("loc_lookback"),
+                "loc_threshold": f.best_params.get("loc_threshold"),
+                "stop_atr_mult": f.best_params.get("stop_atr_mult"),
+                "atr_period": f.best_params.get("atr_period"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
