@@ -57,14 +57,20 @@ unwarmed bars are NaN and the signal fails *closed*):
     be simultaneously above +entry_dev and below -entry_dev).
 
   - Stop: `stop_atr_mult * ATR` from the entry Close, symmetric — the delegate
-    resolves it below the entry for longs and above for shorts. Held fixed at
-    2.0 so this iteration is a clean test of the VWAP-deviation signal itself.
+    resolves it below the entry for longs and above for shorts. This is now
+    the *searched* exit axis (0.75 / 1.0 / 1.5 / 2.0 ATRs). The prior
+    iteration never searched it at all, pinning it at 2.0, so the whole
+    sub-2.0 region is untested ground; 2.0 stays in the grid as the control
+    anchor that reproduces the previous 2.0-stop / 4.0-target pairing.
 
-  - Target: entry Close +/- `target_atr_mult * ATR`, supplied as an absolute,
-    already-direction-resolved level (the shape the delegate requires). The
-    grid spans 1.5 / 2.5 / 4.0 ATRs — from tighter than the stop to twice it —
-    so the optimizer can pick the reward:risk that the data supports rather
-    than having one baked in.
+  - Target: pinned at a fixed reward:risk multiple of whatever stop the fold
+    selected — entry Close +/- `RR_MULT * stop_distance`, i.e. 2R, supplied
+    as an absolute, already-direction-resolved level (the shape the delegate
+    requires). `RR_MULT` is a module constant, deliberately *not* a param:
+    letting the target float independently just re-selects targets so wide
+    they never bind inside a ~6.5-bar NY session, degenerating every trade
+    into a run to the forced session flatten. Anchoring it to the stop makes
+    the target actually bind on the tight end of the stop grid.
 
 Exit is path-dependent, so this delegates to
 `session.apply_session_constraint_with_stops()` (both legs supplied on every
@@ -83,11 +89,13 @@ Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`):
   - `vwap_lookback` is a genuine bar count, passed as plain `int`, so it
     correctly sizes the pre-test-window warm-up buffer (max 96 -> (96+5)*3 =
     303 bars, ample for the 96-bar VWAP and the 14-bar ATR alike).
-  - `entry_dev`, `target_atr_mult` and `stop_atr_mult` are unitless ATR
-    multipliers, not bar counts, so all three are passed as `float` and are
-    correctly ignored by that buffer sizing.
-  - `ATR_PERIOD` is a module constant rather than a param, so it never enters
-    a grid combo at all.
+  - `entry_dev` and `stop_atr_mult` are unitless ATR multipliers, not bar
+    counts, so both are passed as `float` and are correctly ignored by that
+    buffer sizing. The float cast on `stop_atr_mult` is load-bearing now that
+    it is searched: its grid contains 1.0 and 2.0, which as plain Python ints
+    would be scooped up by that name-agnostic max-int scan.
+  - `ATR_PERIOD` and `RR_MULT` are module constants rather than params, so
+    neither ever enters a grid combo at all.
 
 Cost note: `metrics.py`'s ~0.102% round-trip (0.001% fee + 0.05% slippage per
 leg, 2 legs) is unchanged and out of scope. Staying at 1h keeps that fixed
@@ -108,6 +116,14 @@ from session import apply_session_constraint_with_stops
 # lever this iteration is testing. Plain int is fine here — it never enters a
 # grid combo, so it can't affect the warm-up buffer sizing either way.
 ATR_PERIOD = 14
+
+# Reward:risk multiple. The profit target sits RR_MULT * stop_distance from the
+# entry Close, so it rescales with whichever stop the fold picked instead of
+# being an independent ATR multiple. Hardcoded on purpose — see the module
+# docstring: as a free grid axis it degenerates to "never binds, run to the
+# session flatten". Float, and never in a grid combo, so it cannot touch the
+# warm-up buffer sizing.
+RR_MULT = 2.0
 
 
 def average_true_range(df: pd.DataFrame, atr_period: int = ATR_PERIOD) -> pd.Series:
@@ -154,8 +170,7 @@ def generate_positions(
     df: pd.DataFrame,
     vwap_lookback: int,
     entry_dev: float,
-    target_atr_mult: float,
-    stop_atr_mult: float = 2.0,
+    stop_atr_mult: float = 1.0,
     session: str | None = "New York",
 ) -> pd.Series:
     close = df["Close"]
@@ -182,10 +197,17 @@ def generate_positions(
     stop_distance = float(stop_atr_mult) * atr
 
     # Target as an absolute, already direction-resolved level, which is the
-    # shape the delegate expects. Only read on actual entry bars.
-    tgt = float(target_atr_mult)
+    # shape the delegate expects. Only read on actual entry bars. Measured off
+    # `stop_distance` — NOT off `atr` — so it is exactly RR_MULT R away from
+    # entry for whatever stop the fold chose (a 0.75-ATR stop gets a 1.5-ATR
+    # target, a 2.0-ATR stop gets a 4.0-ATR one). Multiplying `atr` instead
+    # would freeze the target at 2 ATR and decouple it from the searched axis.
     target_price = pd.Series(
-        np.where(long_signal, close + tgt * atr, close - tgt * atr),
+        np.where(
+            long_signal,
+            close + RR_MULT * stop_distance,
+            close - RR_MULT * stop_distance,
+        ),
         index=df.index,
     )
 
@@ -204,7 +226,6 @@ def generate_positions(
 DEFAULT_PARAMS = {
     "vwap_lookback": 24,
     "entry_dev": 0.5,
-    "target_atr_mult": 2.5,
-    "stop_atr_mult": 2.0,
+    "stop_atr_mult": 1.0,
     "session": "New York",
 }
