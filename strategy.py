@@ -1,135 +1,187 @@
-"""Swing-horizon time-series momentum, executed intraday.
+"""Regression-channel reversion — OLS-residual sigma entry, exit at the fitted line.
 
-`momentum-strategies.md`'s canonical construction read literally: rank by the
-cumulative return over a *formation period*, skipping the most recent period
-(Rcum = P(S)/P(S+T) - 1), and take the sign of that cumulative return as the
-directional state. The one thing this repo has never measured is the
-*horizon*: every directional lookback across 22 iterations tops out at 384
-bars (~4 days), and iterations 7/20 measured drift over 24-192 bars (6h-2
-days). The formation windows here are 480-1440 bars on 15min NQ, i.e. roughly
-1-3 weeks — the horizon where the time-series momentum evidence is actually
-strong, rather than the intraday horizon where it is weakest.
+`mean-reversion.md` lists exactly three simple mean-reversion recipes; the log
+has mined only one (Bollinger bands, iteration 1). This implements the
+untouched third verbatim — "Linear Regression / Threshold: Fit a line to
+recent prices. When price deviates by N standard deviations from the line,
+assume reversion" — with that page's documented Bollinger exit ("expecting
+reversion to middle. Exit at middle") supplying a zero-parameter target.
 
-Second design driver is turnover economics. `metrics.py` charges ~10.2bps
-round-trip off Close and is out of scope here, but it is the binding
-constraint: the log's two gate-v2 runs both decomposed to roughly -11bps
-net/trade on ~0bps gross across ~750-950 trades. So this is deliberately a
-*state* signal, not an event trigger — the multi-week sign changes rarely, so
-the strategy takes at most one round trip per session (open on the session's
-first live bar, held to `session.py`'s forced flatten), rather than re-arming
-after every stop.
+Why this is not a seventh z-score fade. Iteration 21 concluded the rolling-
+*mean* z-score is information-free on this data in either polarity (PF 0.675
+IS and OOS with both signs live). But a rolling mean lags inside a drifting
+window, so price sits persistently on one side of it and the fade is really
+fighting local drift — `mean-reversion.md` pitfall #1, "in a strong uptrend,
+shorting strength is a losing strategy". An OLS fit removes the local slope,
+so the quantity being faded (the residual) is closer to stationary, and it
+does so *without* a separate trend filter — which matters because iterations
+8 and 9 showed added conjunctive filters cutting OOS trade count
+183 -> 100 -> 74 and collapsing into an overfit gap.
+
+It also repairs an unnamed defect in iteration 21: its `entry_z` grid started
+at 1.0, so part of the grid implied a reversion target that could not clear
+`metrics.py`'s ~10.2bps round-trip toll at all. Here `entry_sigma` floors at
+1.5 and `reg_lookback` at 48, putting the smallest implied target at roughly
+3-5x the toll — the discipline iterations 1 and 2 applied and 21 dropped.
 
 Rules (all computed on the full continuous frame with no session awareness of
-their own; every leg is a strict backward `.shift()` so unwarmed bars are NaN
-and the signal fails *closed* — NaN compares False on both `> 0` and `< 0`, so
-no entry can fire on an unwarmed bar):
+their own; every input is a strictly backward rolling window, so unwarmed
+bars are NaN and the signal fails *closed*):
 
-  - anchor = Close.shift(skip_period)
-    The formation window deliberately *ends* `skip_period` bars in the past.
-    `skip_period = 0` is retained in the grid as a control: iteration 20
-    already tested the skip mechanism at intraday horizon (hardcoded L/8) and
-    found no edge there, so the skip must earn its place at this horizon.
+  - For every bar t, fit an ordinary least-squares line of Close on bar index
+    over the trailing `reg_lookback` bars ending at t. Closed form off rolling
+    moments only:
 
-  - formation_ret = anchor / Close.shift(skip_period + trend_lookback) - 1
-    The Rcum of the formation window itself.
+        slope_t     = cov(x, y) / var(x)                  (rolling, window n)
+        line_t      = mean(y) + slope_t * (x_t - mean(x))
+        sigma_t     = sqrt(max(var(y) - slope_t^2 * var(x), 0))
+        z_t         = (Close_t - line_t) / sigma_t
 
-  - confirm_ret  = anchor / Close.shift(skip_period + max(1, trend_lookback // 4)) - 1
-    A quarter-horizon confirmation over the *same* anchor. This is
-    momentum-strategies.md pitfall 1 read literally — "when a trend breaks
-    suddenly, momentum strategies take large losses; this is the main driver
-    of drawdowns" — and it costs zero degrees of freedom: the quarter horizon
-    is derived internally from `trend_lookback` and is deliberately NOT a
-    grid param or a DEFAULT_PARAMS key.
+    `sigma_t` is the residual standard deviation inside that same window, via
+    the OLS identity SSresid = SSyy - slope^2 * SSxx. Nothing after bar t is
+    touched; `line_t` is the fitted value *at* t (the window's right edge), so
+    it is knowable at t's Close and the entry is priced at that same Close.
 
-  - Raw entries:  1.0 where formation_ret > 0 AND confirm_ret > 0
-                 -1.0 where formation_ret < 0 AND confirm_ret < 0
-                  NaN otherwise (the two horizons disagree, or warm-up).
-    NaN means "do not open", not "exit": `apply_session_constraint()`'s ffill
-    holds any position already open. Because that function zeroes the last bar
-    of every session run and ffills that 0 through the off-session gap, no
-    position ever survives the session close and every session starts flat.
+    `x` is the positional bar index of the frame handed in. Simple regression
+    is invariant to the origin of a uniformly-spaced x, so the slope/line/
+    sigma at bar t are identical whether the frame is the whole dataset or one
+    of `wfo_engine._simulate_window()`'s buffered slices.
 
-  - No lookahead: every input is a backward shift of Close, every value is
-    knowable at bar t's Close, and the entry is priced at that same Close.
+  - Raw entries (crossing, not level, so the signal does not re-arm on every
+    bar of a sustained excursion):
+        -1.0 where z_t >  entry_sigma and z_{t-1} <=  entry_sigma
+        +1.0 where z_t < -entry_sigma and z_{t-1} >= -entry_sigma
+         NaN elsewhere.
+    Unwarmed bars leave z NaN, and NaN compares False on both sides, so no
+    entry can fire before the window is full. With pandas' default
+    `min_periods == window`, z first goes non-NaN at position n-1 and
+    z.shift(1) is still NaN there, so the first possible entry is position n.
 
-Exit is a plain flip — `session.apply_session_constraint(entries, session)`.
-There is no stop and no target, and deliberately no call to
-`apply_session_constraint_with_stops()`: that path requires a valid stop AND a
-valid target on every entry bar and would add nothing the forced session
-flatten isn't already doing. Within a session the position is held, flipped
-only if the multi-week state reverses sign intra-session (rare at this
-horizon), and force-flattened by `session.py` on the session's last bar.
+  - Target = `line_t`, the fitted line level captured at the entry bar —
+    mean-reversion.md's "exit at middle" read literally, held as a fixed price
+    level for the life of the trade rather than recomputed. By construction a
+    short entry has Close > line and a long entry has Close < line, so the
+    target is always on the correct side of the entry Close, which is what
+    `apply_session_constraint_with_stops()` requires. Implied target distance
+    is entry_sigma * sigma_t.
 
-Warm-up and param types:
+  - Stop = entry price displaced a further `stop_sigma * sigma_t` *away* from
+    the line (below entry for longs, above for shorts). Stop distance is
+    therefore independent of `entry_sigma`, so reward:risk runs 0.75:1 to
+    1.5:1 across the intended grid. `volatility.md`'s stop guidance (scale the
+    stop with measured volatility, wide enough that whipsaws don't punish it)
+    is satisfied by quoting it in the same residual-sigma unit as the entry.
 
-  - `trend_lookback` and `skip_period` are both genuine bar counts, so both
-    are passed as plain `int` from `build_grid()` and correctly feed
-    `wfo_engine._max_lookback_bars()`'s pre-test-window buffer. Nothing else
-    is a bar count, so nothing else is an int.
-  - The deepest reach back is `skip_period + trend_lookback` = 96 + 1440 =
-    1536 bars with the intended grid, against a buffer of
-    max((1440 + 5) * 3, day_bars + 5) = 4335 bars. That clears comfortably —
-    the buffer is sized off the largest single int, and here the *sum* of the
-    two ints is what matters, which is why the 3x multiplier is load-bearing.
+Exit is path-dependent, so this delegates to
+`session.apply_session_constraint_with_stops()` (both legs supplied on every
+entry bar, as that function requires). `session.py`'s forced flatten on the
+session's last bar remains the backstop — no position survives the session.
+The bounded line target (rather than a run-to-session-flatten) is deliberate:
+it keeps P&L from being tail-driven, which is what the gate's
+leave-top-5-out hard check penalizes.
+
+Param types / warm-up:
+  - `reg_lookback` is a genuine bar count, so it is passed as a plain `int`
+    from `build_grid()` and correctly feeds `wfo_engine._max_lookback_bars()`'s
+    pre-test-window buffer (384 -> (384+5)*3 = 1167 bars, ample).
+  - `entry_sigma` and `stop_sigma` are sigma multipliers, not bar counts, so
+    both are passed as `float` and are correctly ignored by that buffer sizing.
 
 Cost note: `metrics.py`'s ~0.102% round-trip is unchanged and out of scope.
-At one round trip per session an entry has a full New York session to cover
-that toll, which is the whole economic point of the state-based shape.
 
-This module decides only *when* the strategy wants to be long or short. All
-day-trade gating and the end-of-session flatten are delegated to
-`session.apply_session_constraint()`; see its docstring for that contract.
+This module decides only *when* the strategy wants to be long or short and at
+what levels it wants out. All day-trade gating and the end-of-session flatten
+are delegated to `session.py`; see its docstring for that contract.
 """
 import numpy as np
 import pandas as pd
 
 
-from session import apply_session_constraint
+from session import apply_session_constraint_with_stops
 
 
-def cumulative_return(close: pd.Series, skip_period: int, lookback: int) -> pd.Series:
-    """Rcum over the window ending `skip_period` bars back, `lookback` bars long.
+def regression_channel(close: pd.Series, reg_lookback: int) -> tuple[pd.Series, pd.Series]:
+    """Rolling OLS fitted value at the window's right edge + residual sigma.
 
-    `anchor = Close.shift(skip_period)` is the end of the formation window;
-    `Close.shift(skip_period + lookback)` is its start. Both legs are strict
-    backward shifts, so the result at bar t uses only bars <= t and the
-    leading `skip_period + lookback` bars are NaN (fails closed).
+    Returns `(line, sigma)` where `line[t]` is the fitted value at bar t of an
+    OLS fit of Close on bar index over the `reg_lookback` bars *ending at* t,
+    and `sigma[t]` is the standard deviation of that fit's residuals inside
+    the same window. Both are NaN until the window is full (fails closed).
+
+    Computed from rolling moments rather than a per-bar `polyfit`: pandas'
+    `rolling().cov()/.var()` are numerically stable at NQ-scale price levels
+    (a naive mean-of-squares would lose precision on y^2 ~ 4e8), and the OLS
+    identity SSresid = SSyy - slope^2 * SSxx gives the residual sigma without
+    ever materializing the residuals. `var`/`cov` are both ddof=1 here, so the
+    ddof cancels in the slope and `sigma` is sqrt(SSresid / (n - 1)).
     """
-    anchor = close.shift(skip_period)
-    base = close.shift(skip_period + lookback)
-    return anchor / base - 1.0
+    n = int(reg_lookback)
+    x = pd.Series(np.arange(len(close), dtype=float), index=close.index)
+
+    mean_x = x.rolling(n).mean()
+    mean_y = close.rolling(n).mean()
+    var_x = x.rolling(n).var()
+    var_y = close.rolling(n).var()
+    cov_xy = close.rolling(n).cov(x)
+
+    slope = cov_xy / var_x
+    line = mean_y + slope * (x - mean_x)
+
+    # OLS identity; clipped at 0 to absorb floating-point noise on a window
+    # whose residuals are (near-)degenerate.
+    resid_var = (var_y - slope**2 * var_x).clip(lower=0.0)
+    sigma = np.sqrt(resid_var)
+
+    # A perfectly-fit (zero-residual) window carries no information and would
+    # divide by zero — mark it unwarmed so the signal fails closed.
+    sigma = sigma.where(sigma > 0)
+
+    return line, sigma
 
 
 def generate_positions(
     df: pd.DataFrame,
-    trend_lookback: int,
-    skip_period: int,
+    reg_lookback: int,
+    entry_sigma: float,
+    stop_sigma: float,
     session: str | None = "New York",
 ) -> pd.Series:
     close = df["Close"]
 
-    # Quarter-horizon confirmation window, derived from trend_lookback rather
-    # than searched — zero extra degrees of freedom. max(1, ...) keeps it a
-    # strictly positive window even if a tiny trend_lookback is ever tried.
-    confirm_lookback = max(1, int(trend_lookback) // 4)
+    line, sigma = regression_channel(close, reg_lookback)
+    z = (close - line) / sigma
+    z_prev = z.shift(1)
 
-    formation_ret = cumulative_return(close, skip_period, trend_lookback)
-    confirm_ret = cumulative_return(close, skip_period, confirm_lookback)
+    # Crossing (not level) so a sustained excursion arms the signal once.
+    # NaN on either leg compares False, so unwarmed bars produce no entry.
+    short_signal = (z > entry_sigma) & (z_prev <= entry_sigma)
+    long_signal = (z < -entry_sigma) & (z_prev >= -entry_sigma)
 
-    # Both horizons must agree in sign. NaN (warm-up) compares False on both
-    # sides, so an unwarmed bar produces NaN entries = "do not open".
-    long_signal = (formation_ret > 0) & (confirm_ret > 0)
-    short_signal = (formation_ret < 0) & (confirm_ret < 0)
+    # Target: the fitted line itself, captured at the entry bar and held fixed
+    # for the trade. Long entries sit below the line and shorts above it, so
+    # the level is always on the profitable side of the entry Close.
+    target_price = line
 
-    entries = pd.Series(np.nan, index=df.index)
-    entries[long_signal] = 1.0
-    entries[short_signal] = -1.0
+    # Stop: a further stop_sigma of residual sigma *away* from the line.
+    # apply_session_constraint_with_stops() resolves the direction (below the
+    # entry for longs, above for shorts) from the sign of the position.
+    stop_distance = float(stop_sigma) * sigma
 
-    return apply_session_constraint(entries, session)
+    return apply_session_constraint_with_stops(
+        close=close,
+        high=df["High"],
+        low=df["Low"],
+        long_signal=long_signal,
+        short_signal=short_signal,
+        stop_distance=stop_distance,
+        target_price=target_price,
+        session=session,
+    )
 
 
 DEFAULT_PARAMS = {
-    "trend_lookback": 480,
-    "skip_period": 24,
+    "reg_lookback": 96,
+    "entry_sigma": 2.0,
+    "stop_sigma": 2.0,
     "session": "New York",
 }

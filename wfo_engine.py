@@ -42,31 +42,32 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(trend_lookbacks, skip_periods, session) -> list[dict]:
+def build_grid(reg_lookbacks, entry_sigmas, stop_sigma, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched: `trend_lookback` (the swing-horizon formation
-    window, ~1-3 weeks on 15min bars) and `skip_period` (how many bars back
-    the formation window ends — the classic momentum "skip the most recent
-    period", with 0 kept in the grid as a no-skip control).
+    Two params are searched: `reg_lookback` (the rolling OLS regression window
+    in bars) and `entry_sigma` (how many residual standard deviations away
+    from the fitted line price must cross for the fade to arm).
 
-    Both are cast to plain `int` on purpose: both are genuine bar counts, so
-    both *should* feed `_max_lookback_bars()`'s warm-up buffer. The strategy
-    reaches back `skip_period + trend_lookback` bars, and the buffer is sized
-    off the largest single int times 3, which comfortably covers that sum
-    (96 + 1440 = 1536 needed vs. (1440 + 5) * 3 = 4335 buffered). Nothing
-    else this strategy takes is a bar count, so nothing else is an int — the
-    quarter-horizon confirmation window is derived inside `strategy.py` from
-    `trend_lookback` and is deliberately not a param at all.
+    `stop_sigma` and `session` are fixed, never searched — threaded into every
+    combo as-is.
 
-    `session` is fixed, never searched — threaded into every combo as-is.
+    Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
+      - `reg_lookback` is cast to plain `int` on purpose — it is a genuine
+        bar-count lookback, so it *should* size the pre-test-window warm-up
+        buffer.
+      - `entry_sigma`/`stop_sigma` are cast to `float` on purpose — they are
+        sigma multipliers, not bar counts. Passing e.g. `2` as an int would
+        be harmless today but would silently start feeding the buffer sizing
+        if the grid ever widened, so the cast is explicit.
     """
     grid = []
-    for lookback, skip in product(trend_lookbacks, skip_periods):
+    for lookback, sigma in product(reg_lookbacks, entry_sigmas):
         grid.append(
             {
-                "trend_lookback": int(lookback),
-                "skip_period": int(skip),
+                "reg_lookback": int(lookback),
+                "entry_sigma": float(sigma),
+                "stop_sigma": float(stop_sigma),
                 "session": session,
             }
         )

@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --trend-lookback 480,720,960,1440 --skip-period 0,24,48,96 \\
+        --reg-lookback 48,96,192,384 --entry-sigma 1.5,2.0,2.5,3.0 --stop-sigma 2.0 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -64,19 +64,22 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (swing-horizon time-series momentum, intraday execution, flip exit)"
+        "strategy grid (regression-channel reversion: OLS-residual sigma entry, exit at the fitted line, "
+        "fixed sigma stop)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--trend-lookback", default="480,720,960,1440",
-                        help="comma-separated formation-window lengths in bars — the cumulative-return "
-                             "(Rcum) horizon whose sign sets the directional state. On 15min bars 480-1440 "
-                             "is roughly 1-3 weeks, the swing horizon the intraday lookbacks in this log "
-                             "have never reached")
-    strat.add_argument("--skip-period", default="0,24,48,96",
-                        help="comma-separated skip lengths in bars — how far in the past the formation "
-                             "window ends (classic momentum's 'skip the most recent period'). 0 is kept in "
-                             "the grid as a no-skip control")
+    strat.add_argument("--reg-lookback", default="48,96,192,384",
+                        help="comma-separated rolling OLS regression windows in bars — how much recent "
+                             "price the line is fit to. Floors at 48 so the implied reversion target is "
+                             "several times metrics.py's ~10.2bps round-trip toll")
+    strat.add_argument("--entry-sigma", default="1.5,2.0,2.5,3.0",
+                        help="comma-separated entry thresholds in residual standard deviations — price "
+                             "must cross this far from the fitted line for the fade to arm. Floors at 1.5 "
+                             "so no combo implies a target the cost model can't clear")
+    strat.add_argument("--stop-sigma", type=float, default=2.0,
+                        help="stop distance in residual standard deviations, measured from the entry price "
+                             "*away* from the line. Fixed (not grid-searched) — threaded into every combo")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -127,9 +130,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        trend_lookbacks = parse_num_list(args.trend_lookback, int)
-        skip_periods = parse_num_list(args.skip_period, int)
-        grid = build_grid(trend_lookbacks, skip_periods, session)
+        reg_lookbacks = parse_num_list(args.reg_lookback, int)
+        entry_sigmas = parse_num_list(args.entry_sigma, float)
+        grid = build_grid(reg_lookbacks, entry_sigmas, args.stop_sigma, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -170,11 +173,11 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        trend_lookback_vals = sorted({p["trend_lookback"] for p in chosen})
-        skip_period_vals = sorted({p["skip_period"] for p in chosen})
+        reg_lookback_vals = sorted({p["reg_lookback"] for p in chosen})
+        entry_sigma_vals = sorted({p["entry_sigma"] for p in chosen})
         print(
-            f"Fold param stability: {len(trend_lookback_vals)} distinct trend lookback "
-            f"{trend_lookback_vals}, {len(skip_period_vals)} distinct skip period {skip_period_vals}"
+            f"Fold param stability: {len(reg_lookback_vals)} distinct regression lookback "
+            f"{reg_lookback_vals}, {len(entry_sigma_vals)} distinct entry sigma {entry_sigma_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -208,8 +211,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "trend_lookback": f.best_params.get("trend_lookback"),
-                "skip_period": f.best_params.get("skip_period"),
+                "reg_lookback": f.best_params.get("reg_lookback"),
+                "entry_sigma": f.best_params.get("entry_sigma"),
+                "stop_sigma": f.best_params.get("stop_sigma"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
