@@ -42,37 +42,41 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(loc_lookbacks, loc_thresholds, stop_atr_mult, atr_period, session) -> list[dict]:
+def build_grid(vwap_lookbacks, entry_devs, target_atr_mults, stop_atr_mult, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched: `loc_lookback` (the trailing High/Low window, in
-    bars, that price's location is measured inside) and `loc_threshold` (how
-    far into the top/bottom of that range the Close must sit for the
-    directional state to be on).
+    Three params are searched: `vwap_lookback` (the trailing window, in bars,
+    the volume-weighted reference level is computed over), `entry_dev` (how
+    far, in ATRs, the Close must stretch past that level for the continuation
+    crossing to fire) and `target_atr_mult` (the profit target distance, in
+    ATRs, from the entry Close).
 
-    `stop_atr_mult`, `atr_period` and `session` are fixed, never searched —
-    threaded into every combo as-is. Holding the stop fixed keeps this
-    iteration a clean test of the location signal itself; the stop is the
-    reserved lever for the next one.
+    `stop_atr_mult` and `session` are fixed, never searched — threaded into
+    every combo as-is. Holding the stop fixed while the target varies keeps
+    the reward:risk ratio the thing being searched, rather than letting both
+    legs float and confounding the two.
+
+    (`strategy.ATR_PERIOD` is a module constant, not a param, so it never
+    appears in a combo at all.)
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `loc_lookback` and `atr_period` are cast to plain `int` on purpose —
-        both are genuine bar-count lookbacks, so both *should* size the
-        pre-test-window warm-up buffer.
-      - `loc_threshold`/`stop_atr_mult` are cast to `float` on purpose — they
-        are unitless multipliers, not bar counts. `stop_atr_mult` is exactly
-        the case the cast protects against: its default 2.0 would be harmless
-        as an int today, but any integer value would silently start feeding
-        the buffer sizing.
+      - `vwap_lookback` is cast to plain `int` on purpose — it's a genuine
+        bar-count lookback, so it *should* size the pre-test-window warm-up
+        buffer.
+      - `entry_dev`/`target_atr_mult`/`stop_atr_mult` are cast to `float` on
+        purpose — they are unitless ATR multipliers, not bar counts. They're
+        exactly the case the cast protects against: a target of 4.0 would be
+        harmless as an int today, but any integer value would silently start
+        feeding the buffer sizing.
     """
     grid = []
-    for lookback, threshold in product(loc_lookbacks, loc_thresholds):
+    for lookback, dev, target in product(vwap_lookbacks, entry_devs, target_atr_mults):
         grid.append(
             {
-                "loc_lookback": int(lookback),
-                "loc_threshold": float(threshold),
+                "vwap_lookback": int(lookback),
+                "entry_dev": float(dev),
+                "target_atr_mult": float(target),
                 "stop_atr_mult": float(stop_atr_mult),
-                "atr_period": int(atr_period),
                 "session": session,
             }
         )

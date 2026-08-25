@@ -10,9 +10,9 @@ Examples:
     python cli.py
 
     # override strategy/grid + walk-forward schedule
-    python cli.py --symbol ES --timeframe 1h --session "New York" \\
-        --loc-lookback 12,18,24,48 --loc-threshold 0.70,0.80,0.90 \\
-        --stop-atr-mult 2.0 --atr-period 14 \\
+    python cli.py --symbol NQ --timeframe 1h --session "New York" \\
+        --vwap-lookback 12,24,48,96 --entry-dev 0.25,0.5,1.0 \\
+        --target-atr-mult 1.5,2.5,4.0 --stop-atr-mult 2.0 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -65,24 +65,24 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (trailing-range location trend-hold: stochastic-location state entry, "
-        "ATR protective stop, no target, run to the session flatten)"
+        "strategy grid (VWAP-deviation continuation cross: entry when price crosses out past "
+        "+/- entry_dev ATRs from a rolling VWAP, ATR stop and ATR target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--loc-lookback", default="12,18,24,48",
-                        help="comma-separated trailing High/Low windows in bars — the range price's "
-                             "location is measured inside. At 1h these span roughly half a day to two days")
-    strat.add_argument("--loc-threshold", default="0.70,0.80,0.90",
-                        help="comma-separated location thresholds in 0-1 range units — long while "
-                             "location >= this, short while location <= 1 minus this. Must stay above "
-                             "0.5 so the two sides can't both be on for the same bar")
+    strat.add_argument("--vwap-lookback", default="12,24,48,96",
+                        help="comma-separated trailing windows in bars for the rolling volume-weighted "
+                             "average price. At 1h these span roughly half a day to four days")
+    strat.add_argument("--entry-dev", default="0.25,0.5,1.0",
+                        help="comma-separated entry thresholds in ATRs — long when the Close/VWAP "
+                             "deviation crosses up through +this, short when it crosses down through "
+                             "-this. Must stay above 0 so the two sides can't both fire on one bar")
+    strat.add_argument("--target-atr-mult", default="1.5,2.5,4.0",
+                        help="comma-separated profit-target distances in ATRs, measured from the entry "
+                             "price")
     strat.add_argument("--stop-atr-mult", type=float, default=2.0,
                         help="protective stop distance in ATRs, measured from the entry price. Fixed "
                              "(not grid-searched) — threaded into every combo")
-    strat.add_argument("--atr-period", type=int, default=14,
-                        help="ATR lookback in bars used to size the stop. Fixed (not grid-searched) — "
-                             "threaded into every combo")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -133,9 +133,10 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        loc_lookbacks = parse_num_list(args.loc_lookback, int)
-        loc_thresholds = parse_num_list(args.loc_threshold, float)
-        grid = build_grid(loc_lookbacks, loc_thresholds, args.stop_atr_mult, args.atr_period, session)
+        vwap_lookbacks = parse_num_list(args.vwap_lookback, int)
+        entry_devs = parse_num_list(args.entry_dev, float)
+        target_atr_mults = parse_num_list(args.target_atr_mult, float)
+        grid = build_grid(vwap_lookbacks, entry_devs, target_atr_mults, args.stop_atr_mult, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -176,12 +177,14 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        loc_lookback_vals = sorted({p["loc_lookback"] for p in chosen})
-        loc_threshold_vals = sorted({p["loc_threshold"] for p in chosen})
+        vwap_lookback_vals = sorted({p["vwap_lookback"] for p in chosen})
+        entry_dev_vals = sorted({p["entry_dev"] for p in chosen})
+        target_atr_mult_vals = sorted({p["target_atr_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(loc_lookback_vals)} distinct location lookback "
-            f"{loc_lookback_vals}, {len(loc_threshold_vals)} distinct location threshold "
-            f"{loc_threshold_vals}"
+            f"Fold param stability: {len(vwap_lookback_vals)} distinct VWAP lookback "
+            f"{vwap_lookback_vals}, {len(entry_dev_vals)} distinct entry deviation "
+            f"{entry_dev_vals}, {len(target_atr_mult_vals)} distinct target ATR multiple "
+            f"{target_atr_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -215,10 +218,10 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "loc_lookback": f.best_params.get("loc_lookback"),
-                "loc_threshold": f.best_params.get("loc_threshold"),
+                "vwap_lookback": f.best_params.get("vwap_lookback"),
+                "entry_dev": f.best_params.get("entry_dev"),
+                "target_atr_mult": f.best_params.get("target_atr_mult"),
                 "stop_atr_mult": f.best_params.get("stop_atr_mult"),
-                "atr_period": f.best_params.get("atr_period"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
