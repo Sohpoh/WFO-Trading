@@ -42,42 +42,54 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(run_lens, run_move_atrs, target_atr_mults, stop_atr_mult, session) -> list[dict]:
+def build_grid(move_lookbacks, move_atrs, stop_atr_high, stop_atr_low, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched: `run_len` (how many consecutive same-direction
-    closes make a run), `run_move_atr` (how far, in ATRs, that run must have
-    travelled for it to count as an exhaustion candidate worth fading) and
-    `target_atr_mult` (the profit target distance, in ATRs, from the entry
-    Close).
+    Two params are searched, and they are the *whole* signal: `move_lookback`
+    (over how many bars the displacement is measured) and `move_atr` (how many
+    ATRs that displacement must cover to arm an entry). The volatility regime
+    that sets the trade's *polarity* is deliberately not searchable — it lives
+    in `strategy.py` as module constants (`VOL_FAST_N`/`VOL_SLOW_N`), so a fold
+    cannot pick a regime definition that happens to flatter its sample, and
+    any result is attributable to the polarity switch alone.
 
-    `stop_atr_mult` and `session` are fixed, never searched — threaded into
-    every combo as-is. Holding the stop fixed while the target varies keeps
-    the reward:risk ratio the thing being searched, rather than letting both
-    legs float and confounding the two.
+    `stop_atr_high`, `stop_atr_low` and `session` are fixed, never searched —
+    threaded into every combo as-is. The two stops are the regime-scaled
+    widths (wide for the HIGH-vol momentum leg, tight for the LOW-vol
+    reversion leg); holding both fixed keeps the search on the entry signal
+    rather than letting the exit geometry float alongside it. There is no
+    target param at all — the target is `strategy.RR_MULT * stop_distance`,
+    so reward:risk is a constant 1.5R by construction.
 
-    (`strategy.ATR_PERIOD` is a module constant, not a param, so it never
-    appears in a combo at all and can't reach `_max_lookback_bars()` below.)
+    (`strategy.ATR_PERIOD`, `VOL_FAST_N`, `VOL_SLOW_N` and `RR_MULT` are all
+    module constants, not params, so none appears in a combo and none can
+    reach `_max_lookback_bars()` below.)
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `run_len` is cast to plain `int` on purpose — it's a genuine bar-count
-        lookback (the strategy reads `Close.shift(run_len)` and rolls a
-        `run_len`-bar window), so it *should* size the pre-test-window warm-up
-        buffer.
-      - `run_move_atr`/`target_atr_mult`/`stop_atr_mult` are cast to `float`
-        on purpose — they are unitless ATR multipliers, not bar counts.
-        They're exactly the case the cast protects against: a run_move_atr of
-        2.0 would be harmless as an int today, but any integer value would
-        silently start feeding the buffer sizing.
+      - `move_lookback` is cast to plain `int` on purpose — it's a genuine
+        bar-count lookback (the strategy reads `Close.shift(move_lookback)`),
+        so it *should* size the pre-test-window warm-up buffer.
+      - `move_atr`/`stop_atr_high`/`stop_atr_low` are cast to `float` on
+        purpose — they are unitless ATR multipliers, not bar counts. They're
+        exactly the case the cast protects against: a `move_atr` of 2.0 would
+        be harmless as an int today, but any integer value would silently
+        start feeding the buffer sizing.
+
+    Warm-up caveat: because the regime windows are constants, the buffer is
+    sized off `move_lookback` alone. The intended grid top of 24 yields
+    `max((24 + 5) * 3, bars_per_day + 5)` = 87 bars at NQ 1h against the
+    regime's ~75-bar reach. Narrowing the grid's top below 24 leaves the
+    regime cold at the head of each test window (fails closed — no trades —
+    but silently). See `strategy.py`'s docstring.
     """
     grid = []
-    for run_len, run_move, target in product(run_lens, run_move_atrs, target_atr_mults):
+    for move_lookback, move_atr in product(move_lookbacks, move_atrs):
         grid.append(
             {
-                "run_len": int(run_len),
-                "run_move_atr": float(run_move),
-                "target_atr_mult": float(target),
-                "stop_atr_mult": float(stop_atr_mult),
+                "move_lookback": int(move_lookback),
+                "move_atr": float(move_atr),
+                "stop_atr_high": float(stop_atr_high),
+                "stop_atr_low": float(stop_atr_low),
                 "session": session,
             }
         )

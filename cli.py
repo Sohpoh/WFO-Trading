@@ -11,8 +11,8 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 1h --session "New York" \\
-        --run-len 2,3,4 --run-move-atr 0.75,1.25,2.0 \\
-        --target-atr-mult 1.0,1.5,2.5 --stop-atr-mult 1.5 \\
+        --move-lookback 3,6,12,24 --move-atr 1.0,1.75,2.5 \\
+        --stop-atr-high 1.5 --stop-atr-low 1.0 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -65,27 +65,34 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (run-exhaustion reversal: a run of run_len consecutive same-direction "
-        "closes that has covered at least run_move_atr ATRs is faded once, on the first bar it "
-        "qualifies — long after a down-run, short after an up-run — with an ATR stop and an ATR "
-        "target. The ATR period itself is hardcoded in strategy.py and has no flag)"
+        "strategy grid (volatility-level polarity switch: one ATR-normalized displacement over "
+        "move_lookback bars arms an entry once it covers move_atr ATRs, and the measured vol "
+        "regime sets its sign — HIGH-vol trades WITH the move on a wide stop, LOW-vol trades "
+        "AGAINST it on a tight stop. The target is always 1.5R off whichever stop applies. The "
+        "ATR period, the 24/72-bar regime windows and the 1.5R reward:risk are hardcoded module "
+        "constants in strategy.py and have no flags)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--run-len", default="2,3,4",
-                        help="comma-separated run lengths in bars — how many consecutive lower (or "
-                             "higher) closes make a run. At 1h these are 2-4 hours of uninterrupted "
-                             "one-way trade")
-    strat.add_argument("--run-move-atr", default="0.75,1.25,2.0",
-                        help="comma-separated magnitude floors in ATRs — the run's total close-to-close "
-                             "displacement must clear this many ATRs before it is worth fading. Keeps a "
-                             "long but trivial drift from qualifying")
-    strat.add_argument("--target-atr-mult", default="1.0,1.5,2.5",
-                        help="comma-separated profit-target distances in ATRs, measured from the entry "
-                             "price")
-    strat.add_argument("--stop-atr-mult", type=float, default=1.5,
-                        help="protective stop distance in ATRs, measured from the entry price. Fixed "
-                             "(not grid-searched) — threaded into every combo")
+    strat.add_argument("--move-lookback", default="3,6,12,24",
+                        help="comma-separated displacement horizons in bars — d = (Close[t] - "
+                             "Close[t-N]) / ATR[t]. WARM-UP CAVEAT: this is the only int param, so it "
+                             "alone sizes the engine's pre-test-window buffer, while the regime needs "
+                             "~75 bars of history. Keep the largest value at 24 (buffer 87 bars at "
+                             "NQ 1h); lowering the top leaves the regime cold at the head of each "
+                             "test window — it fails closed (no trades), but silently")
+    strat.add_argument("--move-atr", default="1.0,1.75,2.5",
+                        help="comma-separated arming thresholds in ATRs — |d| must clear this before "
+                             "an entry fires, and it fires only on the crossing (once per "
+                             "displacement event), not on every bar the move stays extended")
+    strat.add_argument("--stop-atr-high", type=float, default=1.5,
+                        help="stop distance in ATRs for entries taken in the HIGH-vol regime (the "
+                             "wide-stop momentum leg). Fixed (not grid-searched) — threaded into "
+                             "every combo")
+    strat.add_argument("--stop-atr-low", type=float, default=1.0,
+                        help="stop distance in ATRs for entries taken in the LOW-vol regime (the "
+                             "tight-stop mean-reversion leg). Fixed (not grid-searched) — threaded "
+                             "into every combo")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -136,10 +143,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        run_lens = parse_num_list(args.run_len, int)
-        run_move_atrs = parse_num_list(args.run_move_atr, float)
-        target_atr_mults = parse_num_list(args.target_atr_mult, float)
-        grid = build_grid(run_lens, run_move_atrs, target_atr_mults, args.stop_atr_mult, session)
+        move_lookbacks = parse_num_list(args.move_lookback, int)
+        move_atrs = parse_num_list(args.move_atr, float)
+        grid = build_grid(move_lookbacks, move_atrs, args.stop_atr_high, args.stop_atr_low, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -180,14 +186,12 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        run_len_vals = sorted({p["run_len"] for p in chosen})
-        run_move_atr_vals = sorted({p["run_move_atr"] for p in chosen})
-        target_atr_mult_vals = sorted({p["target_atr_mult"] for p in chosen})
+        move_lookback_vals = sorted({p["move_lookback"] for p in chosen})
+        move_atr_vals = sorted({p["move_atr"] for p in chosen})
         print(
-            f"Fold param stability: {len(run_len_vals)} distinct run length "
-            f"{run_len_vals}, {len(run_move_atr_vals)} distinct run magnitude floor "
-            f"{run_move_atr_vals}, {len(target_atr_mult_vals)} distinct target ATR multiple "
-            f"{target_atr_mult_vals}"
+            f"Fold param stability: {len(move_lookback_vals)} distinct displacement horizon "
+            f"{move_lookback_vals}, {len(move_atr_vals)} distinct arming threshold in ATRs "
+            f"{move_atr_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -221,10 +225,10 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "run_len": f.best_params.get("run_len"),
-                "run_move_atr": f.best_params.get("run_move_atr"),
-                "target_atr_mult": f.best_params.get("target_atr_mult"),
-                "stop_atr_mult": f.best_params.get("stop_atr_mult"),
+                "move_lookback": f.best_params.get("move_lookback"),
+                "move_atr": f.best_params.get("move_atr"),
+                "stop_atr_high": f.best_params.get("stop_atr_high"),
+                "stop_atr_low": f.best_params.get("stop_atr_low"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
