@@ -42,53 +42,42 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(cl_thresholds, range_mults, history_bars, session) -> list[dict]:
+def build_grid(cmf_lookbacks, entry_pressures, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched, and they are the *whole* signal: `cl_threshold`
-    (how close to the prior UTC day's extreme that day had to settle before
-    the next session fades it) and `range_mult` (how wide that prior day's
-    range had to be, relative to its own 14-day baseline, to qualify at all).
-    The baseline length itself is deliberately not searchable — it lives in
-    `strategy.py` as the module constant `RANGE_BASELINE_DAYS`, so a fold
-    cannot pick a volatility yardstick that happens to flatter its sample and
-    any result is attributable to the fade itself.
+    Two params are searched, and they are the *whole* signal: `cmf_lookback`
+    (how many completed bars of volume-weighted intrabar close location get
+    summed into the Chaikin Money Flow reading) and `entry_pressure` (how far
+    from zero that reading has to sit before the strategy takes a side).
+    There is nothing else to tune — the exit is a plain flip plus `session.py`'s
+    forced flatten, so no stop/target params exist.
 
-    `history_bars` and `session` are fixed, never searched — threaded into
-    every combo as-is.
+    `session` is fixed, never searched — threaded into every combo as-is.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `history_bars` is cast to plain `int` **on purpose**, and it is the
-        only int in a combo. The strategy never reads it; its entire job is to
-        reach `_max_lookback_bars()` and size the pre-test-window warm-up
-        buffer, because the strategy's reach is day-anchored (14 completed
-        days of Range baseline + the 1-day freeze shift) and there is no
-        bar-count param that expresses that. The engine's own
-        `_bars_per_day()` floor only guarantees *one* day of history, which is
-        not enough. At the 1440 default and NQ 15min this gives
-        `max((1440 + 5) * 3, 92 + 5)` = 4335 bars ~= 47 trading days.
-      - `cl_threshold` and `range_mult` are cast to `float` on purpose — a
-        [0,1] range location and a ratio of ranges, neither a bar count. The
-        cast matters: `range_mult` values like 1.0 or 2.0 are perfectly
-        plausible grid points and would silently start inflating the warm-up
-        buffer if they arrived as ints.
+      - `cmf_lookback` is cast to plain `int` **on purpose**, and it is the
+        only int in a combo. It is a genuine bar-count lookback, so it is
+        exactly what should size the pre-test-window warm-up buffer: at the
+        grid's top end (96) `buffer_bars = max((96 + 5) * 3, day_bars + 5)`
+        = 303 bars, comfortably covering a 96-bar rolling window.
+      - `entry_pressure` is cast to `float` on purpose — CMF is a unitless
+        ratio in [-1, 1], never a bar count. The cast is defensive: a grid
+        point written as `1` would otherwise arrive as an `int` and silently
+        inflate the warm-up buffer.
 
-    COVERAGE HAZARD, both directions. `run_walk_forward()` below skips any
-    fold whose train window holds fewer than `max_lookback + 10` bars, so at
-    `history_bars=1440` a fold needs 1450 train bars. A 12-week train window
-    is ~5492 bars at NQ 15min (fine) but only ~1373 at NQ 1h — under the
-    guard, so at 1h *every* fold is skipped and the CLI prints "Folds: 0/N"
-    with an empty OOS column next to a populated in-sample one. Lower
-    `--history-bars` for coarser timeframes; raising it past ~1/3 of the train
-    window reintroduces the same failure.
+    Note that this strategy has NO day-anchored reach and therefore no
+    `history_bars` hint (iteration 31 needed one; a rolling window does not).
+    That also dissolves iteration 31's coverage hazard: `run_walk_forward()`
+    below skips any fold whose train window holds fewer than
+    `max_lookback + 10` bars, which is now 106 rather than 1450, so coarse
+    timeframes no longer skip every fold.
     """
     grid = []
-    for cl_threshold, range_mult in product(cl_thresholds, range_mults):
+    for cmf_lookback, entry_pressure in product(cmf_lookbacks, entry_pressures):
         grid.append(
             {
-                "cl_threshold": float(cl_threshold),
-                "range_mult": float(range_mult),
-                "history_bars": int(history_bars),
+                "cmf_lookback": int(cmf_lookback),
+                "entry_pressure": float(entry_pressure),
                 "session": session,
             }
         )

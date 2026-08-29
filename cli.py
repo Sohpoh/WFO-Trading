@@ -6,13 +6,12 @@ Useful for batch runs, cron/CI, or piping results into other tools instead of
 clicking through the sidebar every time.
 
 Examples:
-    # the strategy's intended config (NQ 15min, New York session)
-    python cli.py --symbol NQ --timeframe 15min --train-weeks 12 --test-weeks 3
+    # the strategy's intended config (ES 15min, New York session)
+    python cli.py --symbol ES --timeframe 15min --train-weeks 12 --test-weeks 3
 
     # override strategy/grid + walk-forward schedule
-    python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --cl-threshold 0.70,0.75,0.82,0.90 --range-mult 0.6,0.9,1.2,1.6 \\
-        --history-bars 1440 \\
+    python cli.py --symbol ES --timeframe 15min --session "New York" \\
+        --cmf-lookback 12,24,48,96 --entry-pressure 0.05,0.10,0.15,0.25 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -65,41 +64,31 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (prior-day close-location reversal: the previous completed UTC day's "
-        "close location within its own High-Low range is frozen before the session opens and "
-        "then FADED — closed near the high goes short, closed near the low goes long — but only "
-        "if that day's range cleared range_mult times its 14-day baseline. The bias is constant "
-        "all day, so there is no stop, no target and no intraday flip: exactly one round trip "
-        "per qualifying session, closed by session.py's forced flatten. The 14-day baseline "
-        "length is a hardcoded module constant in strategy.py and has no flag)"
+        "strategy grid (money-flow pressure trend state: per bar, the intrabar close location "
+        "((Close-Low)-(High-Close))/(High-Low) is weighted by that bar's Volume and summed over "
+        "cmf_lookback bars, divided by the summed Volume, giving Chaikin Money Flow in [-1,1]. "
+        "The strategy goes LONG while CMF sits at or above entry_pressure and SHORT while it "
+        "sits at or below -entry_pressure — a persistent STATE, not a crossing event, and with "
+        "no extremity condition at entry. Exit is a plain flip: the position turns over only "
+        "when CMF reaches the opposite threshold, otherwise it is closed by session.py's forced "
+        "flatten on the session's last bar. No stop, no target, winners uncapped)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--cl-threshold", default="0.70,0.75,0.82,0.90",
-                        help="comma-separated close-location thresholds in [0,1] — with "
-                             "CL = (Close_d - Low_d) / (High_d - Low_d) measured on the prior UTC "
-                             "day, CL >= threshold fades SHORT and CL <= 1 - threshold fades LONG. "
-                             "Values above 0.5 keep the two sides mutually exclusive")
-    strat.add_argument("--range-mult", default="0.6,0.9,1.2,1.6",
-                        help="comma-separated qualifiers — the prior UTC day's range must be at "
-                             "least this multiple of its own trailing 14-day mean range for the "
-                             "session to trade at all. Note that CME's Sunday 18:00 ET open makes "
-                             "UTC Sunday a ~2h stub day that deflates the baseline, so the "
-                             "effective threshold is looser than the nominal value; a pin at the "
-                             "low end means the qualifier is inert, not that a boundary was found")
-    strat.add_argument("--history-bars", type=int, default=1440,
-                        help="warm-up buffer hint in bars. Fixed (not grid-searched) — threaded "
-                             "into every combo, and NEVER READ by strategy.py: its only job is to "
-                             "be the largest int in the grid so wfo_engine._max_lookback_bars() "
-                             "sizes the pre-test-window buffer for a day-anchored indicator "
-                             "(14 baseline days + the 1-day freeze shift). 1440 gives 4335 bars "
-                             "~= 47 days at NQ 15min. HAZARD: run_walk_forward() skips any fold "
-                             "with fewer than history_bars + 10 train bars, and a 12-week train "
-                             "window is only ~1373 bars at NQ 1h and ~372 at 4h — so on those "
-                             "timeframes the default silently skips EVERY fold ('Folds: 0/N', "
-                             "empty OOS column). Use ~400 at 1h and ~100 at 4h (400 would itself "
-                             "trip the guard at 4h); both still buffer ~52 days, well past the "
-                             "~15 days of reach the baseline needs")
+    strat.add_argument("--cmf-lookback", default="12,24,48,96",
+                        help="comma-separated Chaikin Money Flow window lengths, in bars — how "
+                             "many completed bars of volume-weighted close location get summed "
+                             "into one CMF reading. Strictly warm (min_periods = the window), so "
+                             "unwarmed bars are NaN and stand aside. These are genuine bar-count "
+                             "lookbacks and are passed as ints, so the largest one sizes "
+                             "wfo_engine's pre-test-window warm-up buffer (96 -> 303 bars)")
+    strat.add_argument("--entry-pressure", default="0.05,0.10,0.15,0.25",
+                        help="comma-separated CMF thresholds, unitless in [0,1] — CMF >= p goes "
+                             "long, CMF <= -p goes short, in between holds whatever position is "
+                             "already open. Kept deliberately loose: tightening this is pure "
+                             "selectivity and drops the OOS trade count, which earlier iterations "
+                             "showed walking straight into an overfit gap. Any value > 0 keeps "
+                             "the two sides mutually exclusive")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -150,9 +139,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        cl_thresholds = parse_num_list(args.cl_threshold, float)
-        range_mults = parse_num_list(args.range_mult, float)
-        grid = build_grid(cl_thresholds, range_mults, args.history_bars, session)
+        cmf_lookbacks = parse_num_list(args.cmf_lookback, int)
+        entry_pressures = parse_num_list(args.entry_pressure, float)
+        grid = build_grid(cmf_lookbacks, entry_pressures, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -193,15 +182,15 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the two grid-searched params are reported here; `history_bars`
-        # is fixed across every combo, so its "distinct values" would always
-        # be 1 and carry no stability information.
-        cl_threshold_vals = sorted({p["cl_threshold"] for p in chosen})
-        range_mult_vals = sorted({p["range_mult"] for p in chosen})
+        # Only the two grid-searched params are reported here; `session` is
+        # fixed across every combo, so its "distinct values" would always be 1
+        # and carry no stability information.
+        cmf_lookback_vals = sorted({p["cmf_lookback"] for p in chosen})
+        entry_pressure_vals = sorted({p["entry_pressure"] for p in chosen})
         print(
-            f"Fold param stability: {len(cl_threshold_vals)} distinct close-location threshold "
-            f"{cl_threshold_vals}, {len(range_mult_vals)} distinct range qualifier "
-            f"{range_mult_vals}"
+            f"Fold param stability: {len(cmf_lookback_vals)} distinct CMF lookback "
+            f"{cmf_lookback_vals}, {len(entry_pressure_vals)} distinct entry pressure "
+            f"{entry_pressure_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -235,9 +224,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "cl_threshold": f.best_params.get("cl_threshold"),
-                "range_mult": f.best_params.get("range_mult"),
-                "history_bars": f.best_params.get("history_bars"),
+                "cmf_lookback": f.best_params.get("cmf_lookback"),
+                "entry_pressure": f.best_params.get("entry_pressure"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
