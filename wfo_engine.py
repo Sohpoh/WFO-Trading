@@ -42,54 +42,53 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(move_lookbacks, move_atrs, stop_atr_high, stop_atr_low, session) -> list[dict]:
+def build_grid(cl_thresholds, range_mults, history_bars, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched, and they are the *whole* signal: `move_lookback`
-    (over how many bars the displacement is measured) and `move_atr` (how many
-    ATRs that displacement must cover to arm an entry). The volatility regime
-    that sets the trade's *polarity* is deliberately not searchable — it lives
-    in `strategy.py` as module constants (`VOL_FAST_N`/`VOL_SLOW_N`), so a fold
-    cannot pick a regime definition that happens to flatter its sample, and
-    any result is attributable to the polarity switch alone.
+    Two params are searched, and they are the *whole* signal: `cl_threshold`
+    (how close to the prior UTC day's extreme that day had to settle before
+    the next session fades it) and `range_mult` (how wide that prior day's
+    range had to be, relative to its own 14-day baseline, to qualify at all).
+    The baseline length itself is deliberately not searchable — it lives in
+    `strategy.py` as the module constant `RANGE_BASELINE_DAYS`, so a fold
+    cannot pick a volatility yardstick that happens to flatter its sample and
+    any result is attributable to the fade itself.
 
-    `stop_atr_high`, `stop_atr_low` and `session` are fixed, never searched —
-    threaded into every combo as-is. The two stops are the regime-scaled
-    widths (wide for the HIGH-vol momentum leg, tight for the LOW-vol
-    reversion leg); holding both fixed keeps the search on the entry signal
-    rather than letting the exit geometry float alongside it. There is no
-    target param at all — the target is `strategy.RR_MULT * stop_distance`,
-    so reward:risk is a constant 1.5R by construction.
-
-    (`strategy.ATR_PERIOD`, `VOL_FAST_N`, `VOL_SLOW_N` and `RR_MULT` are all
-    module constants, not params, so none appears in a combo and none can
-    reach `_max_lookback_bars()` below.)
+    `history_bars` and `session` are fixed, never searched — threaded into
+    every combo as-is.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `move_lookback` is cast to plain `int` on purpose — it's a genuine
-        bar-count lookback (the strategy reads `Close.shift(move_lookback)`),
-        so it *should* size the pre-test-window warm-up buffer.
-      - `move_atr`/`stop_atr_high`/`stop_atr_low` are cast to `float` on
-        purpose — they are unitless ATR multipliers, not bar counts. They're
-        exactly the case the cast protects against: a `move_atr` of 2.0 would
-        be harmless as an int today, but any integer value would silently
-        start feeding the buffer sizing.
+      - `history_bars` is cast to plain `int` **on purpose**, and it is the
+        only int in a combo. The strategy never reads it; its entire job is to
+        reach `_max_lookback_bars()` and size the pre-test-window warm-up
+        buffer, because the strategy's reach is day-anchored (14 completed
+        days of Range baseline + the 1-day freeze shift) and there is no
+        bar-count param that expresses that. The engine's own
+        `_bars_per_day()` floor only guarantees *one* day of history, which is
+        not enough. At the 1440 default and NQ 15min this gives
+        `max((1440 + 5) * 3, 92 + 5)` = 4335 bars ~= 47 trading days.
+      - `cl_threshold` and `range_mult` are cast to `float` on purpose — a
+        [0,1] range location and a ratio of ranges, neither a bar count. The
+        cast matters: `range_mult` values like 1.0 or 2.0 are perfectly
+        plausible grid points and would silently start inflating the warm-up
+        buffer if they arrived as ints.
 
-    Warm-up caveat: because the regime windows are constants, the buffer is
-    sized off `move_lookback` alone. The intended grid top of 24 yields
-    `max((24 + 5) * 3, bars_per_day + 5)` = 87 bars at NQ 1h against the
-    regime's ~75-bar reach. Narrowing the grid's top below 24 leaves the
-    regime cold at the head of each test window (fails closed — no trades —
-    but silently). See `strategy.py`'s docstring.
+    COVERAGE HAZARD, both directions. `run_walk_forward()` below skips any
+    fold whose train window holds fewer than `max_lookback + 10` bars, so at
+    `history_bars=1440` a fold needs 1450 train bars. A 12-week train window
+    is ~5492 bars at NQ 15min (fine) but only ~1373 at NQ 1h — under the
+    guard, so at 1h *every* fold is skipped and the CLI prints "Folds: 0/N"
+    with an empty OOS column next to a populated in-sample one. Lower
+    `--history-bars` for coarser timeframes; raising it past ~1/3 of the train
+    window reintroduces the same failure.
     """
     grid = []
-    for move_lookback, move_atr in product(move_lookbacks, move_atrs):
+    for cl_threshold, range_mult in product(cl_thresholds, range_mults):
         grid.append(
             {
-                "move_lookback": int(move_lookback),
-                "move_atr": float(move_atr),
-                "stop_atr_high": float(stop_atr_high),
-                "stop_atr_low": float(stop_atr_low),
+                "cl_threshold": float(cl_threshold),
+                "range_mult": float(range_mult),
+                "history_bars": int(history_bars),
                 "session": session,
             }
         )

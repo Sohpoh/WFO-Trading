@@ -6,13 +6,13 @@ Useful for batch runs, cron/CI, or piping results into other tools instead of
 clicking through the sidebar every time.
 
 Examples:
-    # quick run with defaults (NQ, 1h, New York session)
-    python cli.py
+    # the strategy's intended config (NQ 15min, New York session)
+    python cli.py --symbol NQ --timeframe 15min --train-weeks 12 --test-weeks 3
 
     # override strategy/grid + walk-forward schedule
-    python cli.py --symbol NQ --timeframe 1h --session "New York" \\
-        --move-lookback 3,6,12,24 --move-atr 1.0,1.75,2.5 \\
-        --stop-atr-high 1.5 --stop-atr-low 1.0 \\
+    python cli.py --symbol NQ --timeframe 15min --session "New York" \\
+        --cl-threshold 0.70,0.75,0.82,0.90 --range-mult 0.6,0.9,1.2,1.6 \\
+        --history-bars 1440 \\
         --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -65,34 +65,41 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (volatility-level polarity switch: one ATR-normalized displacement over "
-        "move_lookback bars arms an entry once it covers move_atr ATRs, and the measured vol "
-        "regime sets its sign — HIGH-vol trades WITH the move on a wide stop, LOW-vol trades "
-        "AGAINST it on a tight stop. The target is always 1.5R off whichever stop applies. The "
-        "ATR period, the 24/72-bar regime windows and the 1.5R reward:risk are hardcoded module "
-        "constants in strategy.py and have no flags)"
+        "strategy grid (prior-day close-location reversal: the previous completed UTC day's "
+        "close location within its own High-Low range is frozen before the session opens and "
+        "then FADED — closed near the high goes short, closed near the low goes long — but only "
+        "if that day's range cleared range_mult times its 14-day baseline. The bias is constant "
+        "all day, so there is no stop, no target and no intraday flip: exactly one round trip "
+        "per qualifying session, closed by session.py's forced flatten. The 14-day baseline "
+        "length is a hardcoded module constant in strategy.py and has no flag)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--move-lookback", default="3,6,12,24",
-                        help="comma-separated displacement horizons in bars — d = (Close[t] - "
-                             "Close[t-N]) / ATR[t]. WARM-UP CAVEAT: this is the only int param, so it "
-                             "alone sizes the engine's pre-test-window buffer, while the regime needs "
-                             "~75 bars of history. Keep the largest value at 24 (buffer 87 bars at "
-                             "NQ 1h); lowering the top leaves the regime cold at the head of each "
-                             "test window — it fails closed (no trades), but silently")
-    strat.add_argument("--move-atr", default="1.0,1.75,2.5",
-                        help="comma-separated arming thresholds in ATRs — |d| must clear this before "
-                             "an entry fires, and it fires only on the crossing (once per "
-                             "displacement event), not on every bar the move stays extended")
-    strat.add_argument("--stop-atr-high", type=float, default=1.5,
-                        help="stop distance in ATRs for entries taken in the HIGH-vol regime (the "
-                             "wide-stop momentum leg). Fixed (not grid-searched) — threaded into "
-                             "every combo")
-    strat.add_argument("--stop-atr-low", type=float, default=1.0,
-                        help="stop distance in ATRs for entries taken in the LOW-vol regime (the "
-                             "tight-stop mean-reversion leg). Fixed (not grid-searched) — threaded "
-                             "into every combo")
+    strat.add_argument("--cl-threshold", default="0.70,0.75,0.82,0.90",
+                        help="comma-separated close-location thresholds in [0,1] — with "
+                             "CL = (Close_d - Low_d) / (High_d - Low_d) measured on the prior UTC "
+                             "day, CL >= threshold fades SHORT and CL <= 1 - threshold fades LONG. "
+                             "Values above 0.5 keep the two sides mutually exclusive")
+    strat.add_argument("--range-mult", default="0.6,0.9,1.2,1.6",
+                        help="comma-separated qualifiers — the prior UTC day's range must be at "
+                             "least this multiple of its own trailing 14-day mean range for the "
+                             "session to trade at all. Note that CME's Sunday 18:00 ET open makes "
+                             "UTC Sunday a ~2h stub day that deflates the baseline, so the "
+                             "effective threshold is looser than the nominal value; a pin at the "
+                             "low end means the qualifier is inert, not that a boundary was found")
+    strat.add_argument("--history-bars", type=int, default=1440,
+                        help="warm-up buffer hint in bars. Fixed (not grid-searched) — threaded "
+                             "into every combo, and NEVER READ by strategy.py: its only job is to "
+                             "be the largest int in the grid so wfo_engine._max_lookback_bars() "
+                             "sizes the pre-test-window buffer for a day-anchored indicator "
+                             "(14 baseline days + the 1-day freeze shift). 1440 gives 4335 bars "
+                             "~= 47 days at NQ 15min. HAZARD: run_walk_forward() skips any fold "
+                             "with fewer than history_bars + 10 train bars, and a 12-week train "
+                             "window is only ~1373 bars at NQ 1h and ~372 at 4h — so on those "
+                             "timeframes the default silently skips EVERY fold ('Folds: 0/N', "
+                             "empty OOS column). Use ~400 at 1h and ~100 at 4h (400 would itself "
+                             "trip the guard at 4h); both still buffer ~52 days, well past the "
+                             "~15 days of reach the baseline needs")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -143,9 +150,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        move_lookbacks = parse_num_list(args.move_lookback, int)
-        move_atrs = parse_num_list(args.move_atr, float)
-        grid = build_grid(move_lookbacks, move_atrs, args.stop_atr_high, args.stop_atr_low, session)
+        cl_thresholds = parse_num_list(args.cl_threshold, float)
+        range_mults = parse_num_list(args.range_mult, float)
+        grid = build_grid(cl_thresholds, range_mults, args.history_bars, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -186,12 +193,15 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        move_lookback_vals = sorted({p["move_lookback"] for p in chosen})
-        move_atr_vals = sorted({p["move_atr"] for p in chosen})
+        # Only the two grid-searched params are reported here; `history_bars`
+        # is fixed across every combo, so its "distinct values" would always
+        # be 1 and carry no stability information.
+        cl_threshold_vals = sorted({p["cl_threshold"] for p in chosen})
+        range_mult_vals = sorted({p["range_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(move_lookback_vals)} distinct displacement horizon "
-            f"{move_lookback_vals}, {len(move_atr_vals)} distinct arming threshold in ATRs "
-            f"{move_atr_vals}"
+            f"Fold param stability: {len(cl_threshold_vals)} distinct close-location threshold "
+            f"{cl_threshold_vals}, {len(range_mult_vals)} distinct range qualifier "
+            f"{range_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -225,10 +235,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "move_lookback": f.best_params.get("move_lookback"),
-                "move_atr": f.best_params.get("move_atr"),
-                "stop_atr_high": f.best_params.get("stop_atr_high"),
-                "stop_atr_low": f.best_params.get("stop_atr_low"),
+                "cl_threshold": f.best_params.get("cl_threshold"),
+                "range_mult": f.best_params.get("range_mult"),
+                "history_bars": f.best_params.get("history_bars"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

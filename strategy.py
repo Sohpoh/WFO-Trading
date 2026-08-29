@@ -1,305 +1,262 @@
-"""Volatility-level polarity switch — one displacement primitive, sign set by regime.
+"""Prior-day close-location reversal, held for one session.
 
-Across this project's history the ATR ratio has only ever been used as an
-on/off *gate* on a momentum strategy: trade when volatility is expanding,
-stand aside when it isn't. The one polarity switch tried before keyed off a
-variance ratio — a measure of *persistence*, not of volatility *level*. This
-iteration reads volatility.md's Strategy Selection line literally instead —
-"High volatility? Use wide-stop momentum strategies. Low volatility? Use
-tight-stop mean-reversion" — and lets the measured vol regime set the *sign*
-of a single entry primitive, plus the width of its stop.
+Every prior iteration in this project measured its signal on a rolling window
+that *includes* the bar it trades. This one does the opposite: the entire
+signal is a statistic of the **previous completed UTC calendar day**, frozen
+before the session opens, and it is faded.
 
-There is exactly one signal primitive: an ATR-normalized displacement over
-`move_lookback` bars. In the HIGH-vol regime it is traded *with* (momentum);
-in the LOW-vol regime it is traded *against* (reversion). Nothing else about
-the entry differs between the two legs, so the run is attributable to the
-polarity switch alone.
+The thesis is transplanted, and is flagged as such rather than presented as a
+base rate. Cross-sectional momentum work skips the most recent completed
+period ("S = skip period, usually 1 month, to avoid microstructure mean
+reversion") precisely because that period is asserted to *reverse*; the
+short-term-overreaction / forced-buying-and-selling literature supplies the
+mechanism. Both claims are about individual equities at a monthly horizon.
+Index futures at a daily horizon are much closer to a random walk, so this is
+an analogy being tested, not a documented effect being harvested.
 
-The reversion leg is deliberately NOT a price-vs-rolling-mean / band /
-regression z-score. Two earlier iterations concluded that exact quantity is
-information-free on this data in either polarity, so the fade here is of a
-*displacement over a fixed horizon*, which is a different measurement.
+What makes this a different *shape* rather than a 31st indicator is the
+holding geometry, not the statistic:
+
+  - The signal is fully determined ~13.5h before the New York open, so there
+    is no intraday event to chase and no extremity condition to select on.
+  - The bias is constant for the whole day, so no opposing signal can fire
+    intraday. Every trade is therefore closed by `session.py`'s forced
+    flatten on the session's last bar: exactly one round trip per qualifying
+    session, ~6h of hold (09:45 -> 15:45 ET at 15min bars).
+  - One round trip means `metrics.py`'s ~10.2bps toll is charged once against
+    a full open-to-close excursion, rather than once per intraday event.
 
 Rules (all computed on the full continuous frame with no session awareness of
 their own; every window is strictly backward with strict `min_periods`, so
 unwarmed bars are NaN and the signal fails *closed*):
 
-  - ATR: Wilder true range, simple-mean averaged over `ATR_PERIOD`, shifted
-    one bar so the entry bar cannot size its own stop. The same shifted
-    series normalizes the displacement and scales the stop — one volatility
-    yardstick throughout, measured strictly before the entry bar.
+  - Daily aggregation, grouped by **UTC calendar day** (`index.normalize()`):
 
-  - Regime (zero-param, hardcoded module constants, so the grid searches only
-    the signal itself):
+        High_d  = max(High) over day d
+        Low_d   = min(Low)  over day d
+        Close_d = last Close of day d
+        Range_d = High_d - Low_d
+        CL_d    = (Close_d - Low_d) / Range_d      (NaN where Range_d <= 0)
 
-        vol_fast[t] = mean TR over VOL_FAST_N bars, shifted 1
-        vol_slow[t] = mean TR over VOL_SLOW_N bars, shifted 1
-        HIGH-vol  <=>  vol_fast >= vol_slow
-        LOW-vol   <=>  vol_fast <  vol_slow
+  - Range baseline, a strictly-warm 14-day mean of Range over the completed
+    days ending at d (`min_periods=RANGE_BASELINE_DAYS`, so the first 13 days
+    of any slice are NaN and disqualify):
 
-    A hard split with no deadband — the same construction earlier ATR-ratio
-    gates used, so this iteration differs from them in polarity, not in how
-    the regime is measured. Both comparisons return False when either leg is
-    NaN, so an unwarmed bar is in *neither* regime and takes no trade.
+        Baseline_d = mean(Range over the 14 days ending at d)
 
-  - Displacement:
+    Note that the window is inclusive of d, exactly as specced, so after the
+    freeze `Baseline_{d-1}` contains `Range_{d-1}` as 1/14 of itself. A wide
+    day therefore partly inflates its own threshold, compressing the effective
+    qualifier toward 1.0. This is not an off-by-one — it is the specced
+    "14 completed days ending at d" — but it should be kept in mind when
+    reading where `range_mult` pins.
 
-        d[t] = (Close[t] - Close[t - move_lookback]) / ATR[t]
+  - Freeze. Every bar of day d reads the statistics of day d-1 via a single
+    positional `.shift(1)` on the *daily* frame. This is a strict one-day
+    lag with no lookahead: day d-1 has fully closed (00:00 UTC) more than
+    13h before the 09:30 ET open that lives inside day d.
 
-    masked to NaN where ATR is NaN or non-positive (so those bars can neither
-    arm a signal nor pass the delegate's `stop_distance > 0` guard).
+  - Qualification (the volatility filter):
 
-  - Arming and the crossing:
+        Range_{d-1} >= range_mult * Baseline_{d-1}
 
-        armed[t] = |d[t]| >= move_atr
-        raw entry only where armed[t] and not armed[t-1]
+    NaN on either side makes the comparison False, so an unwarmed day is
+    disqualified for free.
 
-    Firing on the crossing rather than the level means a continuing move does
-    not re-arm bar after bar, and a stopped-out trade cannot immediately
-    re-enter on the same displacement.
+  - Bias, given qualification — this is the fade, and the one place a sign
+    slip would be silent rather than loud:
 
-  - Direction — the one place a sign slip would be silent rather than loud:
+        CL_{d-1} >= cl_threshold        -> SHORT  (closed near the high)
+        CL_{d-1} <= 1 - cl_threshold    -> LONG   (closed near the low)
+        otherwise                       -> NaN    (no bias, stand aside)
 
-        HIGH-vol:  d > 0 -> LONG,   d < 0 -> SHORT   (trade *with* the move)
-        LOW-vol:   d > 0 -> SHORT,  d < 0 -> LONG    (trade *against* it)
+    Mutually exclusive by construction for any `cl_threshold > 0.5`, which
+    the whole intended grid satisfies. That bias is written onto *every* bar
+    of day d; `session.py` alone decides which of those bars are tradable, so
+    the position opens on the session's first bar and no session logic enters
+    this module.
 
-    Long and short are mutually exclusive by construction: `d` cannot be both
-    positive and negative, and the two regimes cannot both be True.
+Exit is a plain flip with no stop, no target and no path dependence, so this
+delegates to `session.apply_session_constraint()`. Non-qualifying days emit
+NaN throughout, and the ffilled 0.0 left by the previous session's forced
+flatten keeps the strategy flat across them.
 
-    `.fillna(False)` on both signals is load-bearing — the delegate reads them
-    as raw numpy values and `bool(np.nan)` is True, so a NaN left in the array
-    would fire an entry on an unwarmed bar.
+ANCHOR CAVEAT (named deliberately, not hidden). Grouping by UTC calendar day
+is an *approximation* of the cash-session statistic the order-flow intuition
+describes. Two consequences, both accepted rather than patched:
 
-  - Stop, regime-scaled at the entry bar (volatility.md's Stop-Loss Placement
-    section — wide stops for the momentum leg, tight for the reversion leg):
+  1. The "prior close" is the last bar before 00:00 UTC, i.e. ~19:45 ET, in
+     thin trade — not the 16:00 ET cash close. The prior High/Low likewise
+     include overnight extremes. Fixing this would require session awareness
+     inside `strategy.py`, which the contract forbids.
 
-        HIGH-vol entry:  stop_atr_high * ATR
-        LOW-vol  entry:  stop_atr_low  * ATR
-
-    Bars in neither regime get a NaN stop distance, which is a second,
-    independent fail-closed path: the delegate refuses any entry there.
-
-  - Target: entry Close +/- `RR_MULT * stop_distance`, supplied as an
-    absolute, already-direction-resolved level (the shape the delegate
-    requires). Because the target is quoted off the *stop*, its ATR distance
-    inherits the regime scaling too — at the default 1.5 / 1.0 stops that is
-    2.25 ATR in HIGH-vol and 1.5 ATR in LOW-vol, both a constant 1.5R.
-
-    Sizing is deliberately tighter than a 2.0/3.0-ATR shape: an earlier
-    iteration showed a ~4-ATR target essentially never binds inside a ~6.5-bar
-    1h New York session, so it degenerated into a run-to-session-flatten whose
-    P&L was carried by a handful of tails. Both legs here are bounded, so P&L
-    cannot be carried by an open-ended run.
-
-Semantics worth stating explicitly, because they *reduce* trade count by
-design and should not be read as bugs:
-
-  - `armed` is computed on |d| alone, with no regime term. So if the regime
-    flips while `armed` stays True, no new entry fires; and a crossing bar
-    whose regime is still cold (NaN) consumes that crossing with no trade,
-    which won't re-arm until |d| drops back below `move_atr` and crosses up
-    again. This is what keeps "one entry per displacement event" true
-    regardless of what the regime is doing.
-
-  - There is no flip. The delegate only opens when it is flat (by design — it
-    owns the session bookkeeping a flip would have to respect), and faking a
-    flip here would require session awareness inside `strategy.py`, which the
-    contract forbids. A trade ends at its stop, its target, or the session
-    flatten.
-
-Exit is path-dependent, so this delegates to
-`session.apply_session_constraint_with_stops()` (both legs supplied on every
-entry bar, as that function requires). `session.py`'s forced flatten on the
-session's last bar remains the backstop — no position survives the session.
+  2. CME's Sunday 18:00 ET open lands in UTC Sunday, so UTC Sunday is a real
+     group holding only ~8 bars at 15min (~2 at 1h). Two knock-on effects,
+     both real and both left in place because the spec says UTC calendar
+     days: every Monday session reads that ~2h stub as its "prior day", whose
+     tiny Range almost never clears the qualifier, so Mondays are
+     systematically disqualified; and those stub ranges enter the 14-day
+     Baseline and deflate it, so other days clear `range_mult` more easily
+     than the nominal threshold suggests. In particular this means a
+     `range_mult` pin at the grid's low end should be read as "the qualifier
+     is inert", not as evidence about a genuine boundary. No min-bars-per-day
+     filter is applied — that would be a rule the spec does not have.
 
 Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`):
-  - `move_lookback` is a genuine bar count, passed as plain `int`, so it
-    correctly sizes the pre-test-window warm-up buffer.
-  - `move_atr`, `stop_atr_high` and `stop_atr_low` are unitless ATR
-    multipliers, not bar counts, so all three are passed as `float` and are
-    correctly ignored by that buffer sizing.
-  - `ATR_PERIOD`, `VOL_FAST_N`, `VOL_SLOW_N` and `RR_MULT` are module
-    constants rather than params, so none of them enters a grid combo and
-    none can touch the buffer either way.
 
-  WARM-UP HAZARD — read before narrowing the grid. Because `VOL_SLOW_N` is a
-  constant it never reaches `_max_lookback_bars()`, so the buffer is sized off
-  `move_lookback` alone. With the intended grid top of 24,
-  `buffer_bars = max((24 + 5) * 3, bars_per_day + 5)` = 87 bars at NQ 1h,
-  against a regime reach of ~75 bars (72-bar window + 1 bar for the TR's own
-  `Close.shift(1)` + 1 bar for the shift). That is ~12 bars of headroom. Run
-  with, say, `--move-lookback 3` and the buffer collapses to ~24 bars, leaving
-  the regime series NaN for roughly the first 50 bars of every test window —
-  which fails *closed* (no trades there, not wrong trades), but silently guts
-  the strategy. Do not narrow the grid below a top of 24 without also
-  shortening `VOL_SLOW_N`.
+  - `cl_threshold` and `range_mult` are unitless (a [0,1] location and a ratio
+    of ranges), never bar counts, so both are passed as `float` and are
+    correctly ignored by the warm-up buffer sizing.
 
-Cost note: `metrics.py`'s ~0.102% round-trip (0.001% fee + 0.05% slippage per
-leg, 2 legs) is unchanged and out of scope. At NQ 1h (ATR ~0.3%) the chosen
-legs imply breakeven hit rates of roughly 49% (HIGH-vol, 2.25 ATR target vs
-1.5 ATR stop) and 54% (LOW-vol, 1.5 ATR vs 1.0 ATR) against that toll.
+  - `history_bars` is a plain `int` and is deliberately **not read by any
+    computation in this module**. It exists solely to reach
+    `_max_lookback_bars()`, which scans every int-valued entry of every combo
+    dict, and `build_grid()` threads it into every combo. This is the only
+    lever this codebase has for telling the engine "my indicator is
+    day-anchored and needs ~N bars of history": the engine's own
+    `_bars_per_day()` floor only guarantees *one* day, while the Baseline
+    needs 14 completed days plus the 1-day freeze shift.
 
-This module decides only *when* the strategy wants to be long or short and at
-what levels it wants out. All day-trade gating and the end-of-session flatten
-are delegated to `session.py`; see its docstring for that contract.
+      DO NOT DELETE IT AS DEAD CODE. Removing the kwarg (or casting it to
+      float) collapses `buffer_bars` to `max(5*3, bars_per_day + 5)` = ~97
+      bars at NQ 15min, i.e. about one day of history, which leaves
+      `Baseline` NaN for the first ~15 days of every test window. That fails
+      *closed* (no trades there, not wrong trades) but silently guts the
+      strategy.
+
+      Sizing at NQ 15min: buffer_bars = max((1440 + 5) * 3, 92 + 5) = 4335
+      bars ~= 47 trading days, comfortably covering the 15 days of reach.
+
+      COVERAGE HAZARD IN THE OTHER DIRECTION. `run_walk_forward()` skips any
+      fold whose train window holds fewer than `max_lookback + 10` = 1450
+      bars. A 12-week train window is ~5492 bars at 15min (fine) but only
+      ~1373 bars at 1h and ~372 at 4h — both below the guard, so on those
+      timeframes *every* fold is skipped and the run prints "Folds: 0/N" with
+      an empty OOS column beside a populated in-sample one. Lower
+      `--history-bars` for coarser timeframes, and check the Baseline still
+      warms: measured 12-week train windows are 5492 bars at 15min, 1373 at
+      1h and 372 at 4h, so use ~400 at 1h (guard 410, buffer 1215 bars ~= 53
+      days at 23 bars/day) and ~100 at 4h (guard 110, buffer 315 bars ~= 52
+      days at 6 bars/day). 400 at 4h would *itself* trip the guard.
+
+  - `RANGE_BASELINE_DAYS` is a module constant, not a param, so it never
+    enters a grid combo and cannot touch the buffer either way.
+
+Cost note: `metrics.py`'s ~0.102% round trip (0.001% fee + 0.05% slippage per
+leg, 2 legs) is unchanged and out of scope. With one round trip per session
+against a ~6h NQ excursion, that toll is a far smaller fraction of the bet
+than it is for event-triggered intraday entries — which is the point of the
+holding geometry, not an assumption baked into the cost model.
+
+This module decides only *when* the strategy wants to be long or short. All
+day-trade gating and the end-of-session flatten are delegated to `session.py`;
+see its docstring for that contract.
 """
 import numpy as np
 import pandas as pd
 
+from session import apply_session_constraint
 
-from session import apply_session_constraint_with_stops
-
-# ATR lookback in bars — the volatility yardstick the displacement is
-# normalized by and the stop is quoted in, not a lever this iteration tests.
-ATR_PERIOD = 14
-
-# Regime measure, both in bars. Fast vs. slow mean true range: vol_fast >=
-# vol_slow means realized volatility is at/above its own slower baseline
-# (HIGH), below means it is compressed (LOW). Hardcoded so the polarity switch
-# is the only thing the grid can tune — and so a fold cannot pick a regime
-# definition that happens to flatter the sample.
-VOL_FAST_N = 24
-VOL_SLOW_N = 72
-
-# Reward:risk. The target is placed RR_MULT * stop_distance from entry, so it
-# inherits whichever regime-scaled stop the entry was given and every trade
-# carries the same R multiple regardless of regime. Hardcoded, same status as
-# ATR_PERIOD.
-RR_MULT = 1.5
-
-# All four are plain ints/floats used only inside this module — none enters a
-# grid combo, so none can reach `wfo_engine._max_lookback_bars()`.
+# Length of the daily-Range baseline, in completed UTC days. Hardcoded rather
+# than grid-searched so the search tunes the fade itself (where the close sits
+# in the prior day's range, and how big that range had to be) and cannot pick
+# a volatility yardstick that happens to flatter its own sample. Being a
+# module constant it never enters a grid combo, so it cannot reach
+# `wfo_engine._max_lookback_bars()` — see `history_bars` for how the warm-up
+# buffer is actually sized.
+RANGE_BASELINE_DAYS = 14
 
 
-def true_range(df: pd.DataFrame) -> pd.Series:
-    """Wilder true range, one row per bar, unsmoothed and unshifted.
+def daily_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-UTC-day High/Low/Close/Range/CL/Baseline, indexed by UTC midnight.
 
-    `skipna=False` on the row-wise max keeps the first bar's TR NaN (its
-    `Close.shift(1)` is NaN) rather than silently falling back to High-Low.
+    `index.normalize()` on the frame's tz-aware UTC index is what defines a
+    "day" here — see the ANCHOR CAVEAT in the module docstring for what that
+    does and does not correspond to.
+
+    `CL` is NaN wherever `Range <= 0` (a zero-range day carries no location
+    information and would divide by zero). `Baseline` uses a strict
+    `min_periods`, so the first `RANGE_BASELINE_DAYS - 1` days of any slice
+    are NaN and cannot qualify.
+
+    Every column here is a statistic *of* day d, not yet lagged — the one-day
+    freeze is applied by the caller.
     """
-    prev_close = df["Close"].shift(1)
-    return pd.concat(
-        [
-            df["High"] - df["Low"],
-            (df["High"] - prev_close).abs(),
-            (df["Low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1, skipna=False)
+    day = df.index.normalize()
+    grouped = df.groupby(day)
 
+    high = grouped["High"].max()
+    low = grouped["Low"].min()
+    close = grouped["Close"].last()
 
-def average_true_range(df: pd.DataFrame, atr_period: int = ATR_PERIOD) -> pd.Series:
-    """Wilder true range, simple-mean averaged over `atr_period`, shifted one bar.
+    rng = high - low
+    cl = ((close - low) / rng).where(rng > 0)
+    baseline = rng.rolling(RANGE_BASELINE_DAYS, min_periods=RANGE_BASELINE_DAYS).mean()
 
-    The shift excludes the current bar from its own volatility baseline, so the
-    stop is sized off strictly prior information — the entry bar's own range
-    can't widen or narrow the stop it is about to be given.
-
-    Strict `min_periods` keeps every unwarmed bar NaN, so the delegate's
-    `stop_distance > 0` guard refuses entries during warm-up.
-    """
-    tr = true_range(df)
-    return tr.rolling(atr_period, min_periods=atr_period).mean().shift(1)
-
-
-def _vol_regime(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-    """(high_vol, low_vol) bool Series — the measured volatility *level* regime.
-
-    Fast and slow simple means of true range, each shifted one bar so the
-    entry bar's own range cannot classify the bar it is about to trade.
-    Strict `min_periods` leaves both NaN until warm; `NaN >= x` and `NaN < x`
-    are both False, so an unwarmed bar lands in *neither* regime and is
-    therefore untradeable — the regime series fails closed with no explicit
-    validity mask needed.
-    """
-    tr = true_range(df)
-    vol_fast = tr.rolling(VOL_FAST_N, min_periods=VOL_FAST_N).mean().shift(1)
-    vol_slow = tr.rolling(VOL_SLOW_N, min_periods=VOL_SLOW_N).mean().shift(1)
-    return (vol_fast >= vol_slow), (vol_fast < vol_slow)
+    return pd.DataFrame({"Range": rng, "CL": cl, "Baseline": baseline})
 
 
 def generate_positions(
     df: pd.DataFrame,
-    move_lookback: int,
-    move_atr: float,
-    stop_atr_high: float = 1.5,
-    stop_atr_low: float = 1.0,
+    cl_threshold: float,
+    range_mult: float,
+    history_bars: int = 1440,
     session: str | None = "New York",
 ) -> pd.Series:
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
+    # `history_bars` is intentionally unread here — it is a warm-up-buffer
+    # hint consumed by wfo_engine._max_lookback_bars(). See the module
+    # docstring's "DO NOT DELETE IT AS DEAD CODE" note before touching it.
+    del history_bars
 
-    # One shifted ATR series, used both to normalize the displacement and to
-    # size the stop/target — so "1 ATR of move" and "1 ATR of stop" mean the
-    # same thing on any given bar.
-    atr = average_true_range(df, ATR_PERIOD)
+    stats = daily_stats(df)
 
-    high_vol, low_vol = _vol_regime(df)
+    # THE FREEZE. A single positional shift on the *daily* frame, so every
+    # bar of day d reads only statistics of the previous day present in the
+    # data. No lookahead: day d-1 closed at 00:00 UTC, more than 13h before
+    # the 09:30 ET open that lives inside day d.
+    prev = stats.shift(1)
 
-    # ATR-normalized displacement over a fixed horizon. `.where(atr > 0)`
-    # masks bars with a NaN or non-positive ATR to NaN, so they fail closed
-    # instead of dividing by zero.
-    n = int(move_lookback)
-    displacement = ((close - close.shift(n)) / atr).where(atr > 0)
+    # Broadcast the frozen daily statistics back onto every bar of their day.
+    # `reindex` on the bar-level day labels (rather than `.map`) keeps this a
+    # plain float64 alignment with no Timestamp-key dtype surprises.
+    day = df.index.normalize()
+    prev_range = prev["Range"].reindex(day).to_numpy()
+    prev_cl = prev["CL"].reindex(day).to_numpy()
+    prev_baseline = prev["Baseline"].reindex(day).to_numpy()
 
-    # Arming is on magnitude alone (no regime term) — see the module docstring
-    # for why. `NaN >= x` is False, so unwarmed bars are simply not armed.
-    armed = (displacement.abs() >= float(move_atr)).fillna(False)
+    # Qualification: the frozen day had to be a genuinely wide day relative to
+    # its own 14-day baseline. NaN on either side makes this False, so an
+    # unwarmed day (or a Sunday stub whose Baseline is still cold) fails
+    # closed with no explicit validity mask needed.
+    with np.errstate(invalid="ignore"):
+        qualified = prev_range >= float(range_mult) * prev_baseline
 
-    # Crossing, not level: fire on the first bar the displacement qualifies and
-    # not again while it keeps qualifying. `fill_value=False` keeps the shifted
-    # series bool (no NaN at position 0) so the negation is well-defined.
-    crossing = armed & ~armed.shift(1, fill_value=False)
+    # THE FADE. Closed near the prior day's high -> short it; closed near the
+    # prior day's low -> long it. Mutually exclusive for any cl_threshold >
+    # 0.5 (the whole intended grid). NaN CL compares False both ways.
+    thr = float(cl_threshold)
+    with np.errstate(invalid="ignore"):
+        short_bias = qualified & (prev_cl >= thr)
+        long_bias = qualified & (prev_cl <= 1.0 - thr)
 
-    up = (displacement > 0).fillna(False)
-    down = (displacement < 0).fillna(False)
+    # Raw, session-unaware entries: the day's constant bias on *every* bar of
+    # that day, NaN on days with no bias. Explicit float64 so the delegate's
+    # ffill/fillna arithmetic stays numeric.
+    entries = pd.Series(np.nan, index=df.index, dtype=float)
+    entries[long_bias] = 1.0
+    entries[short_bias] = -1.0
 
-    # THE POLARITY SWITCH. HIGH-vol trades *with* the displacement, LOW-vol
-    # trades *against* it. Mutually exclusive: `up`/`down` cannot both be
-    # True, and `high_vol`/`low_vol` cannot both be True.
-    long_signal = (crossing & ((high_vol & up) | (low_vol & down))).fillna(False)
-    short_signal = (crossing & ((high_vol & down) | (low_vol & up))).fillna(False)
-
-    # Regime-scaled protective stop, in ATR units from the entry Close.
-    # Symmetric — the delegate resolves the side. Bars in neither regime keep
-    # a NaN multiplier, so `stop_distance` is NaN there and the delegate
-    # refuses the entry (a second fail-closed path, independent of the
-    # signals themselves).
-    stop_mult = pd.Series(np.nan, index=df.index)
-    stop_mult[high_vol] = float(stop_atr_high)
-    stop_mult[low_vol] = float(stop_atr_low)
-    stop_distance = stop_mult * atr
-
-    # Target as an absolute, already direction-resolved level, which is the
-    # shape the delegate expects. Quoted off the *stop distance*, so every
-    # trade is the same RR_MULT R regardless of regime. Only read on actual
-    # entry bars.
-    target_price = pd.Series(
-        np.where(
-            long_signal,
-            close + RR_MULT * stop_distance,
-            close - RR_MULT * stop_distance,
-        ),
-        index=df.index,
-    )
-
-    return apply_session_constraint_with_stops(
-        close=close,
-        high=high,
-        low=low,
-        long_signal=long_signal,
-        short_signal=short_signal,
-        stop_distance=stop_distance,
-        target_price=target_price,
-        session=session,
-    )
+    # session.py alone decides which of those bars are tradable: it opens the
+    # position on the session's first bar and force-flattens on the session's
+    # last. Because the bias is constant within a day, no opposing signal can
+    # fire intraday, so that flatten is the only exit — exactly one round trip
+    # per qualifying session.
+    return apply_session_constraint(entries, session)
 
 
 DEFAULT_PARAMS = {
-    "move_lookback": 6,
-    "move_atr": 1.75,
-    "stop_atr_high": 1.5,
-    "stop_atr_low": 1.0,
+    "cl_threshold": 0.75,
+    "range_mult": 0.9,
+    "history_bars": 1440,
     "session": "New York",
 }
