@@ -42,42 +42,47 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(cmf_lookbacks, entry_pressures, session) -> list[dict]:
+def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched, and they are the *whole* signal: `cmf_lookback`
-    (how many completed bars of volume-weighted intrabar close location get
-    summed into the Chaikin Money Flow reading) and `entry_pressure` (how far
-    from zero that reading has to sit before the strategy takes a side).
-    There is nothing else to tune — the exit is a plain flip plus `session.py`'s
-    forced flatten, so no stop/target params exist.
+    Two params are searched: `formation_lookback` (how many completed bars the
+    momentum statistic `Close_t / Close_{t-n} - 1` measures over) and
+    `rank_pct` (how deep into the trailing distribution of that statistic a
+    bar has to rank before the strategy goes long). Nothing else is tunable —
+    the strategy is long-only with no stop and no target, so its only exit is
+    `session.py`'s forced flatten.
 
-    `session` is fixed, never searched — threaded into every combo as-is.
+    Two params are fixed and threaded into every combo as-is, never searched:
+    `session` (required by CLAUDE.md) and `rank_window`.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `cmf_lookback` is cast to plain `int` **on purpose**, and it is the
-        only int in a combo. It is a genuine bar-count lookback, so it is
-        exactly what should size the pre-test-window warm-up buffer: at the
-        grid's top end (96) `buffer_bars = max((96 + 5) * 3, day_bars + 5)`
-        = 303 bars, comfortably covering a 96-bar rolling window.
-      - `entry_pressure` is cast to `float` on purpose — CMF is a unitless
-        ratio in [-1, 1], never a bar count. The cast is defensive: a grid
-        point written as `1` would otherwise arrive as an `int` and silently
-        inflate the warm-up buffer.
+      - `formation_lookback` and `rank_window` are both cast to plain `int`
+        **on purpose** — both are genuine bar counts and both should feed the
+        pre-test-window warm-up buffer.
+      - `rank_window` is the larger, so it is what sizes that buffer:
+        `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895 bars, which
+        covers the signal's true requirement of
+        `rank_window + max(formation_lookback)` = 960 + 192 = 1152.
+      - `rank_pct` is cast to `float` on purpose — it is a quantile level in
+        (0, 1), never a bar count. The cast is defensive: a grid point written
+        as `1` would otherwise arrive as an `int` and inflate the buffer.
 
-    Note that this strategy has NO day-anchored reach and therefore no
-    `history_bars` hint (iteration 31 needed one; a rolling window does not).
-    That also dissolves iteration 31's coverage hazard: `run_walk_forward()`
-    below skips any fold whose train window holds fewer than
-    `max_lookback + 10` bars, which is now 106 rather than 1450, so coarse
-    timeframes no longer skip every fold.
+    COVERAGE HAZARD — do not raise `rank_window` (and be careful pointing this
+    strategy at a coarse timeframe) without redoing this arithmetic:
+    `run_walk_forward()` below skips any fold whose train window holds fewer
+    than `max_lookback + 10` bars, i.e. 970 here. A 12-week train window at
+    15min is ~5,700 bars and a 3-week test window ~1,900, so the guard is
+    comfortable at the intended timeframe. 1h (~1,400 bars per 12-week train
+    window) still clears it, with ~40% headroom; 4h (~350) does not, and every
+    fold there would be silently skipped — the iteration-31 failure mode.
     """
     grid = []
-    for cmf_lookback, entry_pressure in product(cmf_lookbacks, entry_pressures):
+    for formation_lookback, rank_pct in product(formation_lookbacks, rank_pcts):
         grid.append(
             {
-                "cmf_lookback": int(cmf_lookback),
-                "entry_pressure": float(entry_pressure),
+                "formation_lookback": int(formation_lookback),
+                "rank_pct": float(rank_pct),
+                "rank_window": int(rank_window),
                 "session": session,
             }
         )

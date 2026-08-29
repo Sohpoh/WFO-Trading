@@ -6,13 +6,13 @@ Useful for batch runs, cron/CI, or piping results into other tools instead of
 clicking through the sidebar every time.
 
 Examples:
-    # the strategy's intended config (ES 15min, New York session)
-    python cli.py --symbol ES --timeframe 15min --train-weeks 12 --test-weeks 3
+    # the strategy's intended config (NQ 15min, New York session)
+    python cli.py --symbol NQ --timeframe 15min --train-weeks 12 --test-weeks 3
 
     # override strategy/grid + walk-forward schedule
-    python cli.py --symbol ES --timeframe 15min --session "New York" \\
-        --cmf-lookback 12,24,48,96 --entry-pressure 0.05,0.10,0.15,0.25 \\
-        --train-weeks 12 --test-weeks 3
+    python cli.py --symbol NQ --timeframe 15min --session "New York" \\
+        --formation-lookback 24,48,96,192 --rank-pct 0.80,0.875,0.925 \\
+        --rank-window 960 --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
     python cli.py --source yfinance --symbol NQ=F --timeframe 1d
@@ -64,31 +64,41 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (money-flow pressure trend state: per bar, the intrabar close location "
-        "((Close-Low)-(High-Close))/(High-Low) is weighted by that bar's Volume and summed over "
-        "cmf_lookback bars, divided by the summed Volume, giving Chaikin Money Flow in [-1,1]. "
-        "The strategy goes LONG while CMF sits at or above entry_pressure and SHORT while it "
-        "sits at or below -entry_pressure — a persistent STATE, not a crossing event, and with "
-        "no extremity condition at entry. Exit is a plain flip: the position turns over only "
-        "when CMF reaches the opposite threshold, otherwise it is closed by session.py's forced "
-        "flatten on the session's last bar. No stop, no target, winners uncapped)"
+        "strategy grid (long-only percentile-rank momentum: each bar's formation return "
+        "Close_t/Close_{t-formation_lookback} - 1 is ranked against its own trailing "
+        "distribution — the rank_pct quantile of the same statistic over the previous "
+        "rank_window bars, current bar excluded. Top-quantile bars go LONG; there is NO "
+        "short leg, so a down-state simply pays no legs at all instead of paying two to "
+        "reverse. Exit is session.py's forced flatten on the session's last bar and nothing "
+        "else — no stop, no target, no opposite signal — so a traded session is exactly one "
+        "round trip and winners are uncapped)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--cmf-lookback", default="12,24,48,96",
-                        help="comma-separated Chaikin Money Flow window lengths, in bars — how "
-                             "many completed bars of volume-weighted close location get summed "
-                             "into one CMF reading. Strictly warm (min_periods = the window), so "
-                             "unwarmed bars are NaN and stand aside. These are genuine bar-count "
-                             "lookbacks and are passed as ints, so the largest one sizes "
-                             "wfo_engine's pre-test-window warm-up buffer (96 -> 303 bars)")
-    strat.add_argument("--entry-pressure", default="0.05,0.10,0.15,0.25",
-                        help="comma-separated CMF thresholds, unitless in [0,1] — CMF >= p goes "
-                             "long, CMF <= -p goes short, in between holds whatever position is "
-                             "already open. Kept deliberately loose: tightening this is pure "
-                             "selectivity and drops the OOS trade count, which earlier iterations "
-                             "showed walking straight into an overfit gap. Any value > 0 keeps "
-                             "the two sides mutually exclusive")
+    strat.add_argument("--formation-lookback", default="24,48,96,192",
+                        help="comma-separated momentum formation periods, in bars — how far back "
+                             "Close_t is compared to when measuring the return that gets ranked. "
+                             "Genuine bar-count lookbacks, passed as ints, so they feed "
+                             "wfo_engine's pre-test-window warm-up buffer (though --rank-window, "
+                             "being larger, is what actually sizes it)")
+    strat.add_argument("--rank-pct", default="0.80,0.875,0.925",
+                        help="comma-separated quantile levels in (0,1) — a bar goes long when its "
+                             "formation return is strictly above the rank_pct quantile of the "
+                             "trailing distribution, i.e. 0.90 means 'top decile'. Unlike every "
+                             "absolute threshold used in earlier iterations this re-scales itself "
+                             "with the volatility regime, so it should not churn across folds. "
+                             "Passed as floats and correctly ignored by the warm-up sizing")
+    strat.add_argument("--rank-window", type=int, default=960,
+                        help="FIXED, never grid-searched: how many trailing bars the rank "
+                             "threshold is computed over (960 = ~10 trading days of 15min bars). "
+                             "As the largest int in the grid this alone sizes the warm-up buffer "
+                             "to (960+5)*3 = 2895 bars, covering the true requirement of "
+                             "rank_window + max(formation_lookback) = 1152. Raising it also "
+                             "raises wfo_engine's fold-skip guard (max_lookback + 10 = 970 bars "
+                             "of train window); that is comfortable at 15min (~5,700 bars per "
+                             "12-week train window) and still clears at 1h (~1,400), but at 4h "
+                             "(~350) EVERY fold is silently skipped — so re-check both numbers "
+                             "before raising it or moving to a coarser timeframe")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -139,9 +149,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        cmf_lookbacks = parse_num_list(args.cmf_lookback, int)
-        entry_pressures = parse_num_list(args.entry_pressure, float)
-        grid = build_grid(cmf_lookbacks, entry_pressures, session)
+        formation_lookbacks = parse_num_list(args.formation_lookback, int)
+        rank_pcts = parse_num_list(args.rank_pct, float)
+        grid = build_grid(formation_lookbacks, rank_pcts, args.rank_window, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -182,15 +192,15 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the two grid-searched params are reported here; `session` is
-        # fixed across every combo, so its "distinct values" would always be 1
-        # and carry no stability information.
-        cmf_lookback_vals = sorted({p["cmf_lookback"] for p in chosen})
-        entry_pressure_vals = sorted({p["entry_pressure"] for p in chosen})
+        # Only the two grid-searched params are reported here; `session` and
+        # `rank_window` are fixed across every combo, so their "distinct
+        # values" would always be 1 and carry no stability information.
+        formation_lookback_vals = sorted({p["formation_lookback"] for p in chosen})
+        rank_pct_vals = sorted({p["rank_pct"] for p in chosen})
         print(
-            f"Fold param stability: {len(cmf_lookback_vals)} distinct CMF lookback "
-            f"{cmf_lookback_vals}, {len(entry_pressure_vals)} distinct entry pressure "
-            f"{entry_pressure_vals}"
+            f"Fold param stability: {len(formation_lookback_vals)} distinct formation lookback "
+            f"{formation_lookback_vals}, {len(rank_pct_vals)} distinct rank pct "
+            f"{rank_pct_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -224,8 +234,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "cmf_lookback": f.best_params.get("cmf_lookback"),
-                "entry_pressure": f.best_params.get("entry_pressure"),
+                "formation_lookback": f.best_params.get("formation_lookback"),
+                "rank_pct": f.best_params.get("rank_pct"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
