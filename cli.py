@@ -69,9 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
         "distribution — the rank_pct quantile of the same statistic over the previous "
         "rank_window bars, current bar excluded. Top-quantile bars go LONG; there is NO "
         "short leg, so a down-state simply pays no legs at all instead of paying two to "
-        "reverse. Exit is session.py's forced flatten on the session's last bar and nothing "
-        "else — no stop, no target, no opposite signal — so a traded session is exactly one "
-        "round trip and winners are uncapped)"
+        "reverse. Exit is a hard stop at 0.6x the trailing daily range — the average 96-bar "
+        "high-low span over the last 960 bars, shifted one bar — with a deliberately "
+        "unreachable target, so winners still run uncapped to session.py's forced flatten "
+        "while the -2%/-4% run-to-flatten collapses get cut. The stop constants live in "
+        "strategy.py and are NOT searched, so there is no flag for them; because a stop-out "
+        "can re-enter later in the same session, a traded session is no longer exactly one "
+        "round trip)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")

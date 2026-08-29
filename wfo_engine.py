@@ -48,9 +48,12 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
     Two params are searched: `formation_lookback` (how many completed bars the
     momentum statistic `Close_t / Close_{t-n} - 1` measures over) and
     `rank_pct` (how deep into the trailing distribution of that statistic a
-    bar has to rank before the strategy goes long). Nothing else is tunable —
-    the strategy is long-only with no stop and no target, so its only exit is
-    `session.py`'s forced flatten.
+    bar has to rank before the strategy goes long). Nothing else is tunable:
+    the strategy's exit is a hard stop at a fixed 0.6x its trailing daily
+    range with an unreachable target (so winners still run to `session.py`'s
+    forced flatten), and both of those are module constants in `strategy.py`,
+    deliberately NOT searched axes — the family's diagnosed failure mode is an
+    overfit gap, so the stop is kept at zero degrees of freedom.
 
     Two params are fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md) and `rank_window`.
@@ -62,7 +65,12 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
       - `rank_window` is the larger, so it is what sizes that buffer:
         `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895 bars, which
         covers the signal's true requirement of
-        `rank_window + max(formation_lookback)` = 960 + 192 = 1152.
+        `rank_window + max(formation_lookback)` = 960 + 192 = 1152. The
+        stop's trailing-daily-range windows live in `strategy.py` as module
+        constants (96 and 960 bars) and so are invisible to
+        `_max_lookback_bars()`; hand-checked, they warm at bar 1056, i.e.
+        inside the 1152 the signal leg already requires, so the binding
+        requirement is unchanged.
       - `rank_pct` is cast to `float` on purpose — it is a quantile level in
         (0, 1), never a bar count. The cast is defensive: a grid point written
         as `1` would otherwise arrive as an `int` and inflate the buffer.
