@@ -49,16 +49,14 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
     momentum statistic `Close_t / Close_{t-n} - 1` measures over) and
     `rank_pct` (how deep into the trailing distribution of that statistic a
     bar has to rank before the strategy goes long). Nothing else is tunable:
-    the strategy's exit is a volatility-scaled hard stop at
-    `STOP_FRAC * trailing daily range` (`STOP_FRAC = 0.5`, a module constant
-    in `strategy.py`, deliberately NOT a searched axis — the exit is kept at
-    zero degrees of freedom), routed through
-    `session.apply_session_constraint_with_stops()`. Iteration 36's
-    momentum-decay flip and its `EXIT_PCT` constant are gone. There is no
-    profit target — `target_price` is a deliberately unreachable `Close * 2.0`
-    that only exists to satisfy the delegate's "target must be non-NaN and
-    above the entry close" guard — so a winner still runs uncapped to
-    `session.py`'s forced flatten.
+    the strategy's exit is a momentum-decay flip to flat when that same
+    formation return falls below its own trailing median (`EXIT_PCT = 0.5`, a
+    module constant in `strategy.py`, deliberately NOT a searched axis — the
+    family's diagnosed failure mode is an overfit gap, so the exit is kept at
+    zero degrees of freedom). There is no stop and no profit target, so a
+    winner still runs uncapped to `session.py`'s forced flatten. (Iteration
+    37's daily-range hard stop was rejected and is gone; this is iteration
+    36's exit, restored.)
 
     Two params are fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md) and `rank_window`.
@@ -71,20 +69,19 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
         `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895 bars, which
         covers the strategy's true requirement of
         `rank_window + max(formation_lookback)` = 960 + 384 = 1344 at the top
-        of the current (slow-end) formation grid 96/192/288/384.
-      - The stop brings back a SECOND warm-up leg this function cannot see:
-        `strategy.DAILY_RANGE_BARS = 96` and `DAILY_RANGE_WINDOW = 960` are
-        module constants, not grid params, so `_max_lookback_bars()` is blind
-        to them and they have to be hand-checked. Doing that: `rolling(96)`
-        goes finite at bar 95, the strict 960-bar mean at 95 + 959 = 1054, and
-        `.shift(1)` pushes it to 1056. The two legs are independent, so the
-        binding requirement is the max, 1344 bars — the signal leg still
-        dominates, so the stop adds no fold skips and no new suppressed-entry
-        region at the head of the un-buffered train windows `_score_params()`
-        scores on. `max_lookback` is still `rank_window` = 960.
+        of the current (slow-end) formation grid 96/192/288/384. Both the
+        entry threshold and the decay-exit threshold are quantiles of the
+        same `rank_window` rolling window over the same formation return, so
+        that single number is the whole warm-up story — there is no longer a
+        second, module-constant window (iteration 34/37's 96/960 daily range
+        for their stop) that `_max_lookback_bars()` cannot see and that had to
+        be hand-checked.
       - `rank_pct` is cast to `float` on purpose — it is a quantile level in
         (0, 1), never a bar count. The cast is defensive: a grid point written
         as `1` would otherwise arrive as an `int` and inflate the buffer.
+        Lowering the searched levels to 0.70/0.775 this iteration changes no
+        types, no keys and no warm-up arithmetic — only which quantiles the
+        8-combo (4 x 2) grid visits.
 
     COVERAGE HAZARD — do not raise `rank_window` (and be careful pointing this
     strategy at a coarse timeframe) without redoing this arithmetic:
