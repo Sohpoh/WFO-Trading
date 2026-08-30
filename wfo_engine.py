@@ -66,7 +66,8 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
       - `rank_window` is the larger, so it is what sizes that buffer:
         `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895 bars, which
         covers the strategy's true requirement of
-        `rank_window + max(formation_lookback)` = 960 + 192 = 1152. Both the
+        `rank_window + max(formation_lookback)` = 960 + 384 = 1344 at the top
+        of the current (slow-end) formation grid 96/192/288/384. Both the
         entry threshold and the decay-exit threshold are quantiles of the
         same `rank_window` rolling window over the same formation return, so
         that single number is the whole warm-up story — there is no longer a

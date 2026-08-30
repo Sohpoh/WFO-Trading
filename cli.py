@@ -81,12 +81,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--formation-lookback", default="24,48,96,192",
+    strat.add_argument("--formation-lookback", default="96,192,288,384",
                         help="comma-separated momentum formation periods, in bars — how far back "
                              "Close_t is compared to when measuring the return that gets ranked. "
                              "Genuine bar-count lookbacks, passed as ints, so they feed "
                              "wfo_engine's pre-test-window warm-up buffer (though --rank-window, "
-                             "being larger, is what actually sizes it)")
+                             "being larger, is what actually sizes it). The default grid is the "
+                             "SLOW end only: across the previous iteration's 48 folds the two "
+                             "slowest values took 41 of them (96 in 22, grid-max 192 in 19) while "
+                             "24 and 48 took 5 and 2, so the dead fast end is retired and 288/384 "
+                             "are opened above the old boundary. Do not push past ~384 with "
+                             "--rank-window at 960: the trailing quantile then rests on only "
+                             "~960/L (~2.5 at 384) independent non-overlapping observations and "
+                             "the threshold itself gets jumpy")
     strat.add_argument("--rank-pct", default="0.80,0.875,0.925",
                         help="comma-separated quantile levels in (0,1) — a bar goes long when its "
                              "formation return is strictly above the rank_pct quantile of the "
@@ -99,7 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "threshold is computed over (960 = ~10 trading days of 15min bars). "
                              "As the largest int in the grid this alone sizes the warm-up buffer "
                              "to (960+5)*3 = 2895 bars, covering the true requirement of "
-                             "rank_window + max(formation_lookback) = 1152. Raising it also "
+                             "rank_window + max(formation_lookback) = 960 + 384 = 1344. Raising "
+                             "it also "
                              "raises wfo_engine's fold-skip guard (max_lookback + 10 = 970 bars "
                              "of train window); that is comfortable at 15min (~5,700 bars per "
                              "12-week train window) and still clears at 1h (~1,400), but at 4h "

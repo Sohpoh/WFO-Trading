@@ -20,8 +20,16 @@ iteration's entry level was absolute (a z-score, a CMF pressure, an ATR
 multiple) and therefore churned across folds as volatility regime shifted; a
 quantile of the trailing `rank_window` bars re-scales itself automatically.
 
-Entry — unchanged, byte-for-byte, from iterations 33 and 34
+Entry — unchanged, byte-for-byte, from iterations 33/34/35
 -----------------------------------------------------------
+The only thing that moves in this iteration is the *range* `formation_lookback`
+is drawn from: the fast end (24/48) is retired and the grid is lifted to
+96/192/288/384. Across iteration 35's 48 folds the two slowest values took 41
+(96 in 22, grid-max 192 in 19) against 5 and 2 for 24 and 48, so the searched
+region is moved to where the folds already pointed and extended above the old
+boundary. `rank_pct`'s grid is deliberately NOT touched despite 0.925 (its grid
+max) being pinned in 25/48 folds — pushing selectivity higher would thin an
+already ~3-trade-per-fold OOS sample. No code below changes for any of this.
 All computed on the full continuous frame with no session awareness of their
 own; every window is strictly backward-looking, so there is no lookahead.
 
@@ -44,8 +52,9 @@ own; every window is strictly backward-looking, so there is no lookahead.
     strict `min_periods=rank_window` NaNs out every unwarmed bar. Because
     `ret` is itself NaN for its first `formation_lookback` bars and pandas'
     `min_periods` counts only non-NaN observations, the first finite threshold
-    lands at bar `formation_lookback + rank_window` — 1152 bars at the top of
-    the intended grid, which the engine's warm-up buffer covers (see below).
+    lands at bar `formation_lookback + rank_window` — 1344 bars at the top of
+    the intended grid (960 + 384), which the engine's warm-up buffer covers
+    (see below).
 
     `rolling(...).quantile(...)` is used rather than `rolling(...).apply(...)`
     with a rank function on purpose: the latter is orders of magnitude slower
@@ -143,17 +152,20 @@ Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`):
   - `rank_window` is fixed at 960, never grid-searched, and is the larger of
     the two: it drives `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895
     bars, comfortably covering the true requirement of
-    `rank_window + max(formation_lookback)` = 1152. Do not raise it without
+    `rank_window + max(formation_lookback)` = 960 + 384 = 1344 at the top of
+    the current slow-end grid 96/192/288/384. Do not raise it without
     re-checking that arithmetic *and* the fold-skip guard — see build_grid().
   - `rank_pct` is a quantile level in (0, 1), never a bar count, so it is
     passed as `float` and correctly ignored by the buffer sizing.
   - Retiring the stop removes the one warm-up leg that was invisible to
     `_max_lookback_bars()` (iteration 34's hardcoded 96/960 daily-range
     windows, which had to be hand-checked to bar 1056). The warm-up story is
-    now a single leg, `rank_window + max(formation_lookback)` = 1152 bars, all
-    of it engine-derived. The binding requirement is unchanged from 33/34, so
-    there are no new fold skips (the guard is still `max_lookback + 10` = 970,
-    since `max_lookback` is still `rank_window` = 960).
+    now a single leg, `rank_window + max(formation_lookback)` = 1344 bars, all
+    of it engine-derived. Lifting the formation grid to the slow end raises
+    that true requirement from 1152 to 1344 bars, still far inside the 2895-bar
+    buffer, and it does NOT move what the engine keys off: `max_lookback` is
+    still `rank_window` = 960 (384 < 960), so the buffer is still 2895 and the
+    fold-skip guard is still `max_lookback + 10` = 970 — no new fold skips.
 
   - `EXIT_PCT` is a module constant and is **never grid-searched**: it adds no
     `build_grid()` / `DEFAULT_PARAMS` key, so the grid and param names stay
@@ -252,7 +264,11 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    "formation_lookback": 48,
+    # 192 rather than the retired 48: the formation grid is now the slow end
+    # only (96/192/288/384), so the sanity-check default has to name a value
+    # the grid actually searches. Same key, same type — no param added,
+    # removed or renamed.
+    "formation_lookback": 192,
     "rank_pct": 0.875,
     "rank_window": 960,
     "session": "New York",
