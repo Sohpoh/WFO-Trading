@@ -1,4 +1,4 @@
-"""Long-only percentile-rank momentum, momentum-decay exit, widened entry base.
+"""Long-only percentile-rank momentum with a momentum-decay exit.
 
 Every one of the 32 iterations before this family was symmetrically
 long/short. Splitting their OOS trades by direction says the same thing in
@@ -20,39 +20,18 @@ iteration's entry level was absolute (a z-score, a CMF pressure, an ATR
 multiple) and therefore churned across folds as volatility regime shifted; a
 quantile of the trailing `rank_window` bars re-scales itself automatically.
 
-This iteration branches off **iteration 36** (not the most recent entry): 36
-was the repo's first clean leave-top-5-out (robust:true, PF_ex5 1.2615) and
-failed on one line only, fold consistency at 25/45 = 55.6% against a >60% aim;
-iteration 37's daily-range hard stop was rejected as an overfit gap, so it is
-discarded wholesale and 36 is restored as the base. Everything below is
-iteration 36's code byte-for-byte except the *values* in the `rank_pct` grid.
-
-Entry — code unchanged from iteration 36; only the `rank_pct` grid shifts
--------------------------------------------------------------------------
-The one thing that moves is the *range* `rank_pct` is drawn from:
-0.80/0.875/0.925 (the region searched in iterations 33-37) is retired and the
-grid drops to **0.70/0.775**, territory never searched in this family.
-
-The reason is a power calculation, not a hunch. Iteration 36's sole binding
-failure was fold consistency, and its own evaluator named the cause: at a mean
-of ~4.1 OOS trades per active fold, each fold's profitable/unprofitable bit
-carries almost no statistical content. With 36's OOS per-trade mu/sigma ~ 0.070,
-P(fold profitable) = Phi(mu*sqrt(n)/sigma), so n = 4.1 predicts 55.6% — which is
-exactly what 36 measured — and reaching 60% needs n ~ 13. Only **widening the
-entry base** raises n, and only lowering the grid does that: `optimize()` scores
-on train Sharpe, a ratio that systematically pins to the most selective grid
-point (0.925 took 26 of 48 folds and all 3 zero-trade folds), so merely adding a
-low anchor beneath the old grid would leave the old top still winning and
-manufacture more empty folds. The grid top therefore has to fall to ~0.775.
-
-Cutting three `rank_pct` values to two also cuts the grid 12 combos -> 8,
-reducing selection pressure in a family that has logged three overfit gaps, and
-retires a point (0.80) that never converged anyway (13/9/26 fold split).
-
-`formation_lookback` keeps iteration 36's slow-end grid 96/192/288/384 and
-`rank_window` stays fixed at 960. All computed on the full continuous frame
-with no session awareness of their own; every window is strictly
-backward-looking, so there is no lookahead.
+Entry — unchanged, byte-for-byte, from iterations 33/34/35
+-----------------------------------------------------------
+The only thing that moves in this iteration is the *range* `formation_lookback`
+is drawn from: the fast end (24/48) is retired and the grid is lifted to
+96/192/288/384. Across iteration 35's 48 folds the two slowest values took 41
+(96 in 22, grid-max 192 in 19) against 5 and 2 for 24 and 48, so the searched
+region is moved to where the folds already pointed and extended above the old
+boundary. `rank_pct`'s grid is deliberately NOT touched despite 0.925 (its grid
+max) being pinned in 25/48 folds — pushing selectivity higher would thin an
+already ~3-trade-per-fold OOS sample. No code below changes for any of this.
+All computed on the full continuous frame with no session awareness of their
+own; every window is strictly backward-looking, so there is no lookahead.
 
   - Formation return, the momentum statistic:
 
@@ -79,18 +58,14 @@ backward-looking, so there is no lookahead.
 
     `rolling(...).quantile(...)` is used rather than `rolling(...).apply(...)`
     with a rank function on purpose: the latter is orders of magnitude slower
-    across an 8-combo grid x ~48 folds.
+    across a 12-combo grid x ~48 folds.
 
   - Long entry where `ret_t > q_enter_t`, strict `>`. There is no short leg;
     -1.0 is never emitted. NaN compares False on both sides of `>`, so
     unwarmed bars fail closed with no separate validity mask.
 
-Exit — restored unchanged from iteration 36, not touched by this iteration
----------------------------------------------------------------------------
-Nothing in this section is new here: it is iteration 36's decay exit, brought
-back byte-for-byte after iteration 37's hard stop was rejected. The history
-below is kept because it is *why* the exit looks the way it does.
-
+Exit — the only thing changed from the previous iteration
+---------------------------------------------------------
 Iteration 33 had **no exit at all** beyond the forced end-of-session flatten;
 iteration 34 bolted on a hard stop at 0.6x the trailing daily range, routed
 through the path-dependent stops delegate. That stop is **retired here** and
@@ -140,12 +115,10 @@ The replacement, a second hardcoded threshold on the same statistic:
     its 0.6x-daily-range stop are dropped entirely.
 
   - The masks are assigned exit-first, entry-second so an entry wins if they
-    ever overlap. For any `rank_pct` above `EXIT_PCT = 0.5` they cannot
-    overlap at all — quantiles of the same rolling window are monotone in
-    `pct`, so the entry level sits at or above the exit level on any
-    distribution — and this grid's floor is 0.70, comfortably clear of 0.5.
-    The ordering makes the no-overlap guarantee structural rather than
-    dependent on that inequality holding.
+    ever overlap. At `rank_pct >= 0.80` against `EXIT_PCT = 0.5` they cannot
+    overlap (the entry quantile is strictly above the exit quantile on any
+    non-degenerate distribution), but the ordering makes that structural
+    rather than incidental.
 
 Consequences, pre-registered:
 
@@ -196,9 +169,8 @@ Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`):
 
   - `EXIT_PCT` is a module constant and is **never grid-searched**: it adds no
     `build_grid()` / `DEFAULT_PARAMS` key, so the grid and param names stay
-    byte-identical to iterations 33-36 and the `rank_pct` grid is the only
-    variable in this comparison. That is also deliberate given the diagnosed
-    overfit gap —
+    byte-identical to iterations 33/34 and the exit is the only variable in
+    this comparison. That is also deliberate given the diagnosed overfit gap —
     iteration 10 added a zero-param exit change as its only edit and passed;
     iteration 27 promoted its exit level to a searched axis and the family's
     economics inverted.
@@ -278,10 +250,9 @@ def generate_positions(
         decay_signal = ret < exit_threshold
 
     # Raw, session-unaware entries: 1.0 long / 0.0 flat / NaN hold. Exit is
-    # written first and entry second so an entry wins on any overlap; for any
-    # rank_pct above EXIT_PCT = 0.5 the two masks are disjoint anyway
-    # (quantiles of one rolling window are monotone in pct, and this grid's
-    # floor is 0.70), but the ordering makes that structural.
+    # written first and entry second so an entry wins on any overlap; with
+    # rank_pct >= 0.80 against EXIT_PCT = 0.5 the two masks are disjoint
+    # anyway, but the ordering makes that structural.
     entries = pd.Series(np.nan, index=df.index, dtype=float)
     entries[decay_signal] = 0.0
     entries[long_signal] = 1.0
@@ -298,11 +269,7 @@ DEFAULT_PARAMS = {
     # the grid actually searches. Same key, same type — no param added,
     # removed or renamed.
     "formation_lookback": 192,
-    # 0.775 rather than the retired 0.875: the rank grid drops to 0.70/0.775
-    # this iteration, so the sanity-check default has to name a value the grid
-    # actually searches. Same key, same float type — no param added, removed
-    # or renamed.
-    "rank_pct": 0.775,
+    "rank_pct": 0.875,
     "rank_window": 960,
     "session": "New York",
 }

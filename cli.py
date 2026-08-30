@@ -11,7 +11,7 @@ Examples:
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --formation-lookback 96,192,288,384 --rank-pct 0.70,0.775 \\
+        --formation-lookback 24,48,96,192 --rank-pct 0.80,0.875,0.925 \\
         --rank-window 960 --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
@@ -77,8 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
         "quantile is a module constant in strategy.py and is NOT searched, so there is no "
         "flag for it; because a decayed trade can re-enter later in the same session if "
         "the rank climbs back above --rank-pct, a traded session is not exactly one round "
-        "trip. The previous iteration's daily-range hard stop was rejected and is gone — "
-        "this is iteration 36's exit, restored unchanged)"
+        "trip)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -95,33 +94,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "--rank-window at 960: the trailing quantile then rests on only "
                              "~960/L (~2.5 at 384) independent non-overlapping observations and "
                              "the threshold itself gets jumpy")
-    strat.add_argument("--rank-pct", default="0.70,0.775",
+    strat.add_argument("--rank-pct", default="0.80,0.875,0.925",
                         help="comma-separated quantile levels in (0,1) — a bar goes long when its "
                              "formation return is strictly above the rank_pct quantile of the "
                              "trailing distribution, i.e. 0.90 means 'top decile'. Unlike every "
                              "absolute threshold used in earlier iterations this re-scales itself "
                              "with the volatility regime, so it should not churn across folds. "
-                             "Passed as floats and correctly ignored by the warm-up sizing. The "
-                             "default grid drops from the 0.80/0.875/0.925 region searched in "
-                             "iterations 33-37 to 0.70/0.775: that region's binding failure was "
-                             "fold consistency at ~4 OOS trades per active fold, and only a WIDER "
-                             "entry base raises that count. The whole grid has to move down rather "
-                             "than gain a low anchor, because optimize() scores on train Sharpe and "
-                             "pins to the most selective point available (0.925 took 26 of 48 folds "
-                             "and every zero-trade fold). Keep all values at or above 0.5: below "
-                             "strategy.py's EXIT_PCT the entry and decay-exit masks stop being "
-                             "disjoint. Three values down to two also cuts the grid 12 combos -> 8")
+                             "Passed as floats and correctly ignored by the warm-up sizing")
     strat.add_argument("--rank-window", type=int, default=960,
                         help="FIXED, never grid-searched: how many trailing bars the rank "
                              "threshold is computed over (960 = ~10 trading days of 15min bars). "
                              "As the largest int in the grid this alone sizes the warm-up buffer "
                              "to (960+5)*3 = 2895 bars, covering the true requirement of "
-                             "rank_window + max(formation_lookback) = 960 + 384 = 1344. Both the "
-                             "entry threshold and the decay-exit threshold come off this one "
-                             "rolling window, so that is the whole warm-up story — the retired "
-                             "hard stop's second, module-constant window (which the buffer sizing "
-                             "could not see and had to be hand-checked) is gone. Raising "
-                             "--rank-window also "
+                             "rank_window + max(formation_lookback) = 960 + 384 = 1344. Raising "
+                             "it also "
                              "raises wfo_engine's fold-skip guard (max_lookback + 10 = 970 bars "
                              "of train window); that is comfortable at 15min (~5,700 bars per "
                              "12-week train window) and still clears at 1h (~1,400), but at 4h "

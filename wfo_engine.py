@@ -54,9 +54,7 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
     module constant in `strategy.py`, deliberately NOT a searched axis — the
     family's diagnosed failure mode is an overfit gap, so the exit is kept at
     zero degrees of freedom). There is no stop and no profit target, so a
-    winner still runs uncapped to `session.py`'s forced flatten. (Iteration
-    37's daily-range hard stop was rejected and is gone; this is iteration
-    36's exit, restored.)
+    winner still runs uncapped to `session.py`'s forced flatten.
 
     Two params are fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md) and `rank_window`.
@@ -73,15 +71,12 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
         entry threshold and the decay-exit threshold are quantiles of the
         same `rank_window` rolling window over the same formation return, so
         that single number is the whole warm-up story — there is no longer a
-        second, module-constant window (iteration 34/37's 96/960 daily range
-        for their stop) that `_max_lookback_bars()` cannot see and that had to
-        be hand-checked.
+        second, module-constant window (iteration 34's 96/960 daily range for
+        its stop) that `_max_lookback_bars()` cannot see and that had to be
+        hand-checked.
       - `rank_pct` is cast to `float` on purpose — it is a quantile level in
         (0, 1), never a bar count. The cast is defensive: a grid point written
         as `1` would otherwise arrive as an `int` and inflate the buffer.
-        Lowering the searched levels to 0.70/0.775 this iteration changes no
-        types, no keys and no warm-up arithmetic — only which quantiles the
-        8-combo (4 x 2) grid visits.
 
     COVERAGE HAZARD — do not raise `rank_window` (and be careful pointing this
     strategy at a coarse timeframe) without redoing this arithmetic:
