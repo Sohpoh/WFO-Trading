@@ -1,238 +1,237 @@
-"""Long-only overnight gap-down fill buy (NQ 15min, New York session).
+"""Long-only swing-horizon pullback buy (NQ 15min, New York session).
 
-The previous family (long-only dual-horizon moving-average trend state) is
-retired as structural, not varied: its in-sample leg came back CAGR -7.99% at
-PF 0.868 over 469 IS / 436 OOS trades, which fires both no-edge triggers. This
-iteration is a deliberate, evidence-backed revisit of iteration 3's rejected
-overnight-gap-fade family rather than a re-run of it — two named mechanisms
-from that iteration are deleted outright.
+The previous family (long-only overnight gap-down fill buy) is retired as
+structural, not varied: its in-sample leg came back CAGR -9.97% at PF 0.671
+over 221 IS / 332 OOS trades, which fires both no-edge triggers, and the
+iteration before it was no-edge too. This is a clean pivot to a new family
+rather than another knob on a dead one.
 
-What is deleted from iteration 3
---------------------------------
-1. The gap-up SHORT half. Splitting ~2,000 OOS trades by direction across four
-   unrelated families said the same thing every time: the short leg was the
-   worse half. Under `metrics.py`'s per-leg cost model a no-signal day now pays
-   zero legs rather than the two a short entry would cost. `short_signal` is
-   False on every bar and -1.0 can never be emitted.
-2. The MA-reclaim confirmation gate. Iteration 17 measured reclaim-style
-   confirmation on a fade at roughly +1bp gross — worse than an unfiltered
-   flip — so iteration 3's entry was crippled by a mechanism this log has
-   since falsified. There is no confirmation filter here; the band itself is
-   the whole entry condition.
+The mechanism
+-------------
+mean-reversion.md's short-term-overreaction / forced-selling edge, applied at
+a *swing* horizon instead of an intraday one, and taken only with the
+prevailing trend. Taking it only with the trend is that same page's pitfall #1
+read as a constraint ("in a strong uptrend, shorting strength is a losing
+strategy"): the dip is bought only while price is above a multi-week mean, and
+the dip is never sold.
 
-The anchor — stated honestly, not hidden
-----------------------------------------
-`anchor_t` is the Close of the final bar of the *previous completed UTC day*,
-broadcast forward across the current UTC day. Strictly backward looking: group
-by UTC date, take the last Close of each date, shift one available day, map
-back onto the bar index. Bars on the first date of the frame have no prior day
-and stay NaN, which fails closed everywhere downstream.
+Three construction choices are carried over because they are the only findings
+this log has replicated across unrelated families:
+  1. Long-only. A ~2,000-trade direction split across four families put the
+     short leg as the worse half every time. Under `metrics.py`'s per-leg cost
+     model a non-qualifying day now pays zero legs rather than the two a short
+     entry would cost.
+  2. Slow horizons over fast. In the one clean robust run in this repo the two
+     slowest formation values took 41 of 48 folds, so the grid here starts at
+     ~10 UTC days of trend and never goes faster.
+  3. No stop. Two earlier iterations added a hardcoded stop as their only
+     change and both got worse, and hard-capping the payoff has been measured
+     flipping per-trade economics from +0.4bps to -11.6bps. The exit here is a
+     plain hold to the session flatten.
 
-es-futures.md's "gaps down: 60% fill within same session" (NQ 57%) is measured
-against the 16:00 ET RTH close. This anchor is session-unaware and lands at the
-end of the UTC day (~19:45/20:45 ET), so that figure is directional evidence
-for the mechanism, NOT a base rate that transfers — this run has to stand on
-its own walk-forward numbers.
+Closest prior relative is the trend_pullback_continuation family (no-edge) and
+four things differ, the horizon being load-bearing: this is long-only rather
+than symmetric; the trend filter is 10-20 UTC days rather than 96-384 bars
+(which was *shorter* than that iteration's own pullback window, so it was
+measuring a 5-hour dip against a "1-4 day trend"); the pullback is measured as
+depth below a multi-day rolling high in trailing-daily-range units rather than
+price-vs-its-own-rolling-mean (the exact quantity two earlier iterations found
+information-free on this data in either polarity); and there is no stop.
 
-A second honesty note on the same anchor: the shift is over *available* days,
-not calendar days, so Monday's anchor is Sunday's last close. Sunday UTC days
-carry only ~8 bars at 15min (132 such days in the local NQ frame) — a ~19:45 ET
-print off roughly two hours of Globex, not a post-full-session close. That is
-faithful to the specified anchor and is documented rather than "fixed".
+Entry — a dense state, not a crossing
+-------------------------------------
+All quantities are strictly backward-looking and fully session-unaware.
 
-Entry — a dense band, not a crossing
-------------------------------------
-    dev_t      = Close_t / anchor_t - 1          (signed, negative = gap down)
-    gap_dist_t = anchor_t - Close_t              (positive inside the band)
+    daily_range_t = rolling_max(High, RANGE_WINDOW).shift(1)
+                  - rolling_min(Low,  RANGE_WINDOW).shift(1)
+    vol_unit_t    = rolling_mean(daily_range, VOL_WINDOW)
+    depth_t       = rolling_max(High, dip_lookback).shift(1) - Close_t
 
-    long_signal_t = (dev_t <= -min_gap_pct) AND (dev_t >= -BAND_CAP_MULT * min_gap_pct)
+    long_signal_t = (Close_t > SMA(Close, trend_ma))
+                    AND (depth_t >= dip_frac * vol_unit_t)
 
-The upper band cap at `BAND_CAP_MULT` = 3.0x `min_gap_pct` is a module
-constant, deliberately NOT a searched axis (same treatment as earlier
-iterations' STOP_FRAC). It encodes mean-reversion.md pitfall #4 — news spikes
-wipe out mean-reversion positions — so beyond 3x the threshold the move is
-read as news, not as the overshoot being faded. It is also what bounds the
-re-arm behaviour described below.
+`RANGE_WINDOW` = 96 (one UTC day at 15min) and `VOL_WINDOW` = 480 (~5 days)
+are module constants, deliberately NOT searched — the volatility unit carries
+zero degrees of freedom, so `dip_frac` is the only width knob.
 
-The signal is a dense STATE, not a crossing. The gap forms overnight, outside
-the New York window, so a cross-only formulation would place nearly every
-arming bar outside the session and produce almost no trades.
+The `.shift(1)` on both rolling extrema is required, not cosmetic: without it
+the rolling max includes the current bar's own High, so on a spike bar the
+threshold moves with the price it is supposed to be measured against and the
+condition becomes self-referential.
 
-Exit — bounded target known at entry, gap-scaled stop
------------------------------------------------------
-Positive grounding is mean-reversion.md's short-term-overreaction / forced-
-selling mechanism plus its documented Bollinger exit ("expecting reversion to
-the middle. Exit at middle"), which supplies a target that is bounded and known
-at entry — the frequent-small-wins shape that the gate's leave-top-5-out hard
-check rewards, and the exact shape the uncapped run-to-flatten families keep
-failing.
+This is a dense STATE, not a crossing. A cross-only form would arm on exactly
+one bar per pullback, and that bar is overwhelmingly likely to fall outside
+the New York window (the pullback deepens whenever it deepens, including
+overnight), producing almost no trades. As a state, the first in-session bar
+of an armed stretch is the entry.
 
-    target_price_t  = Close_t + target_frac * gap_dist_t
-    stop_distance_t = stop_gap_frac * gap_dist_t
+NaN comparisons evaluate False, so an unwarmed bar stands aside with no
+separate validity mask to keep in sync — the same fail-closed discipline as
+the previous iteration.
 
-`target_frac` = 1.0 is the literal full fill back at the anchor; 0.75 is a
-partial fill. Inside the band `gap_dist_t > 0` by construction, so the target
-is always strictly above the entry Close and the delegate's
-`target_price > close` guard is satisfied without a special case. The stop is a
-positive from-entry distance (the delegate resolves it below entry for a long)
-measured in the same gap-distance unit as the target, so both sides of the
-trade are scale-invariant in the size of the gap being faded.
+Exit — hold to the session flatten, no stop, no target
+------------------------------------------------------
+The raw `entries` series carries only 1.0 (arm long) and NaN (no opinion); it
+never carries 0.0 and never carries -1.0. `session.apply_session_constraint()`
+forward-fills that into a position, so the trade opens on the first in-session
+armed bar and is force-flattened by `session.py` on the session's last bar.
+Upside is uncapped; duration is bounded by the session. One round trip per
+armed session.
 
-Everything path-dependent is routed through
-`session.apply_session_constraint_with_stops()`; `session.py` also force-
-flattens any survivor on the session's last bar. No trailing stop and no
-scale-out — both are foreclosed by session.py's entry-bar-only stop level and
-CLAUDE.md's {-1, 0, 1} position contract.
+This is deliberately NOT `apply_session_constraint_with_stops` — see point 3
+above. Because `entries` is NaN (not False) on non-qualifying bars, a position
+already open is *held* through bars where the signal switches off; the exit is
+the session boundary alone.
 
-Re-arm behaviour, stated up front
----------------------------------
-Because `long_signal` is a dense state and the delegate forbids only *same-bar*
-re-entry, a stopped-out trade can re-enter on a later in-session bar while
-price is still inside the band. Each re-entry costs 2 extra legs. The hardcoded
-3x band cap is what bounds this to a few attempts in a monotone decline
-instead of unlimited averaging-down: once price falls past 3x `min_gap_pct`
-below the anchor, the state goes False and the strategy stops re-arming.
-Measured here rather than asserted: on the full local NQ 15min frame at
-`min_gap_pct` = 0.004 (the loosest grid point, so the worst case), the band is
-in-session on 506 distinct days and the strategy takes 915 trades — ~1.8
-entries per armed day, at the low end of the expected 2-4.
+Long-only means -1.0 can never be emitted, so `apply_session_constraint`'s
+forward fill can only ever produce {0.0, 1.0} and a non-qualifying day costs
+nothing at all.
 
-Cost discipline, designed into the grid rather than bolted on as a filter
-------------------------------------------------------------------------
-`min_gap_pct` floors at 0.40% and `target_frac` floors at 0.75, so the smallest
-implied target is ~30bps against `metrics.py`'s ~10.2bps round-trip toll
-(~2.9x, rising to ~3.9x at `target_frac` = 1.0). NQ is chosen over ES because
-ES's smaller overnight moves would starve a 0.40% threshold.
+Cost discipline, designed into the grid rather than bolted on
+------------------------------------------------------------
+At `dip_frac` = 0.5 (the loosest grid point) the qualifying pullback measures
+~0.95% of price at the median on the local NQ 15min frame (the volatility unit
+itself runs ~1.9% of price at the median), roughly 9x `metrics.py`'s ~10.2bps
+round-trip toll — the spec estimated ~0.65% / ~6x, so the measured margin is
+wider than pre-registered, not narrower. The trade is a single round trip held
+across an RTH range of ~1.0-1.3%. NQ is chosen over ES because ES's smaller
+ranges would starve the same threshold.
+
+Measured density (full local NQ 15min frame, New York session), since the
+trend filter and the depth filter partially fight each other and the spec
+pre-registered a >=120-OOS-trade power floor: at trend_ma=960 / dip_lookback=96
+/ dip_frac=0.5 the strategy arms on 357 distinct in-session days and takes 354
+entries (one round trip per armed session, exactly as designed); at
+trend_ma=1920 / dip_lookback=288 / dip_frac=0.5, 459 armed days. The tight
+corner is genuinely thin: trend_ma=960 / dip_lookback=96 / dip_frac=1.5 arms on
+only 11 days across four years.
+
+That thinness is NOT neutralized by the engine, and the honest version of this
+is worth stating: `wfo_engine._score_params()` returns -inf only for combos
+with FEWER THAN 2 position changes in the train window, and one complete round
+trip is exactly 2 changes — so a combo that took a single lucky train trade
+still gets scored and can still win the fold. Measured on a 2024-only 12w/3w
+smoke run: `dip_frac` = 1.5 combos won 8 of 13 folds and 6 of 13 folds took
+zero OOS trades. Whether the resulting trade count clears the pre-registered
+>=120-OOS-trade power floor over the full frame is the evaluator's call.
 
 `metrics.py`'s per-leg toll (0.001% fee + 0.05% slippage) is unchanged and out
 of scope.
 
 Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`)
 ---------------------------------------------------------------------------
-  - ALL THREE searched params are `float`: `min_gap_pct` is a return
-    threshold, `stop_gap_frac` and `target_frac` are fractions of the gap
-    distance. None is a bar count, so none should size the warm-up buffer.
-  - Consequently `_max_lookback_bars()` returns 0 for this grid. This inverts
-    the hazard every previous iteration's docstring warned about: the
-    fold-skip guard in `run_walk_forward()` drops to `len(train_df) < 10`,
-    trivially met at every timeframe, so no fold is ever silently skipped and
-    the old "always pass --timeframe 15min or you get zero folds" warning does
-    NOT apply here.
-  - The binding warm-up is therefore `_bars_per_day(df) + 5` alone — exactly
-    the day-anchored floor that function exists for. Hand-checked (it is
-    invisible to `_max_lookback_bars()`): the anchor's true requirement is
-    "the final bar of the previous UTC day is inside the calc slice", i.e. at
-    most (bars of the current day before `test_start`) + 1 = max bars in one
-    UTC day. Measured on the local NQ frame (median / max bars per UTC day,
-    then buffer vs. requirement): 1min 1380/1380 -> 1385 vs 1380; 5min 276/276
-    -> 281 vs 276; 15min 92/92 -> 97 vs 92; 1h 23/23 -> 28 vs 23; 4h 6/6 -> 15
-    vs 6. Every timeframe clears it, the intended 15min included.
-  - That margin depends on median bars/day == max bars/day (it does on this
-    data, at every timeframe above — re-measure before pointing this at
-    another instrument or source). If it ever failed,
-    the effect is a NaN anchor on the first bars of a test window -> no entry
-    -> a few missed trades. It is a fail-closed degradation, never lookahead.
+  - `trend_ma` and `dip_lookback` are genuine bar counts and are `int` in
+    `build_grid()` **on purpose**, so `_max_lookback_bars()` picks them up and
+    sizes the pre-test-window warm-up buffer from them. `dip_frac` is a
+    fraction of the volatility unit and is cast `float` so it cannot inflate
+    that buffer.
+  - At the intended grid the binding value is `trend_ma`: the buffer is
+    `max((trend_ma + 5) * 3, bars_per_day + 5)`, i.e. 2,895 bars at
+    trend_ma = 960 and 5,775 at trend_ma = 1920.
+  - The fold-skip guard in `run_walk_forward()` is
+    `len(train_df) < max_lookback + 10` = 1,930 at the top of the grid. A
+    12-week train window at 15min is ~7,700 bars, so no fold is skipped. THIS
+    STRATEGY IS INTENDED AT `--timeframe 15min`. At 1h a 12-week train window
+    is only ~1,930 bars — right on the guard — so folds will be silently
+    skipped there; at 4h/1d every fold is skipped.
+  - Hand-check for the part `_max_lookback_bars()` cannot see: `vol_unit`
+    needs RANGE_WINDOW + VOL_WINDOW = 96 + 480 = 576 bars of history before it
+    is non-NaN, and 96/480 are module constants that never appear in the grid.
+    The smallest buffer this grid can produce is 2,895 bars, which clears 576
+    with room to spare at every grid corner. If it ever did not, the failure
+    mode is a NaN `vol_unit` -> comparison False -> no entry on the first bars
+    of a test window: a few missed trades, never lookahead.
 
-This module decides only *when* the strategy wants to be long, and at what
-stop/target levels. All day-trade gating and the end-of-session flatten are
-delegated to `session.py`; see its docstring for that contract.
+This module decides only *when* the strategy wants to be long. All day-trade
+gating and the end-of-session flatten are delegated to `session.py`; see its
+docstring for that contract.
 """
 import numpy as np
 import pandas as pd
 
-from session import apply_session_constraint_with_stops
+from session import apply_session_constraint
 
-# Upper edge of the entry band, as a multiple of `min_gap_pct`. A module
-# constant on purpose — the spec pins it as NOT a searched axis, so the exit
-# band keeps zero degrees of freedom. Beyond this multiple the overnight move
-# is read as news rather than as a fadeable overshoot (mean-reversion.md
-# pitfall #4), which is also what bounds re-arming after a stop-out.
-BAND_CAP_MULT = 3.0
+# Bars in one UTC day at the intended 15min timeframe. The trailing high-low
+# range over this window is the raw "one day of movement" unit. A module
+# constant on purpose — the volatility scale keeps zero searched degrees of
+# freedom, so `dip_frac` alone controls how deep a pullback has to be.
+RANGE_WINDOW = 96
+
+# Bars over which those daily ranges are averaged into the volatility unit
+# (~5 UTC days at 15min). Also a module constant, same reason.
+VOL_WINDOW = 480
 
 
-def prior_day_close(close: pd.Series) -> pd.Series:
-    """Close of the final bar of the previous completed UTC day, broadcast
-    forward across every bar of the current UTC day.
+def volatility_unit(high: pd.Series, low: pd.Series) -> pd.Series:
+    """Average trailing one-day high-low range, in price units.
 
-    Strictly backward looking: the value attached to a bar on UTC day D is
-    fully determined before day D's first bar prints. Bars on the first UTC
-    day of the frame get NaN (no prior day exists yet) and fail closed.
-
-    The shift is positional over the days actually present, so a Monday's
-    anchor is the previous Sunday's last close, not the previous Friday's —
-    see the module docstring for why that is documented rather than changed.
+    Strictly backward looking: both extrema are `.shift(1)`ed before the
+    average, so the value attached to bar t is fully determined by bars
+    strictly before t. The first RANGE_WINDOW + VOL_WINDOW bars are NaN and
+    fail closed downstream.
     """
-    day = pd.Series(close.index.normalize(), index=close.index)
-    daily_last = close.groupby(day).last()
-    return day.map(daily_last.shift(1))
+    daily_range = (
+        high.rolling(RANGE_WINDOW).max().shift(1) - low.rolling(RANGE_WINDOW).min().shift(1)
+    )
+    return daily_range.rolling(VOL_WINDOW).mean()
 
 
 def generate_positions(
     df: pd.DataFrame,
-    min_gap_pct: float,
-    stop_gap_frac: float,
-    target_frac: float,
+    trend_ma: int,
+    dip_lookback: int,
+    dip_frac: float,
     session: str | None = "New York",
 ) -> pd.Series:
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
 
-    anchor = prior_day_close(close)
+    # Volatility unit: what "a normal day of movement" is worth in points right
+    # now, so the depth threshold is scale-free across 2022-2025 regimes.
+    vol_unit = volatility_unit(high, low)
 
-    # Signed deviation from the anchor (negative = gapped down) and the
-    # positive price distance back up to it. NaN anchor -> both NaN, which
-    # fails closed on every branch below.
-    dev = close / anchor - 1.0
-    gap_dist = anchor - close
+    # Uptrend gate: price above its multi-week mean. This is what turns the
+    # dip-buy from a naked mean-reversion bet into a with-trend continuation
+    # entry, and it is why there is no short leg (shorting strength inside an
+    # uptrend is mean-reversion.md's pitfall #1).
+    trend_ok = close > close.rolling(int(trend_ma)).mean()
 
-    # Dense entry band: deep enough to clear the round-trip toll, but not so
-    # deep that the move is news rather than an overshoot. A state, not a
-    # crossing — the gap forms outside the New York window, so a cross-only
-    # form would arm almost exclusively on untradable bars. NaN on either side
-    # of a comparison is False, so an unwarmed bar stands aside with no
-    # separate validity mask to keep in sync.
+    # Pullback depth: how far the current Close sits below the highest High of
+    # the last `dip_lookback` bars. The `.shift(1)` excludes the current bar's
+    # own High — without it a spike bar would set its own reference and the
+    # comparison would be self-referential.
+    depth = high.rolling(int(dip_lookback)).max().shift(1) - close
+
+    # Dense arming state. NaN on either side of a comparison is False, so an
+    # unwarmed bar simply stands aside — no separate validity mask to keep in
+    # sync with this expression.
     with np.errstate(invalid="ignore"):
-        long_signal = (dev <= -float(min_gap_pct)) & (dev >= -BAND_CAP_MULT * float(min_gap_pct))
+        long_signal = trend_ok & (depth >= float(dip_frac) * vol_unit)
 
-    # Long-only: the delegate still wants a short side, so hand it one that is
-    # never True. -1.0 can therefore never be emitted, and a gap-up day pays
-    # zero cost legs instead of the two a short entry would cost.
-    short_signal = pd.Series(False, index=df.index)
+    # Raw, session-unaware entries: 1.0 where the strategy wants to be long,
+    # NaN everywhere else. NaN (not False/0.0) is load-bearing — it is what
+    # lets session.py's forward fill HOLD an open position through bars where
+    # the arming condition has switched off, so the only exit is the session
+    # flatten. There is no -1.0 branch: this family is long-only, so a
+    # non-qualifying day pays zero cost legs.
+    entries = pd.Series(np.nan, index=df.index)
+    entries[long_signal] = 1.0
 
-    # Bounded target known at entry: a fraction of the way back to the anchor
-    # (1.0 = the literal full fill). Inside the band gap_dist > 0, so this is
-    # always strictly above the entry Close and the delegate's
-    # `target_price > close` guard is satisfied by construction.
-    target_price = close + float(target_frac) * gap_dist
-
-    # Gap-scaled hard stop: a positive from-entry distance in the same
-    # gap-distance unit as the target, which the delegate resolves below entry
-    # for a long and freezes at the entry bar (hard, not trailing).
-    stop_distance = float(stop_gap_frac) * gap_dist
-
-    # session.py alone decides which bars are tradable, walks the stop/target
-    # path, and force-flattens on the session's last bar.
-    return apply_session_constraint_with_stops(
-        close=close,
-        high=high,
-        low=low,
-        long_signal=long_signal,
-        short_signal=short_signal,
-        stop_distance=stop_distance,
-        target_price=target_price,
-        session=session,
-    )
+    # session.py alone decides which bars are tradable and force-flattens on
+    # the session's last bar.
+    return apply_session_constraint(entries, session)
 
 
 DEFAULT_PARAMS = {
-    # All three are values the intended grid actually searches
-    # (min_gap_pct 0.004/0.006/0.009/0.013, stop_gap_frac 0.5/0.75/1.0,
-    # target_frac 0.75/1.0), so the post-edit sanity check exercises a real
-    # combo. All three are floats — none is a bar count; see the module
-    # docstring's warm-up note.
-    "min_gap_pct": 0.004,
-    "stop_gap_frac": 0.75,
-    "target_frac": 0.75,
+    # All three are real points the intended grid searches (trend_ma
+    # 960/1440/1920, dip_lookback 96/192/288, dip_frac 0.5/0.75/1.0/1.5), so
+    # the post-edit sanity check exercises a genuine combo. trend_ma and
+    # dip_lookback are ints because they ARE bar counts and are meant to size
+    # wfo_engine's warm-up buffer; dip_frac is a float fraction of the
+    # volatility unit and must not.
+    "trend_ma": 960,
+    "dip_lookback": 96,
+    "dip_frac": 0.5,
     "session": "New York",
 }

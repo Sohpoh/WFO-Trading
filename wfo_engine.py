@@ -42,66 +42,68 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(min_gap_pcts, stop_gap_fracs, target_fracs, session) -> list[dict]:
+def build_grid(trend_mas, dip_lookbacks, dip_fracs, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
     Three params are searched, and they are the strategy's only three degrees
     of freedom:
-      - `min_gap_pct` — how far below the previous UTC day's final close the
-        current Close has to sit before the gap is worth fading (the lower
-        edge of the entry band).
-      - `stop_gap_frac` — the hard stop, as a fraction of that gap distance,
-        measured from the entry Close.
-      - `target_frac` — the profit target, as a fraction of the way back up to
-        the anchor (1.0 = the literal full fill).
+      - `trend_ma` - length (in bars) of the simple moving average that
+        defines "we are in an uptrend". Close must be above it to arm.
+      - `dip_lookback` - how far back (in bars) the rolling high is taken from
+        when measuring how deep the current pullback is.
+      - `dip_frac` - how deep that pullback has to be, expressed in units of
+        the trailing average daily range, before the dip is worth buying.
 
     One param is fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md).
 
-    The band's UPPER edge is not here at all: it is `strategy.BAND_CAP_MULT`
-    (3.0x `min_gap_pct`), a module constant deliberately kept off the search
-    axes so the entry keeps exactly one width degree of freedom. Beyond 3x the
-    threshold the overnight move is read as news rather than a fadeable
-    overshoot, and that cap is also what bounds re-arming after a stop-out.
+    The volatility unit itself is not here at all: `strategy.RANGE_WINDOW`
+    (96 bars, one UTC day at 15min) and `strategy.VOL_WINDOW` (480 bars, ~5
+    days) are module constants deliberately kept off the search axes, so the
+    depth threshold keeps exactly one width degree of freedom (`dip_frac`).
+    There is no stop param and no target param either - the exit is the
+    session flatten, nothing else.
 
-    No cross-param filter is applied, and none is needed: every combination of
-    the three is a valid strategy (there is no degenerate pair the way a
-    `fast_ma >= slow_ma` pair would be), so no CLI override can silently empty
-    the grid.
+    No cross-param filter is applied and none is needed: every combination is
+    a valid strategy (there is no degenerate pair the way a `fast_ma >=
+    slow_ma` pair would be), so no CLI override can silently empty the grid.
+    `dip_lookback` may exceed or undercut `trend_ma` freely; both orderings
+    are meaningful.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - ALL THREE are cast to `float` **on purpose**. `min_gap_pct` is a
-        return threshold; `stop_gap_frac` and `target_frac` are fractions of a
-        price distance. None is a bar count, so none should feed the
-        pre-test-window warm-up buffer. The casts are defensive: a grid point
-        hand-written as `1` would otherwise arrive as an `int` and inflate
-        that buffer for no reason.
-      - Consequently `_max_lookback_bars()` returns **0** for this grid, which
-        INVERTS the coverage hazard every previous iteration warned about:
-        `run_walk_forward()`'s fold-skip guard drops to `len(train_df) < 10`,
-        trivially met at every timeframe, so no fold can be silently skipped
-        and there is no "must use --timeframe 15min" constraint here.
-      - The warm-up buffer therefore collapses to `_bars_per_day(df) + 5` —
-        precisely the day-anchored floor that function exists for, since this
-        strategy's only history requirement is day-boundary-anchored rather
-        than an N-bar rolling window. That leg is invisible to
-        `_max_lookback_bars()` and so is hand-checked, in
-        `strategy.py`'s module docstring: the true requirement is at most
-        (bars of the current UTC day preceding `test_start`) + 1 = the max
-        bars in one UTC day. Measured on the local NQ frame (median/max bars
-        per UTC day -> buffer vs. requirement): 1min 1380/1380 -> 1385 vs
-        1380; 5min 276/276 -> 281 vs 276; 15min 92/92 -> 97 vs 92; 1h 23/23 ->
-        28 vs 23; 4h 6/6 -> 15 vs 6. Every timeframe clears it. If one ever
-        did not, the failure is a NaN anchor -> no entry on the first bars of
-        a test window: missed trades, never lookahead.
+      - `trend_ma` and `dip_lookback` are cast to `int` **on purpose**. They
+        are genuine bar-count lookbacks, so they are exactly what
+        `_max_lookback_bars()` is meant to see when it sizes the
+        pre-test-window warm-up buffer.
+      - `dip_frac` is cast to `float` **on purpose**. It is a fraction of the
+        volatility unit, not a bar count, so it must never feed that buffer.
+        The cast is defensive: a grid point hand-written as `1` would
+        otherwise arrive as an `int` and be read as a bar count.
+      - Consequently `_max_lookback_bars()` returns max(trend_mas +
+        dip_lookbacks) = 1920 at the intended grid, the buffer is
+        max((1920 + 5) * 3, bars_per_day + 5) = 5,775 bars, and
+        `run_walk_forward()`'s fold-skip guard is `len(train_df) < 1930`.
+        A 12-week train window at 15min is ~7,700 bars, so no fold is skipped
+        - but this strategy IS TIMEFRAME-SENSITIVE: at 1h a 12-week train
+        window is only ~1,930 bars (right on the guard, so real folds get
+        silently skipped) and at 4h/1d every fold is skipped. Run it at
+        `--timeframe 15min`.
+      - Hand-check for the leg `_max_lookback_bars()` cannot see (the module
+        constants above never appear in the grid): `strategy.volatility_unit`
+        needs RANGE_WINDOW + VOL_WINDOW = 96 + 480 = 576 bars of history
+        before it is non-NaN. The smallest buffer this grid can produce is
+        (960 + 5) * 3 = 2,895 bars, which clears 576 at every grid corner. If
+        it ever did not, the failure is a NaN volatility unit -> comparison
+        False -> no entry on the first bars of a test window: missed trades,
+        never lookahead.
     """
     grid = []
-    for min_gap_pct, stop_gap_frac, target_frac in product(min_gap_pcts, stop_gap_fracs, target_fracs):
+    for trend_ma, dip_lookback, dip_frac in product(trend_mas, dip_lookbacks, dip_fracs):
         grid.append(
             {
-                "min_gap_pct": float(min_gap_pct),
-                "stop_gap_frac": float(stop_gap_frac),
-                "target_frac": float(target_frac),
+                "trend_ma": int(trend_ma),
+                "dip_lookback": int(dip_lookback),
+                "dip_frac": float(dip_frac),
                 "session": session,
             }
         )

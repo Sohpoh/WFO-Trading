@@ -69,52 +69,63 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only overnight gap-down fill buy: the anchor is the Close of "
-        "the final bar of the PREVIOUS completed UTC day, broadcast forward across the "
-        "current UTC day — session-unaware and strictly backward-looking. A bar arms a "
-        "LONG when its Close sits between --min-gap-pct and 3x --min-gap-pct BELOW that "
-        "anchor; the 3x upper edge is strategy.BAND_CAP_MULT, a module constant that is "
-        "deliberately NOT searched (beyond it the move is read as news, not a fadeable "
-        "overshoot). There is NO short leg — a gap-up day pays zero cost legs instead of "
-        "the two a short would cost. The exit is path-dependent and routed through "
-        "session.apply_session_constraint_with_stops: a bounded profit target at "
-        "--target-frac of the way back up to the anchor (1.0 = the literal full fill) "
-        "and a hard stop --stop-gap-frac of the same gap distance below the entry Close, "
-        "with session.py force-flattening any survivor on the session's last bar. The "
-        "arming condition is a dense STATE, not a crossing — the gap forms overnight, "
-        "outside the session — so a stopped-out trade can re-arm on a later in-session "
-        "bar while price is still inside the band; the 3x cap is what bounds that to a "
-        "few attempts rather than unlimited averaging-down)"
+        "strategy grid (long-only swing-horizon pullback buy: a bar arms a LONG when BOTH "
+        "(a) Close is above its --trend-ma bar simple moving average, i.e. the multi-week "
+        "uptrend is intact, and (b) Close sits at least --dip-frac trailing-daily-ranges "
+        "BELOW the highest High of the previous --dip-lookback bars, i.e. the pullback is "
+        "deep enough to be worth buying. The volatility unit is the 480-bar average of the "
+        "trailing 96-bar high-low range (strategy.RANGE_WINDOW / strategy.VOL_WINDOW, "
+        "module constants that are deliberately NOT searched, so depth keeps exactly one "
+        "degree of freedom). Both rolling extrema are shifted one bar so the threshold is "
+        "never self-referential on a spike bar. There is NO short leg — a non-qualifying "
+        "day pays zero cost legs instead of the two a short would cost. The exit is a "
+        "plain hold to the session flatten via session.apply_session_constraint: NO stop "
+        "and NO target, upside uncapped, duration bounded by the session, one round trip "
+        "per armed session. The arming condition is a dense STATE, not a crossing — a "
+        "pullback can deepen overnight, outside the session — and because raw entries are "
+        "NaN rather than False on non-qualifying bars, an open position is HELD through "
+        "them until session.py force-flattens on the session's last bar. NOTE: --trend-ma "
+        "and --dip-lookback are genuine bar counts and size wfo_engine's warm-up buffer, "
+        "so this grid is timeframe-sensitive — see --trend-ma)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--min-gap-pct", default="0.004,0.006,0.009,0.013",
-                        help="comma-separated gap-down thresholds as fractions of the anchor "
-                             "(0.004 = 0.40%%), i.e. the LOWER edge of the entry band; the upper "
-                             "edge is always 3x this and is not searchable. Passed as floats — "
-                             "these are return thresholds, not bar counts, so they must not feed "
-                             "wfo_engine's warm-up buffer. The 0.40%% floor is the cost "
-                             "discipline: with --target-frac >= 0.75 the smallest implied target "
-                             "is ~30bps against metrics.py's ~10.2bps round-trip toll (~2.9x, "
-                             "~3.9x at target_frac 1.0). Lowering it below 0.004 gives that "
-                             "margin away")
-    strat.add_argument("--stop-gap-frac", default="0.5,0.75,1.0",
-                        help="comma-separated hard-stop distances, as fractions of the gap "
-                             "distance (anchor - entry Close), measured from the entry Close and "
-                             "frozen there by session.py (hard, not trailing). Floats, not bar "
-                             "counts. 1.0 puts the stop a full gap-width below entry")
-    strat.add_argument("--target-frac", default="0.75,1.0",
-                        help="comma-separated profit targets, as fractions of the way back up to "
-                             "the anchor: 1.0 is the literal full gap fill, 0.75 a partial fill. "
-                             "Floats, not bar counts. Always > 0 so the target is strictly above "
-                             "the entry Close by construction, satisfying "
-                             "apply_session_constraint_with_stops' target_price > close guard. "
-                             "NOTE: unlike previous iterations, every searched param here is a "
-                             "float, so wfo_engine's _max_lookback_bars() returns 0, the warm-up "
-                             "buffer falls back to the one-day floor (bars_per_day + 5 = 97 at "
-                             "NQ 15min, enough for the prior-day anchor) and the fold-skip guard "
-                             "drops to 10 train bars — there is no timeframe here that silently "
-                             "skips every fold")
+    strat.add_argument("--trend-ma", default="960,1440,1920",
+                        help="comma-separated simple-moving-average lengths IN BARS for the "
+                             "uptrend gate; Close must be above the SMA for a bar to arm. At "
+                             "15min these are ~10/15/20 UTC days — deliberately slow, since the "
+                             "one clean robust run in this repo had its two slowest formation "
+                             "values take 41 of 48 folds. Parsed as ints ON PURPOSE: they are "
+                             "real lookbacks and are meant to feed wfo_engine's warm-up buffer. "
+                             "TIMEFRAME WARNING: at the 1920 top of this grid the buffer is "
+                             "(1920+5)*3 = 5,775 bars and run_walk_forward()'s fold-skip guard "
+                             "becomes len(train_df) < 1930. A 12-week train window is ~7,700 "
+                             "bars at 15min (fine, and that is the intended timeframe) but only "
+                             "~1,930 bars at 1h — right on the guard, so folds get SILENTLY "
+                             "SKIPPED there — and far below it at 4h/1d, where every fold is "
+                             "skipped. Always pass --timeframe 15min")
+    strat.add_argument("--dip-lookback", default="96,192,288",
+                        help="comma-separated lookbacks IN BARS for the rolling high that "
+                             "pullback depth is measured down from (the high is shifted one bar "
+                             "so the current bar's own High cannot set its own reference). At "
+                             "15min these are ~1/2/3 UTC days. Parsed as ints ON PURPOSE — same "
+                             "reason as --trend-ma. May be longer or shorter than --trend-ma; "
+                             "both orderings are meaningful and no combination is degenerate")
+    strat.add_argument("--dip-frac", default="0.5,0.75,1.0,1.5",
+                        help="comma-separated pullback depths, in units of the trailing average "
+                             "daily range (0.5 = half a normal day of movement below the rolling "
+                             "high). Floats, NOT bar counts, so they must not feed the warm-up "
+                             "buffer. The 0.5 floor is the cost discipline: measured on the local "
+                             "NQ 15min frame that is a ~0.95%% pullback at the median against "
+                             "metrics.py's ~10.2bps round-trip toll (~9x), on a single round trip "
+                             "held across an RTH range of ~1.0-1.3%%. Lowering it below 0.5 gives "
+                             "that margin away. Note the top of this range is thin AND is not "
+                             "screened out by the engine: at 1.5 with --trend-ma 960 "
+                             "--dip-lookback 96 the strategy arms on only 11 days in four years, "
+                             "and wfo_engine's guard rejects a combo only below 2 position "
+                             "changes (= one complete round trip), so a single lucky train trade "
+                             "can still win a fold. On a 2024-only 12w/3w run, dip_frac 1.5 won "
+                             "8 of 13 folds and 6 of 13 folds took zero OOS trades")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -165,10 +176,13 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        min_gap_pcts = parse_num_list(args.min_gap_pct, float)
-        stop_gap_fracs = parse_num_list(args.stop_gap_frac, float)
-        target_fracs = parse_num_list(args.target_frac, float)
-        grid = build_grid(min_gap_pcts, stop_gap_fracs, target_fracs, session)
+        # trend_ma / dip_lookback are cast to int (genuine bar-count lookbacks
+        # that are meant to size wfo_engine's warm-up buffer); dip_frac is a
+        # float fraction of the volatility unit and must never feed it.
+        trend_mas = parse_num_list(args.trend_ma, int)
+        dip_lookbacks = parse_num_list(args.dip_lookback, int)
+        dip_fracs = parse_num_list(args.dip_frac, float)
+        grid = build_grid(trend_mas, dip_lookbacks, dip_fracs, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -211,16 +225,17 @@ def main(argv=None) -> int:
     if chosen:
         # Only the three grid-searched params are reported here; `session` is
         # fixed across every combo, so its "distinct values" would always be 1
-        # and carry no stability information. (strategy.BAND_CAP_MULT is a
-        # module constant, not a param, so it never appears in best_params.)
-        min_gap_vals = sorted({p["min_gap_pct"] for p in chosen})
-        stop_frac_vals = sorted({p["stop_gap_frac"] for p in chosen})
-        target_frac_vals = sorted({p["target_frac"] for p in chosen})
+        # and carry no stability information. (strategy.RANGE_WINDOW and
+        # strategy.VOL_WINDOW are module constants, not params, so they never
+        # appear in best_params.)
+        trend_ma_vals = sorted({p["trend_ma"] for p in chosen})
+        dip_lookback_vals = sorted({p["dip_lookback"] for p in chosen})
+        dip_frac_vals = sorted({p["dip_frac"] for p in chosen})
         print(
-            f"Fold param stability: {len(min_gap_vals)} distinct min gap pct "
-            f"{min_gap_vals}, {len(stop_frac_vals)} distinct stop gap frac "
-            f"{stop_frac_vals}, {len(target_frac_vals)} distinct target frac "
-            f"{target_frac_vals}"
+            f"Fold param stability: {len(trend_ma_vals)} distinct trend ma "
+            f"{trend_ma_vals}, {len(dip_lookback_vals)} distinct dip lookback "
+            f"{dip_lookback_vals}, {len(dip_frac_vals)} distinct dip frac "
+            f"{dip_frac_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -254,9 +269,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "min_gap_pct": f.best_params.get("min_gap_pct"),
-                "stop_gap_frac": f.best_params.get("stop_gap_frac"),
-                "target_frac": f.best_params.get("target_frac"),
+                "trend_ma": f.best_params.get("trend_ma"),
+                "dip_lookback": f.best_params.get("dip_lookback"),
+                "dip_frac": f.best_params.get("dip_frac"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
