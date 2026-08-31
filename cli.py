@@ -6,17 +6,18 @@ Useful for batch runs, cron/CI, or piping results into other tools instead of
 clicking through the sidebar every time.
 
 Examples:
-    # the strategy's intended config (NQ 15min, New York session). NOTE: this
-    # strategy's slow MA grid tops out at 1728 bars, so wfo_engine's fold-skip
-    # guard needs >= 1738 bars of train window — 15min clears it (~5,500 per
-    # 12 weeks), the 1h default does NOT and yields zero folds. Always pass
-    # --timeframe 15min.
+    # the strategy's intended config (NQ 15min, New York session). NQ over ES
+    # on purpose: ES's smaller overnight moves would starve the 0.40% floor on
+    # --min-gap-pct. Every searched param is a float, so wfo_engine's warm-up
+    # buffer comes from the one-day floor (~97 bars at 15min) and its fold-skip
+    # guard drops to 10 bars of train window — unlike previous iterations there
+    # is no timeframe that silently skips every fold.
     python cli.py --symbol NQ --timeframe 15min --train-weeks 12 --test-weeks 3
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --fast-ma 192,288,384 --slow-ma 768,1152,1728 \\
-        --train-weeks 12 --test-weeks 3
+        --min-gap-pct 0.004,0.006,0.009,0.013 --stop-gap-frac 0.5,0.75,1.0 \\
+        --target-frac 0.75,1.0 --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
     python cli.py --source yfinance --symbol NQ=F --timeframe 1d
@@ -68,43 +69,52 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only dual-horizon moving-average trend state: two simple "
-        "moving averages of Close, over --fast-ma and --slow-ma bars, are compared "
-        "against each other. The trend state is True where SMA_fast > SMA_slow (strict), "
-        "and the position is exactly that state — LONG while it holds, FLAT the bar it "
-        "stops holding. There is NO short leg, so a downtrend pays no cost legs at all "
-        "instead of paying two to reverse. Exit is a plain flip to flat: no stop, no "
-        "profit target, no path dependence, so a still-trending winner runs uncapped to "
-        "session.py's forced end-of-session flatten. The fast grid floors at 192 bars — "
-        "far longer than the 26-bar New York session at 15min — so the state cannot flip "
-        "inside a session; every fast/slow pair is a multi-session state with 2x-9x "
-        "horizon separation, which is the cost-drag discipline built into the grid "
-        "instead of into a filter. No vol gate and no trend filter are applied)"
+        "strategy grid (long-only overnight gap-down fill buy: the anchor is the Close of "
+        "the final bar of the PREVIOUS completed UTC day, broadcast forward across the "
+        "current UTC day — session-unaware and strictly backward-looking. A bar arms a "
+        "LONG when its Close sits between --min-gap-pct and 3x --min-gap-pct BELOW that "
+        "anchor; the 3x upper edge is strategy.BAND_CAP_MULT, a module constant that is "
+        "deliberately NOT searched (beyond it the move is read as news, not a fadeable "
+        "overshoot). There is NO short leg — a gap-up day pays zero cost legs instead of "
+        "the two a short would cost. The exit is path-dependent and routed through "
+        "session.apply_session_constraint_with_stops: a bounded profit target at "
+        "--target-frac of the way back up to the anchor (1.0 = the literal full fill) "
+        "and a hard stop --stop-gap-frac of the same gap distance below the entry Close, "
+        "with session.py force-flattening any survivor on the session's last bar. The "
+        "arming condition is a dense STATE, not a crossing — the gap forms overnight, "
+        "outside the session — so a stopped-out trade can re-arm on a later in-session "
+        "bar while price is still inside the band; the 3x cap is what bounds that to a "
+        "few attempts rather than unlimited averaging-down)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--fast-ma", default="192,288,384",
-                        help="comma-separated FAST simple-moving-average lengths, in bars. "
-                             "Genuine bar-count lookbacks, passed as ints, so they feed "
-                             "wfo_engine's pre-test-window warm-up buffer (though --slow-ma, "
-                             "being larger, is what actually sizes it). The floor of 192 is "
-                             "deliberate: the New York session is only 26 bars at 15min, so a "
-                             "192-bar fast MA cannot flip state within one session, which keeps "
-                             "the fixed ~10.2bps per-round-trip toll from being paid on "
-                             "intra-session churn")
-    strat.add_argument("--slow-ma", default="768,1152,1728",
-                        help="comma-separated SLOW simple-moving-average lengths, in bars — the "
-                             "reference the fast MA is compared against. Also ints, and as the "
-                             "largest int in the grid this alone sizes the warm-up buffer to "
-                             "(1728+5)*3 = 5199 bars, covering the true requirement of "
-                             "slow_ma = 1728. COVERAGE HAZARD: it also sets wfo_engine's "
-                             "fold-skip guard at max_lookback + 10 = 1738 bars of TRAIN window. "
-                             "A 12-week train window is ~5,500 bars at 15min (comfortable) but "
-                             "only ~1,380 at 1h and ~345 at 4h — at either of those EVERY fold "
-                             "is silently skipped and the run reports 0/N folds, so use "
-                             "--timeframe 15min (note that --timeframe still DEFAULTS to 1h). "
-                             "Re-check both numbers before raising this or coarsening the "
-                             "timeframe")
+    strat.add_argument("--min-gap-pct", default="0.004,0.006,0.009,0.013",
+                        help="comma-separated gap-down thresholds as fractions of the anchor "
+                             "(0.004 = 0.40%%), i.e. the LOWER edge of the entry band; the upper "
+                             "edge is always 3x this and is not searchable. Passed as floats — "
+                             "these are return thresholds, not bar counts, so they must not feed "
+                             "wfo_engine's warm-up buffer. The 0.40%% floor is the cost "
+                             "discipline: with --target-frac >= 0.75 the smallest implied target "
+                             "is ~30bps against metrics.py's ~10.2bps round-trip toll (~2.9x, "
+                             "~3.9x at target_frac 1.0). Lowering it below 0.004 gives that "
+                             "margin away")
+    strat.add_argument("--stop-gap-frac", default="0.5,0.75,1.0",
+                        help="comma-separated hard-stop distances, as fractions of the gap "
+                             "distance (anchor - entry Close), measured from the entry Close and "
+                             "frozen there by session.py (hard, not trailing). Floats, not bar "
+                             "counts. 1.0 puts the stop a full gap-width below entry")
+    strat.add_argument("--target-frac", default="0.75,1.0",
+                        help="comma-separated profit targets, as fractions of the way back up to "
+                             "the anchor: 1.0 is the literal full gap fill, 0.75 a partial fill. "
+                             "Floats, not bar counts. Always > 0 so the target is strictly above "
+                             "the entry Close by construction, satisfying "
+                             "apply_session_constraint_with_stops' target_price > close guard. "
+                             "NOTE: unlike previous iterations, every searched param here is a "
+                             "float, so wfo_engine's _max_lookback_bars() returns 0, the warm-up "
+                             "buffer falls back to the one-day floor (bars_per_day + 5 = 97 at "
+                             "NQ 15min, enough for the prior-day anchor) and the fold-skip guard "
+                             "drops to 10 train bars — there is no timeframe here that silently "
+                             "skips every fold")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -155,9 +165,10 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        fast_mas = parse_num_list(args.fast_ma, int)
-        slow_mas = parse_num_list(args.slow_ma, int)
-        grid = build_grid(fast_mas, slow_mas, session)
+        min_gap_pcts = parse_num_list(args.min_gap_pct, float)
+        stop_gap_fracs = parse_num_list(args.stop_gap_frac, float)
+        target_fracs = parse_num_list(args.target_frac, float)
+        grid = build_grid(min_gap_pcts, stop_gap_fracs, target_fracs, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -198,15 +209,18 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the two grid-searched params are reported here; `session` is
+        # Only the three grid-searched params are reported here; `session` is
         # fixed across every combo, so its "distinct values" would always be 1
-        # and carry no stability information.
-        fast_ma_vals = sorted({p["fast_ma"] for p in chosen})
-        slow_ma_vals = sorted({p["slow_ma"] for p in chosen})
+        # and carry no stability information. (strategy.BAND_CAP_MULT is a
+        # module constant, not a param, so it never appears in best_params.)
+        min_gap_vals = sorted({p["min_gap_pct"] for p in chosen})
+        stop_frac_vals = sorted({p["stop_gap_frac"] for p in chosen})
+        target_frac_vals = sorted({p["target_frac"] for p in chosen})
         print(
-            f"Fold param stability: {len(fast_ma_vals)} distinct fast MA "
-            f"{fast_ma_vals}, {len(slow_ma_vals)} distinct slow MA "
-            f"{slow_ma_vals}"
+            f"Fold param stability: {len(min_gap_vals)} distinct min gap pct "
+            f"{min_gap_vals}, {len(stop_frac_vals)} distinct stop gap frac "
+            f"{stop_frac_vals}, {len(target_frac_vals)} distinct target frac "
+            f"{target_frac_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -240,8 +254,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "fast_ma": f.best_params.get("fast_ma"),
-                "slow_ma": f.best_params.get("slow_ma"),
+                "min_gap_pct": f.best_params.get("min_gap_pct"),
+                "stop_gap_frac": f.best_params.get("stop_gap_frac"),
+                "target_frac": f.best_params.get("target_frac"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

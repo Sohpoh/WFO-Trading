@@ -42,50 +42,66 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(fast_mas, slow_mas, session) -> list[dict]:
+def build_grid(min_gap_pcts, stop_gap_fracs, target_fracs, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched, and they are the strategy's only two degrees of
-    freedom: `fast_ma` and `slow_ma`, the two simple-moving-average bar counts
-    whose relationship *is* the signal (long while `SMA_fast > SMA_slow`, flat
-    otherwise — a plain flip to flat, no short leg, no stop, no profit target,
-    so a winner runs uncapped to `session.py`'s forced flatten).
+    Three params are searched, and they are the strategy's only three degrees
+    of freedom:
+      - `min_gap_pct` — how far below the previous UTC day's final close the
+        current Close has to sit before the gap is worth fading (the lower
+        edge of the entry band).
+      - `stop_gap_frac` — the hard stop, as a fraction of that gap distance,
+        measured from the entry Close.
+      - `target_frac` — the profit target, as a fraction of the way back up to
+        the anchor (1.0 = the literal full fill).
 
     One param is fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md).
 
-    No `fast_ma < slow_ma` filter is applied. Every value in the intended
-    fast grid (192/288/384) is below every value in the intended slow grid
-    (768/1152/1728), so no degenerate combo exists there; adding a filter
-    would only create a way for a CLI override to silently empty the grid.
+    The band's UPPER edge is not here at all: it is `strategy.BAND_CAP_MULT`
+    (3.0x `min_gap_pct`), a module constant deliberately kept off the search
+    axes so the entry keeps exactly one width degree of freedom. Beyond 3x the
+    threshold the overnight move is read as news rather than a fadeable
+    overshoot, and that cap is also what bounds re-arming after a stop-out.
+
+    No cross-param filter is applied, and none is needed: every combination of
+    the three is a valid strategy (there is no degenerate pair the way a
+    `fast_ma >= slow_ma` pair would be), so no CLI override can silently empty
+    the grid.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `fast_ma` and `slow_ma` are both cast to plain `int` **on purpose** —
-        both are genuine bar counts and both should feed the pre-test-window
-        warm-up buffer. This strategy has no incidentally-integer,
-        non-lookback param, so nothing here can inflate that buffer wrongly.
-      - `slow_ma` is the larger, so it alone sizes that buffer: at the grid
-        max of 1728, `buffer_bars = max((1728 + 5) * 3, day_bars + 5)` = 5199
-        bars, well past the strategy's true requirement of `slow_ma` = 1728.
-
-    COVERAGE HAZARD — do not raise `slow_ma` (and be careful pointing this
-    strategy at a coarse timeframe) without redoing this arithmetic:
-    `run_walk_forward()` below skips any fold whose train window holds fewer
-    than `max_lookback + 10` bars, i.e. **1738** here. A 12-week train window
-    at 15min is ~5,500 bars and a 3-week test window ~1,400, so the guard is
-    comfortable at the intended timeframe (NQ 15min). It is NOT comfortable
-    anywhere coarser: 1h gives ~1,380 bars per 12-week train window and 4h
-    ~345, so at either one EVERY fold is silently skipped — the iteration-31
-    failure mode. Note that `cli.py`'s `--timeframe` still defaults to 1h, so
-    a bare `python cli.py` with this grid produces zero folds; pass
-    `--timeframe 15min` (or lengthen `--train-weeks`).
+      - ALL THREE are cast to `float` **on purpose**. `min_gap_pct` is a
+        return threshold; `stop_gap_frac` and `target_frac` are fractions of a
+        price distance. None is a bar count, so none should feed the
+        pre-test-window warm-up buffer. The casts are defensive: a grid point
+        hand-written as `1` would otherwise arrive as an `int` and inflate
+        that buffer for no reason.
+      - Consequently `_max_lookback_bars()` returns **0** for this grid, which
+        INVERTS the coverage hazard every previous iteration warned about:
+        `run_walk_forward()`'s fold-skip guard drops to `len(train_df) < 10`,
+        trivially met at every timeframe, so no fold can be silently skipped
+        and there is no "must use --timeframe 15min" constraint here.
+      - The warm-up buffer therefore collapses to `_bars_per_day(df) + 5` —
+        precisely the day-anchored floor that function exists for, since this
+        strategy's only history requirement is day-boundary-anchored rather
+        than an N-bar rolling window. That leg is invisible to
+        `_max_lookback_bars()` and so is hand-checked, in
+        `strategy.py`'s module docstring: the true requirement is at most
+        (bars of the current UTC day preceding `test_start`) + 1 = the max
+        bars in one UTC day. Measured on the local NQ frame (median/max bars
+        per UTC day -> buffer vs. requirement): 1min 1380/1380 -> 1385 vs
+        1380; 5min 276/276 -> 281 vs 276; 15min 92/92 -> 97 vs 92; 1h 23/23 ->
+        28 vs 23; 4h 6/6 -> 15 vs 6. Every timeframe clears it. If one ever
+        did not, the failure is a NaN anchor -> no entry on the first bars of
+        a test window: missed trades, never lookahead.
     """
     grid = []
-    for fast_ma, slow_ma in product(fast_mas, slow_mas):
+    for min_gap_pct, stop_gap_frac, target_frac in product(min_gap_pcts, stop_gap_fracs, target_fracs):
         grid.append(
             {
-                "fast_ma": int(fast_ma),
-                "slow_ma": int(slow_ma),
+                "min_gap_pct": float(min_gap_pct),
+                "stop_gap_frac": float(stop_gap_frac),
+                "target_frac": float(target_frac),
                 "session": session,
             }
         )
