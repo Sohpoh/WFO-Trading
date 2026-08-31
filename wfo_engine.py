@@ -42,58 +42,50 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dict]:
+def build_grid(fast_mas, slow_mas, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched: `formation_lookback` (how many completed bars the
-    momentum statistic `Close_t / Close_{t-n} - 1` measures over) and
-    `rank_pct` (how deep into the trailing distribution of that statistic a
-    bar has to rank before the strategy goes long). Nothing else is tunable:
-    the strategy's exit is a momentum-decay flip to flat when that same
-    formation return falls below its own trailing median (`EXIT_PCT = 0.5`, a
-    module constant in `strategy.py`, deliberately NOT a searched axis — the
-    family's diagnosed failure mode is an overfit gap, so the exit is kept at
-    zero degrees of freedom). There is no stop and no profit target, so a
-    winner still runs uncapped to `session.py`'s forced flatten.
+    Two params are searched, and they are the strategy's only two degrees of
+    freedom: `fast_ma` and `slow_ma`, the two simple-moving-average bar counts
+    whose relationship *is* the signal (long while `SMA_fast > SMA_slow`, flat
+    otherwise — a plain flip to flat, no short leg, no stop, no profit target,
+    so a winner runs uncapped to `session.py`'s forced flatten).
 
-    Two params are fixed and threaded into every combo as-is, never searched:
-    `session` (required by CLAUDE.md) and `rank_window`.
+    One param is fixed and threaded into every combo as-is, never searched:
+    `session` (required by CLAUDE.md).
+
+    No `fast_ma < slow_ma` filter is applied. Every value in the intended
+    fast grid (192/288/384) is below every value in the intended slow grid
+    (768/1152/1728), so no degenerate combo exists there; adding a filter
+    would only create a way for a CLI override to silently empty the grid.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `formation_lookback` and `rank_window` are both cast to plain `int`
-        **on purpose** — both are genuine bar counts and both should feed the
-        pre-test-window warm-up buffer.
-      - `rank_window` is the larger, so it is what sizes that buffer:
-        `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895 bars, which
-        covers the strategy's true requirement of
-        `rank_window + max(formation_lookback)` = 960 + 384 = 1344 at the top
-        of the current (slow-end) formation grid 96/192/288/384. Both the
-        entry threshold and the decay-exit threshold are quantiles of the
-        same `rank_window` rolling window over the same formation return, so
-        that single number is the whole warm-up story — there is no longer a
-        second, module-constant window (iteration 34's 96/960 daily range for
-        its stop) that `_max_lookback_bars()` cannot see and that had to be
-        hand-checked.
-      - `rank_pct` is cast to `float` on purpose — it is a quantile level in
-        (0, 1), never a bar count. The cast is defensive: a grid point written
-        as `1` would otherwise arrive as an `int` and inflate the buffer.
+      - `fast_ma` and `slow_ma` are both cast to plain `int` **on purpose** —
+        both are genuine bar counts and both should feed the pre-test-window
+        warm-up buffer. This strategy has no incidentally-integer,
+        non-lookback param, so nothing here can inflate that buffer wrongly.
+      - `slow_ma` is the larger, so it alone sizes that buffer: at the grid
+        max of 1728, `buffer_bars = max((1728 + 5) * 3, day_bars + 5)` = 5199
+        bars, well past the strategy's true requirement of `slow_ma` = 1728.
 
-    COVERAGE HAZARD — do not raise `rank_window` (and be careful pointing this
+    COVERAGE HAZARD — do not raise `slow_ma` (and be careful pointing this
     strategy at a coarse timeframe) without redoing this arithmetic:
     `run_walk_forward()` below skips any fold whose train window holds fewer
-    than `max_lookback + 10` bars, i.e. 970 here. A 12-week train window at
-    15min is ~5,700 bars and a 3-week test window ~1,900, so the guard is
-    comfortable at the intended timeframe. 1h (~1,400 bars per 12-week train
-    window) still clears it, with ~40% headroom; 4h (~350) does not, and every
-    fold there would be silently skipped — the iteration-31 failure mode.
+    than `max_lookback + 10` bars, i.e. **1738** here. A 12-week train window
+    at 15min is ~5,500 bars and a 3-week test window ~1,400, so the guard is
+    comfortable at the intended timeframe (NQ 15min). It is NOT comfortable
+    anywhere coarser: 1h gives ~1,380 bars per 12-week train window and 4h
+    ~345, so at either one EVERY fold is silently skipped — the iteration-31
+    failure mode. Note that `cli.py`'s `--timeframe` still defaults to 1h, so
+    a bare `python cli.py` with this grid produces zero folds; pass
+    `--timeframe 15min` (or lengthen `--train-weeks`).
     """
     grid = []
-    for formation_lookback, rank_pct in product(formation_lookbacks, rank_pcts):
+    for fast_ma, slow_ma in product(fast_mas, slow_mas):
         grid.append(
             {
-                "formation_lookback": int(formation_lookback),
-                "rank_pct": float(rank_pct),
-                "rank_window": int(rank_window),
+                "fast_ma": int(fast_ma),
+                "slow_ma": int(slow_ma),
                 "session": session,
             }
         )

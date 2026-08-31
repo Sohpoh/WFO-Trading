@@ -6,13 +6,17 @@ Useful for batch runs, cron/CI, or piping results into other tools instead of
 clicking through the sidebar every time.
 
 Examples:
-    # the strategy's intended config (NQ 15min, New York session)
+    # the strategy's intended config (NQ 15min, New York session). NOTE: this
+    # strategy's slow MA grid tops out at 1728 bars, so wfo_engine's fold-skip
+    # guard needs >= 1738 bars of train window — 15min clears it (~5,500 per
+    # 12 weeks), the 1h default does NOT and yields zero folds. Always pass
+    # --timeframe 15min.
     python cli.py --symbol NQ --timeframe 15min --train-weeks 12 --test-weeks 3
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --formation-lookback 24,48,96,192 --rank-pct 0.80,0.875,0.925 \\
-        --rank-window 960 --train-weeks 12 --test-weeks 3
+        --fast-ma 192,288,384 --slow-ma 768,1152,1728 \\
+        --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
     python cli.py --source yfinance --symbol NQ=F --timeframe 1d
@@ -64,55 +68,43 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only percentile-rank momentum: each bar's formation return "
-        "Close_t/Close_{t-formation_lookback} - 1 is ranked against its own trailing "
-        "distribution — the rank_pct quantile of the same statistic over the previous "
-        "rank_window bars, current bar excluded. Top-quantile bars go LONG; there is NO "
-        "short leg, so a down-state simply pays no legs at all instead of paying two to "
-        "reverse. Exit is a momentum-decay flip to flat: the position is held while the "
-        "formation return stays above the 0.5 quantile (the trailing median) of that same "
-        "distribution and is closed the bar it drops below, so the entry-to-median band is "
-        "a hysteresis hold that rides out ordinary noise. There is no stop and no profit "
-        "target, so winners still run uncapped to session.py's forced flatten. The exit "
-        "quantile is a module constant in strategy.py and is NOT searched, so there is no "
-        "flag for it; because a decayed trade can re-enter later in the same session if "
-        "the rank climbs back above --rank-pct, a traded session is not exactly one round "
-        "trip)"
+        "strategy grid (long-only dual-horizon moving-average trend state: two simple "
+        "moving averages of Close, over --fast-ma and --slow-ma bars, are compared "
+        "against each other. The trend state is True where SMA_fast > SMA_slow (strict), "
+        "and the position is exactly that state — LONG while it holds, FLAT the bar it "
+        "stops holding. There is NO short leg, so a downtrend pays no cost legs at all "
+        "instead of paying two to reverse. Exit is a plain flip to flat: no stop, no "
+        "profit target, no path dependence, so a still-trending winner runs uncapped to "
+        "session.py's forced end-of-session flatten. The fast grid floors at 192 bars — "
+        "far longer than the 26-bar New York session at 15min — so the state cannot flip "
+        "inside a session; every fast/slow pair is a multi-session state with 2x-9x "
+        "horizon separation, which is the cost-drag discipline built into the grid "
+        "instead of into a filter. No vol gate and no trend filter are applied)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--formation-lookback", default="96,192,288,384",
-                        help="comma-separated momentum formation periods, in bars — how far back "
-                             "Close_t is compared to when measuring the return that gets ranked. "
+    strat.add_argument("--fast-ma", default="192,288,384",
+                        help="comma-separated FAST simple-moving-average lengths, in bars. "
                              "Genuine bar-count lookbacks, passed as ints, so they feed "
-                             "wfo_engine's pre-test-window warm-up buffer (though --rank-window, "
-                             "being larger, is what actually sizes it). The default grid is the "
-                             "SLOW end only: across the previous iteration's 48 folds the two "
-                             "slowest values took 41 of them (96 in 22, grid-max 192 in 19) while "
-                             "24 and 48 took 5 and 2, so the dead fast end is retired and 288/384 "
-                             "are opened above the old boundary. Do not push past ~384 with "
-                             "--rank-window at 960: the trailing quantile then rests on only "
-                             "~960/L (~2.5 at 384) independent non-overlapping observations and "
-                             "the threshold itself gets jumpy")
-    strat.add_argument("--rank-pct", default="0.80,0.875,0.925",
-                        help="comma-separated quantile levels in (0,1) — a bar goes long when its "
-                             "formation return is strictly above the rank_pct quantile of the "
-                             "trailing distribution, i.e. 0.90 means 'top decile'. Unlike every "
-                             "absolute threshold used in earlier iterations this re-scales itself "
-                             "with the volatility regime, so it should not churn across folds. "
-                             "Passed as floats and correctly ignored by the warm-up sizing")
-    strat.add_argument("--rank-window", type=int, default=960,
-                        help="FIXED, never grid-searched: how many trailing bars the rank "
-                             "threshold is computed over (960 = ~10 trading days of 15min bars). "
-                             "As the largest int in the grid this alone sizes the warm-up buffer "
-                             "to (960+5)*3 = 2895 bars, covering the true requirement of "
-                             "rank_window + max(formation_lookback) = 960 + 384 = 1344. Raising "
-                             "it also "
-                             "raises wfo_engine's fold-skip guard (max_lookback + 10 = 970 bars "
-                             "of train window); that is comfortable at 15min (~5,700 bars per "
-                             "12-week train window) and still clears at 1h (~1,400), but at 4h "
-                             "(~350) EVERY fold is silently skipped — so re-check both numbers "
-                             "before raising it or moving to a coarser timeframe")
+                             "wfo_engine's pre-test-window warm-up buffer (though --slow-ma, "
+                             "being larger, is what actually sizes it). The floor of 192 is "
+                             "deliberate: the New York session is only 26 bars at 15min, so a "
+                             "192-bar fast MA cannot flip state within one session, which keeps "
+                             "the fixed ~10.2bps per-round-trip toll from being paid on "
+                             "intra-session churn")
+    strat.add_argument("--slow-ma", default="768,1152,1728",
+                        help="comma-separated SLOW simple-moving-average lengths, in bars — the "
+                             "reference the fast MA is compared against. Also ints, and as the "
+                             "largest int in the grid this alone sizes the warm-up buffer to "
+                             "(1728+5)*3 = 5199 bars, covering the true requirement of "
+                             "slow_ma = 1728. COVERAGE HAZARD: it also sets wfo_engine's "
+                             "fold-skip guard at max_lookback + 10 = 1738 bars of TRAIN window. "
+                             "A 12-week train window is ~5,500 bars at 15min (comfortable) but "
+                             "only ~1,380 at 1h and ~345 at 4h — at either of those EVERY fold "
+                             "is silently skipped and the run reports 0/N folds, so use "
+                             "--timeframe 15min (note that --timeframe still DEFAULTS to 1h). "
+                             "Re-check both numbers before raising this or coarsening the "
+                             "timeframe")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -163,9 +155,9 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        formation_lookbacks = parse_num_list(args.formation_lookback, int)
-        rank_pcts = parse_num_list(args.rank_pct, float)
-        grid = build_grid(formation_lookbacks, rank_pcts, args.rank_window, session)
+        fast_mas = parse_num_list(args.fast_ma, int)
+        slow_mas = parse_num_list(args.slow_ma, int)
+        grid = build_grid(fast_mas, slow_mas, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -206,15 +198,15 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the two grid-searched params are reported here; `session` and
-        # `rank_window` are fixed across every combo, so their "distinct
-        # values" would always be 1 and carry no stability information.
-        formation_lookback_vals = sorted({p["formation_lookback"] for p in chosen})
-        rank_pct_vals = sorted({p["rank_pct"] for p in chosen})
+        # Only the two grid-searched params are reported here; `session` is
+        # fixed across every combo, so its "distinct values" would always be 1
+        # and carry no stability information.
+        fast_ma_vals = sorted({p["fast_ma"] for p in chosen})
+        slow_ma_vals = sorted({p["slow_ma"] for p in chosen})
         print(
-            f"Fold param stability: {len(formation_lookback_vals)} distinct formation lookback "
-            f"{formation_lookback_vals}, {len(rank_pct_vals)} distinct rank pct "
-            f"{rank_pct_vals}"
+            f"Fold param stability: {len(fast_ma_vals)} distinct fast MA "
+            f"{fast_ma_vals}, {len(slow_ma_vals)} distinct slow MA "
+            f"{slow_ma_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -248,8 +240,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "formation_lookback": f.best_params.get("formation_lookback"),
-                "rank_pct": f.best_params.get("rank_pct"),
+                "fast_ma": f.best_params.get("fast_ma"),
+                "slow_ma": f.best_params.get("slow_ma"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
