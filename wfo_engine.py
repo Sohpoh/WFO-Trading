@@ -42,68 +42,74 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(trend_mas, dip_lookbacks, dip_fracs, session) -> list[dict]:
+def build_grid(hurst_windows, drift_lookbacks, h_thresholds, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
     Three params are searched, and they are the strategy's only three degrees
     of freedom:
-      - `trend_ma` - length (in bars) of the simple moving average that
-        defines "we are in an uptrend". Close must be above it to arm.
-      - `dip_lookback` - how far back (in bars) the rolling high is taken from
-        when measuring how deep the current pullback is.
-      - `dip_frac` - how deep that pullback has to be, expressed in units of
-        the trailing average daily range, before the dip is worth buying.
+      - `hurst_window` - trailing bars (in bars) over which the multi-scale
+        variance-growth Hurst estimate is computed. 384/768/1152 bars are
+        ~4/8/12 UTC days at 15min.
+      - `drift_lookback` - bars of backward drift
+        (Close[t-1]/Close[t-1-drift_lookback] - 1) that must be positive for
+        the state to be on. 96/192/384 bars are ~1/2/4 UTC days at 15min.
+      - `h_threshold` - the Hurst persistence gate: the state is on only while
+        the estimated H is strictly above this value. Gridded (0.5/0.55/0.6)
+        rather than hardcoded because the naive overlapping variance-growth
+        estimator carries a known scale bias.
 
     One param is fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md).
 
-    The volatility unit itself is not here at all: `strategy.RANGE_WINDOW`
-    (96 bars, one UTC day at 15min) and `strategy.VOL_WINDOW` (480 bars, ~5
-    days) are module constants deliberately kept off the search axes, so the
-    depth threshold keeps exactly one width degree of freedom (`dip_frac`).
-    There is no stop param and no target param either - the exit is the
-    session flatten, nothing else.
+    The tau ladder itself is not here at all: `strategy.HURST_TAUS`
+    (1/2/4/8/16/32 bars) is a module constant deliberately kept off the search
+    axes, so the persistence gate keeps exactly one degree of freedom
+    (`h_threshold`). There is no stop param and no target param either - the
+    exit is the flip-to-flat state decay plus the session flatten, nothing
+    else.
 
     No cross-param filter is applied and none is needed: every combination is
     a valid strategy (there is no degenerate pair the way a `fast_ma >=
     slow_ma` pair would be), so no CLI override can silently empty the grid.
-    `dip_lookback` may exceed or undercut `trend_ma` freely; both orderings
-    are meaningful.
+    `drift_lookback` may exceed or undercut `hurst_window` freely; both
+    orderings are meaningful.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `trend_ma` and `dip_lookback` are cast to `int` **on purpose**. They
-        are genuine bar-count lookbacks, so they are exactly what
+      - `hurst_window` and `drift_lookback` are cast to `int` **on purpose**.
+        They are genuine bar-count lookbacks, so they are exactly what
         `_max_lookback_bars()` is meant to see when it sizes the
         pre-test-window warm-up buffer.
-      - `dip_frac` is cast to `float` **on purpose**. It is a fraction of the
-        volatility unit, not a bar count, so it must never feed that buffer.
-        The cast is defensive: a grid point hand-written as `1` would
-        otherwise arrive as an `int` and be read as a bar count.
-      - Consequently `_max_lookback_bars()` returns max(trend_mas +
-        dip_lookbacks) = 1920 at the intended grid, the buffer is
-        max((1920 + 5) * 3, bars_per_day + 5) = 5,775 bars, and
-        `run_walk_forward()`'s fold-skip guard is `len(train_df) < 1930`.
+      - `h_threshold` is cast to `float` **on purpose**. It is a Hurst gate,
+        not a bar count, so it must never feed that buffer. The cast is
+        defensive: a grid point hand-written as `1` would otherwise arrive as
+        an `int` and be read as a bar count.
+      - Consequently `_max_lookback_bars()` returns max(hurst_windows +
+        drift_lookbacks) = 1152 at the intended grid, the buffer is
+        max((1152 + 5) * 3, bars_per_day + 5) = 3,471 bars, and
+        `run_walk_forward()`'s fold-skip guard is `len(train_df) < 1162`.
         A 12-week train window at 15min is ~7,700 bars, so no fold is skipped
-        - but this strategy IS TIMEFRAME-SENSITIVE: at 1h a 12-week train
-        window is only ~1,930 bars (right on the guard, so real folds get
-        silently skipped) and at 4h/1d every fold is skipped. Run it at
+        - the intended timeframe. At 1h a 12-week train window is ~2,016 bars
+        (above the guard, so folds still run, but with a heavy 3,471-bar
+        warm-up buffer); at 4h/1d every fold is skipped. Run it at
         `--timeframe 15min`.
-      - Hand-check for the leg `_max_lookback_bars()` cannot see (the module
-        constants above never appear in the grid): `strategy.volatility_unit`
-        needs RANGE_WINDOW + VOL_WINDOW = 96 + 480 = 576 bars of history
-        before it is non-NaN. The smallest buffer this grid can produce is
-        (960 + 5) * 3 = 2,895 bars, which clears 576 at every grid corner. If
-        it ever did not, the failure is a NaN volatility unit -> comparison
-        False -> no entry on the first bars of a test window: missed trades,
-        never lookahead.
+      - Hand-check for the leg `_max_lookback_bars()` cannot see (the tau
+        ladder and the shift never appear in the grid): the Hurst regression's
+        slowest column (tau = 32) is non-NaN only after hurst_window + 31
+        bars, and `strategy.hurst_exponent` shifts by one more, so H needs
+        hurst_window + 32 bars of history; drift needs drift_lookback + 1
+        bars. The smallest buffer this grid can produce is (384 + 5) * 3 =
+        1,167 bars, which clears 384 + 32 = 416 at every grid corner. If it
+        ever did not, the failure is a NaN H/drift -> state unknown -> no
+        entry on the first bars of a test window: missed trades, never
+        lookahead.
     """
     grid = []
-    for trend_ma, dip_lookback, dip_frac in product(trend_mas, dip_lookbacks, dip_fracs):
+    for hurst_window, drift_lookback, h_threshold in product(hurst_windows, drift_lookbacks, h_thresholds):
         grid.append(
             {
-                "trend_ma": int(trend_ma),
-                "dip_lookback": int(dip_lookback),
-                "dip_frac": float(dip_frac),
+                "hurst_window": int(hurst_window),
+                "drift_lookback": int(drift_lookback),
+                "h_threshold": float(h_threshold),
                 "session": session,
             }
         )

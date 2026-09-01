@@ -69,63 +69,54 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only swing-horizon pullback buy: a bar arms a LONG when BOTH "
-        "(a) Close is above its --trend-ma bar simple moving average, i.e. the multi-week "
-        "uptrend is intact, and (b) Close sits at least --dip-frac trailing-daily-ranges "
-        "BELOW the highest High of the previous --dip-lookback bars, i.e. the pullback is "
-        "deep enough to be worth buying. The volatility unit is the 480-bar average of the "
-        "trailing 96-bar high-low range (strategy.RANGE_WINDOW / strategy.VOL_WINDOW, "
-        "module constants that are deliberately NOT searched, so depth keeps exactly one "
-        "degree of freedom). Both rolling extrema are shifted one bar so the threshold is "
-        "never self-referential on a spike bar. There is NO short leg — a non-qualifying "
-        "day pays zero cost legs instead of the two a short would cost. The exit is a "
-        "plain hold to the session flatten via session.apply_session_constraint: NO stop "
-        "and NO target, upside uncapped, duration bounded by the session, one round trip "
-        "per armed session. The arming condition is a dense STATE, not a crossing — a "
-        "pullback can deepen overnight, outside the session — and because raw entries are "
-        "NaN rather than False on non-qualifying bars, an open position is HELD through "
-        "them until session.py force-flattens on the session's last bar. NOTE: --trend-ma "
-        "and --dip-lookback are genuine bar counts and size wfo_engine's warm-up buffer, "
-        "so this grid is timeframe-sensitive — see --trend-ma)"
+        "strategy grid (long-only Hurst-persistence drift state: a bar is LONG while BOTH "
+        "(a) the multi-scale variance-growth Hurst estimate of the trailing --hurst-window "
+        "bars is strictly above --h-threshold (H > 0.5 is the canonical persistence "
+        "boundary: variance grows superlinearly, i.e. trending) AND (b) the backward "
+        "--drift-lookback-bar drift Close[t-1]/Close[t-1-drift_lookback]-1 is positive. "
+        "Hurst is estimated per bar by regressing log(Var(tau-bar log returns)) on "
+        "log(tau) for tau in {1,2,4,8,16,32}, H = slope/2, over OVERLAPPING tau-returns, "
+        "shifted one bar so bar t sees only data strictly before t; the naive overlapping "
+        "estimator carries a known scale bias, which is exactly why --h-threshold is "
+        "gridded rather than hardcoded. NO short leg, NO entry threshold on price "
+        "magnitude, NO stop and NO target: the state itself is the self-normalizing "
+        "condition. The exit is a FLIP-TO-FLAT — raw entries carry 1.0 while the state is "
+        "on and 0.0 while it is known-off, so session.apply_session_constraint flattens "
+        "on the first off bar and stays flat until a fresh on-state re-arms; NaN "
+        "(unwarmed) bars hold. session.py force-flattens on the session's last bar, so "
+        "at most one round trip per on-session. NOTE: --hurst-window and --drift-lookback "
+        "are genuine bar counts and size wfo_engine's warm-up buffer — see --hurst-window)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--trend-ma", default="960,1440,1920",
-                        help="comma-separated simple-moving-average lengths IN BARS for the "
-                             "uptrend gate; Close must be above the SMA for a bar to arm. At "
-                             "15min these are ~10/15/20 UTC days — deliberately slow, since the "
-                             "one clean robust run in this repo had its two slowest formation "
-                             "values take 41 of 48 folds. Parsed as ints ON PURPOSE: they are "
-                             "real lookbacks and are meant to feed wfo_engine's warm-up buffer. "
-                             "TIMEFRAME WARNING: at the 1920 top of this grid the buffer is "
-                             "(1920+5)*3 = 5,775 bars and run_walk_forward()'s fold-skip guard "
-                             "becomes len(train_df) < 1930. A 12-week train window is ~7,700 "
-                             "bars at 15min (fine, and that is the intended timeframe) but only "
-                             "~1,930 bars at 1h — right on the guard, so folds get SILENTLY "
-                             "SKIPPED there — and far below it at 4h/1d, where every fold is "
-                             "skipped. Always pass --timeframe 15min")
-    strat.add_argument("--dip-lookback", default="96,192,288",
-                        help="comma-separated lookbacks IN BARS for the rolling high that "
-                             "pullback depth is measured down from (the high is shifted one bar "
-                             "so the current bar's own High cannot set its own reference). At "
-                             "15min these are ~1/2/3 UTC days. Parsed as ints ON PURPOSE — same "
-                             "reason as --trend-ma. May be longer or shorter than --trend-ma; "
-                             "both orderings are meaningful and no combination is degenerate")
-    strat.add_argument("--dip-frac", default="0.5,0.75,1.0,1.5",
-                        help="comma-separated pullback depths, in units of the trailing average "
-                             "daily range (0.5 = half a normal day of movement below the rolling "
-                             "high). Floats, NOT bar counts, so they must not feed the warm-up "
-                             "buffer. The 0.5 floor is the cost discipline: measured on the local "
-                             "NQ 15min frame that is a ~0.95%% pullback at the median against "
-                             "metrics.py's ~10.2bps round-trip toll (~9x), on a single round trip "
-                             "held across an RTH range of ~1.0-1.3%%. Lowering it below 0.5 gives "
-                             "that margin away. Note the top of this range is thin AND is not "
-                             "screened out by the engine: at 1.5 with --trend-ma 960 "
-                             "--dip-lookback 96 the strategy arms on only 11 days in four years, "
-                             "and wfo_engine's guard rejects a combo only below 2 position "
-                             "changes (= one complete round trip), so a single lucky train trade "
-                             "can still win a fold. On a 2024-only 12w/3w run, dip_frac 1.5 won "
-                             "8 of 13 folds and 6 of 13 folds took zero OOS trades")
+    strat.add_argument("--hurst-window", default="384,768,1152",
+                        help="comma-separated trailing-bar windows IN BARS over which the "
+                             "multi-scale variance-growth Hurst estimate is computed "
+                             "(384/768/1152 ~ 4/8/12 UTC days at 15min). Parsed as ints ON "
+                             "PURPOSE: a genuine lookback meant to feed wfo_engine's "
+                             "warm-up buffer. TIMEFRAME WARNING: at the 1152 top of this "
+                             "grid the buffer is (1152+5)*3 = 3,471 bars and "
+                             "run_walk_forward()'s fold-skip guard becomes len(train_df) < "
+                             "1162. A 12-week train window is ~7,700 bars at 15min (fine, "
+                             "and that is the intended timeframe) and ~2,016 bars at 1h "
+                             "(above the guard, so folds still run, but with the heavy "
+                             "buffer); at 4h/1d every fold is skipped. "
+                             "Always pass --timeframe 15min")
+    strat.add_argument("--drift-lookback", default="96,192,384",
+                        help="comma-separated lookbacks IN BARS for the backward drift "
+                             "Close[t-1]/Close[t-1-lookback]-1 that must be positive for "
+                             "the state to be on (96/192/384 ~ 1/2/4 UTC days at 15min). "
+                             "Parsed as ints ON PURPOSE — same reason as --hurst-window. "
+                             "May be longer or shorter than --hurst-window; both orderings "
+                             "are meaningful and no combination is degenerate")
+    strat.add_argument("--h-threshold", default="0.5,0.55,0.6",
+                        help="comma-separated Hurst gates: the state is on only while the "
+                             "estimated H is strictly above this value. 0.5 is the "
+                             "canonical persistence boundary (H > 0.5 = trending, variance "
+                             "grows superlinearly; H < 0.5 = mean-reverting); 0.55/0.6 are "
+                             "safety margins against the naive overlapping estimator's "
+                             "known scale bias. Floats, NOT bar counts, so they must not "
+                             "feed the warm-up buffer")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -176,13 +167,13 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # trend_ma / dip_lookback are cast to int (genuine bar-count lookbacks
-        # that are meant to size wfo_engine's warm-up buffer); dip_frac is a
-        # float fraction of the volatility unit and must never feed it.
-        trend_mas = parse_num_list(args.trend_ma, int)
-        dip_lookbacks = parse_num_list(args.dip_lookback, int)
-        dip_fracs = parse_num_list(args.dip_frac, float)
-        grid = build_grid(trend_mas, dip_lookbacks, dip_fracs, session)
+        # hurst_window / drift_lookback are cast to int (genuine bar-count
+        # lookbacks that are meant to size wfo_engine's warm-up buffer);
+        # h_threshold is a float Hurst gate and must never feed it.
+        hurst_windows = parse_num_list(args.hurst_window, int)
+        drift_lookbacks = parse_num_list(args.drift_lookback, int)
+        h_thresholds = parse_num_list(args.h_threshold, float)
+        grid = build_grid(hurst_windows, drift_lookbacks, h_thresholds, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -225,17 +216,16 @@ def main(argv=None) -> int:
     if chosen:
         # Only the three grid-searched params are reported here; `session` is
         # fixed across every combo, so its "distinct values" would always be 1
-        # and carry no stability information. (strategy.RANGE_WINDOW and
-        # strategy.VOL_WINDOW are module constants, not params, so they never
-        # appear in best_params.)
-        trend_ma_vals = sorted({p["trend_ma"] for p in chosen})
-        dip_lookback_vals = sorted({p["dip_lookback"] for p in chosen})
-        dip_frac_vals = sorted({p["dip_frac"] for p in chosen})
+        # and carry no stability information. (strategy.HURST_TAUS is a module
+        # constant, not a param, so it never appears in best_params.)
+        hurst_window_vals = sorted({p["hurst_window"] for p in chosen})
+        drift_lookback_vals = sorted({p["drift_lookback"] for p in chosen})
+        h_threshold_vals = sorted({p["h_threshold"] for p in chosen})
         print(
-            f"Fold param stability: {len(trend_ma_vals)} distinct trend ma "
-            f"{trend_ma_vals}, {len(dip_lookback_vals)} distinct dip lookback "
-            f"{dip_lookback_vals}, {len(dip_frac_vals)} distinct dip frac "
-            f"{dip_frac_vals}"
+            f"Fold param stability: {len(hurst_window_vals)} distinct hurst window "
+            f"{hurst_window_vals}, {len(drift_lookback_vals)} distinct drift lookback "
+            f"{drift_lookback_vals}, {len(h_threshold_vals)} distinct h threshold "
+            f"{h_threshold_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -269,9 +259,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "trend_ma": f.best_params.get("trend_ma"),
-                "dip_lookback": f.best_params.get("dip_lookback"),
-                "dip_frac": f.best_params.get("dip_frac"),
+                "hurst_window": f.best_params.get("hurst_window"),
+                "drift_lookback": f.best_params.get("drift_lookback"),
+                "h_threshold": f.best_params.get("h_threshold"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

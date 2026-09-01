@@ -1,19 +1,23 @@
-"""Long-only swing-horizon pullback buy (NQ 15min, New York session).
+"""Long-only Hurst-persistence drift state (NQ 15min, New York session).
 
-The previous family (long-only overnight gap-down fill buy) is retired as
-structural, not varied: its in-sample leg came back CAGR -9.97% at PF 0.671
-over 221 IS / 332 OOS trades, which fires both no-edge triggers, and the
-iteration before it was no-edge too. This is a clean pivot to a new family
-rather than another knob on a dead one.
+The previous family (long-only swing-horizon pullback buy) is retired as
+structural, not varied: its in-sample leg came back IS Sharpe 0.02 / PF 1.01
+on 65 IS trades, its own reasoning calling that leg "indistinguishable from no
+edge". This is a clean pivot to a genuinely new family — no prior iteration in
+this log computed Hurst at all (variance ratio appeared only as a single-lag
+gate in iteration 9 and a polarity key in iteration 21, never as the
+multi-tau variance-growth estimator used here).
 
 The mechanism
 -------------
-mean-reversion.md's short-term-overreaction / forced-selling edge, applied at
-a *swing* horizon instead of an intraday one, and taken only with the
-prevailing trend. Taking it only with the trend is that same page's pitfall #1
-read as a constraint ("in a strong uptrend, shorting strength is a losing
-strategy"): the dip is bought only while price is above a multi-week mean, and
-the dip is never sold.
+statistical-mean-reversion-tests.md's persistence boundary read as the
+*precondition for momentum*: H > 0.5 is that page's canonical definition of a
+trending series (variance grows superlinearly — "H > 0.5: trending"), and
+momentum only works when positive autocorrelation actually exists. So this
+strategy refuses any directional bet unless a rolling multi-scale Hurst
+estimate says continuation should be present — and it only ever bets long,
+since iteration 33 measured the short leg as the worse half across ~2,000
+trades in four unrelated families.
 
 Three construction choices are carried over because they are the only findings
 this log has replicated across unrelated families:
@@ -21,126 +25,101 @@ this log has replicated across unrelated families:
      short leg as the worse half every time. Under `metrics.py`'s per-leg cost
      model a non-qualifying day now pays zero legs rather than the two a short
      entry would cost.
-  2. Slow horizons over fast. In the one clean robust run in this repo the two
-     slowest formation values took 41 of 48 folds, so the grid here starts at
-     ~10 UTC days of trend and never goes faster.
-  3. No stop. Two earlier iterations added a hardcoded stop as their only
-     change and both got worse, and hard-capping the payoff has been measured
-     flipping per-trade economics from +0.4bps to -11.6bps. The exit here is a
-     plain hold to the session flatten.
+  2. The dense self-normalizing state + decay-flip exit, no stop, no target.
+     That construction produced the repo's only clean leave-top-5-out pass
+     (iteration 36); stops and bounded targets have each been measured killing
+     continuation gross edge in iterations 27/34/37, so neither is used here.
+  3. A statistical-magnitude regime gate as a continuation conditioner.
+     Iteration 6's vol-magnitude regime gate measurably improved a
+     continuation (OOS Sharpe 0.32 -> 0.86), and H is the direct statistical
+     cousin of that conditioning — the state here replaces the vol-magnitude
+     test with the persistence test itself.
 
-Closest prior relative is the trend_pullback_continuation family (no-edge) and
-four things differ, the horizon being load-bearing: this is long-only rather
-than symmetric; the trend filter is 10-20 UTC days rather than 96-384 bars
-(which was *shorter* than that iteration's own pullback window, so it was
-measuring a 5-hour dip against a "1-4 day trend"); the pullback is measured as
-depth below a multi-day rolling high in trailing-daily-range units rather than
-price-vs-its-own-rolling-mean (the exact quantity two earlier iterations found
-information-free on this data in either polarity); and there is no stop.
+Pre-registered falsification (from the researcher, not this module): if the
+H-gate is uninformative the state degenerates to a slow time-series-momentum
+state (iteration 23, no-edge IS PF 0.946) and the family dies at the IS gate;
+power floor >= 200 OOS trades (dense state, ~350-600 expected); h_threshold is
+gridded rather than hardcoded because the naive overlapping variance-growth
+estimator carries a known scale bias.
 
 Entry — a dense state, not a crossing
 -------------------------------------
 All quantities are strictly backward-looking and fully session-unaware.
 
-    daily_range_t = rolling_max(High, RANGE_WINDOW).shift(1)
-                  - rolling_min(Low,  RANGE_WINDOW).shift(1)
-    vol_unit_t    = rolling_mean(daily_range, VOL_WINDOW)
-    depth_t       = rolling_max(High, dip_lookback).shift(1) - Close_t
+    r_s              = log(Close_s / Close_{s-1})
+    tau-return_s     = sum of `tau` consecutive r's  (tau in {1,2,4,8,16,32})
+    var_tau(s)       = variance of the trailing `hurst_window` tau-returns
+    H(s)             = slope of log(var_tau) on log(tau) over the six taus, /2
+    hurst_t          = H(t-1)          (strictly backward: bar t sees bars < t)
+    drift_t          = Close_{t-1} / Close_{t-1-drift_lookback} - 1
 
-    long_signal_t = (Close_t > SMA(Close, trend_ma))
-                    AND (depth_t >= dip_frac * vol_unit_t)
+    state_t          = (hurst_t > h_threshold) AND (drift_t > 0)
 
-`RANGE_WINDOW` = 96 (one UTC day at 15min) and `VOL_WINDOW` = 480 (~5 days)
-are module constants, deliberately NOT searched — the volatility unit carries
-zero degrees of freedom, so `dip_frac` is the only width knob.
+Hurst is estimated by the page's variance-growth method: for a series whose
+tau-period variance grows as tau^(2H), log(Var) is linear in log(tau) with
+slope 2H, so H = slope/2. A random walk has slope 1 -> H = 0.5; trending
+(superlinear variance growth) -> H > 0.5; mean-reverting -> H < 0.5. The
+tau-returns are *overlapping* (the standard variance-ratio construction), which
+is what makes the estimator's finite-sample scale slightly biased — the exact
+reason h_threshold is a searched parameter rather than a hardcoded 0.5.
 
-The `.shift(1)` on both rolling extrema is required, not cosmetic: without it
-the rolling max includes the current bar's own High, so on a spike bar the
-threshold moves with the price it is supposed to be measured against and the
-condition becomes self-referential.
+Strict min_periods: `rolling(hurst_window).var()` is NaN until the full window
+is present, so an unwarmed bar yields a NaN H. NaN (and inf) fail closed on
+both sides of the state conjunction: the comparisons evaluate False (never a
+phantom entry) AND the bar is marked "unknown" (never a forced flatten). There
+is no entry threshold on price magnitude — the state itself is the
+self-normalizing condition.
 
-This is a dense STATE, not a crossing. A cross-only form would arm on exactly
-one bar per pullback, and that bar is overwhelmingly likely to fall outside
-the New York window (the pullback deepens whenever it deepens, including
-overnight), producing almost no trades. As a state, the first in-session bar
-of an armed stretch is the entry.
+Exit — flip-to-flat, no stop, no target
+---------------------------------------
+The raw `entries` series carries exactly three values:
+  - 1.0 while the state is ON (long),
+  - 0.0 while the state is known-OFF (H <= h_threshold or drift <= 0) — the
+    flip: `session.apply_session_constraint()` forward-fills this 0, so the
+    position flattens on the first off bar and stays flat until a fresh
+    on-state re-arms,
+  - NaN while the state is unknown (unwarmed / non-finite) — forward-fill
+    HOLDS an open position through these bars.
+`session.py` force-flattens on the session's last bar, so there is at most one
+round trip per on-session (a mid-session off->on re-arm is a fresh, intended
+second trip). This is deliberately `apply_session_constraint()`, NOT the
+`with_stops` variant: no stop, no target, upside uncapped, duration bounded by
+the session.
 
-NaN comparisons evaluate False, so an unwarmed bar stands aside with no
-separate validity mask to keep in sync — the same fail-closed discipline as
-the previous iteration.
+This differs from the retired pullback family's entry shape in one load-bearing
+way: there, raw entries were NaN (hold) on non-qualifying bars, so an open
+position was HELD to the session flatten regardless of signal; here raw entries
+are 0.0 on known-off bars, so the position FLIPS to flat the moment the
+persistence/drift condition dies, and re-arms only on a fresh on-state.
 
-Exit — hold to the session flatten, no stop, no target
-------------------------------------------------------
-The raw `entries` series carries only 1.0 (arm long) and NaN (no opinion); it
-never carries 0.0 and never carries -1.0. `session.apply_session_constraint()`
-forward-fills that into a position, so the trade opens on the first in-session
-armed bar and is force-flattened by `session.py` on the session's last bar.
-Upside is uncapped; duration is bounded by the session. One round trip per
-armed session.
-
-This is deliberately NOT `apply_session_constraint_with_stops` — see point 3
-above. Because `entries` is NaN (not False) on non-qualifying bars, a position
-already open is *held* through bars where the signal switches off; the exit is
-the session boundary alone.
-
-Long-only means -1.0 can never be emitted, so `apply_session_constraint`'s
-forward fill can only ever produce {0.0, 1.0} and a non-qualifying day costs
-nothing at all.
-
-Cost discipline, designed into the grid rather than bolted on
-------------------------------------------------------------
-At `dip_frac` = 0.5 (the loosest grid point) the qualifying pullback measures
-~0.95% of price at the median on the local NQ 15min frame (the volatility unit
-itself runs ~1.9% of price at the median), roughly 9x `metrics.py`'s ~10.2bps
-round-trip toll — the spec estimated ~0.65% / ~6x, so the measured margin is
-wider than pre-registered, not narrower. The trade is a single round trip held
-across an RTH range of ~1.0-1.3%. NQ is chosen over ES because ES's smaller
-ranges would starve the same threshold.
-
-Measured density (full local NQ 15min frame, New York session), since the
-trend filter and the depth filter partially fight each other and the spec
-pre-registered a >=120-OOS-trade power floor: at trend_ma=960 / dip_lookback=96
-/ dip_frac=0.5 the strategy arms on 357 distinct in-session days and takes 354
-entries (one round trip per armed session, exactly as designed); at
-trend_ma=1920 / dip_lookback=288 / dip_frac=0.5, 459 armed days. The tight
-corner is genuinely thin: trend_ma=960 / dip_lookback=96 / dip_frac=1.5 arms on
-only 11 days across four years.
-
-That thinness is NOT neutralized by the engine, and the honest version of this
-is worth stating: `wfo_engine._score_params()` returns -inf only for combos
-with FEWER THAN 2 position changes in the train window, and one complete round
-trip is exactly 2 changes — so a combo that took a single lucky train trade
-still gets scored and can still win the fold. Measured on a 2024-only 12w/3w
-smoke run: `dip_frac` = 1.5 combos won 8 of 13 folds and 6 of 13 folds took
-zero OOS trades. Whether the resulting trade count clears the pre-registered
->=120-OOS-trade power floor over the full frame is the evaluator's call.
-
-`metrics.py`'s per-leg toll (0.001% fee + 0.05% slippage) is unchanged and out
-of scope.
+Long-only means -1.0 can never be emitted, so the forward fill can only ever
+produce {0.0, 1.0} and a non-qualifying day costs nothing at all.
 
 Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`)
 ---------------------------------------------------------------------------
-  - `trend_ma` and `dip_lookback` are genuine bar counts and are `int` in
-    `build_grid()` **on purpose**, so `_max_lookback_bars()` picks them up and
-    sizes the pre-test-window warm-up buffer from them. `dip_frac` is a
-    fraction of the volatility unit and is cast `float` so it cannot inflate
-    that buffer.
-  - At the intended grid the binding value is `trend_ma`: the buffer is
-    `max((trend_ma + 5) * 3, bars_per_day + 5)`, i.e. 2,895 bars at
-    trend_ma = 960 and 5,775 at trend_ma = 1920.
+  - `hurst_window` and `drift_lookback` are genuine bar counts and are `int`
+    in `build_grid()` **on purpose**, so `_max_lookback_bars()` picks them up
+    and sizes the pre-test-window warm-up buffer from them. `h_threshold` is a
+    Hurst gate, not a lookback, and is cast `float` so it cannot inflate that
+    buffer.
+  - At the intended grid the binding value is `hurst_window`: the buffer is
+    `max((hurst_window + 5) * 3, bars_per_day + 5)`, i.e. 3,471 bars at
+    hurst_window = 1152.
   - The fold-skip guard in `run_walk_forward()` is
-    `len(train_df) < max_lookback + 10` = 1,930 at the top of the grid. A
-    12-week train window at 15min is ~7,700 bars, so no fold is skipped. THIS
-    STRATEGY IS INTENDED AT `--timeframe 15min`. At 1h a 12-week train window
-    is only ~1,930 bars — right on the guard — so folds will be silently
-    skipped there; at 4h/1d every fold is skipped.
-  - Hand-check for the part `_max_lookback_bars()` cannot see: `vol_unit`
-    needs RANGE_WINDOW + VOL_WINDOW = 96 + 480 = 576 bars of history before it
-    is non-NaN, and 96/480 are module constants that never appear in the grid.
-    The smallest buffer this grid can produce is 2,895 bars, which clears 576
-    with room to spare at every grid corner. If it ever did not, the failure
-    mode is a NaN `vol_unit` -> comparison False -> no entry on the first bars
-    of a test window: a few missed trades, never lookahead.
+    `len(train_df) < max_lookback + 10` = 1,162 at the top of the grid. A
+    12-week train window at 15min is ~7,700 bars, so no fold is skipped — and
+    even at 1h (~2,016 bars) folds still run, only with a heavier warm-up
+    buffer. THIS STRATEGY IS INTENDED AT `--timeframe 15min`. At 4h/1d every
+    fold is skipped.
+  - Hand-check for the part `_max_lookback_bars()` cannot see: the regression's
+    slowest column (tau = 32) is non-NaN only after hurst_window + 31 bars,
+    and the `.shift(1)` adds one more, so `hurst` needs hurst_window + 32 bars
+    of history before it is non-NaN; `drift` needs drift_lookback + 1 bars.
+    The smallest buffer this grid can produce is (384 + 5) * 3 = 1,167 bars,
+    which clears 384 + 32 = 416 (and drift_lookback + 1 = 385) at every grid
+    corner. If it ever did not, the failure mode is a NaN H/drift -> state
+    unknown -> no entry on the first bars of a test window: a few missed
+    trades, never lookahead.
 
 This module decides only *when* the strategy wants to be long. All day-trade
 gating and the end-of-session flatten are delegated to `session.py`; see its
@@ -151,72 +130,89 @@ import pandas as pd
 
 from session import apply_session_constraint
 
-# Bars in one UTC day at the intended 15min timeframe. The trailing high-low
-# range over this window is the raw "one day of movement" unit. A module
-# constant on purpose — the volatility scale keeps zero searched degrees of
-# freedom, so `dip_frac` alone controls how deep a pullback has to be.
-RANGE_WINDOW = 96
-
-# Bars over which those daily ranges are averaged into the volatility unit
-# (~5 UTC days at 15min). Also a module constant, same reason.
-VOL_WINDOW = 480
+# Tau lags (bars) for the variance-growth Hurst regression — the fixed
+# multi-scale ladder from statistical-mean-reversion-tests.md. A module
+# constant on purpose: the estimator's scale structure keeps zero searched
+# degrees of freedom, so `h_threshold` alone controls the persistence gate.
+HURST_TAUS = (1, 2, 4, 8, 16, 32)
 
 
-def volatility_unit(high: pd.Series, low: pd.Series) -> pd.Series:
-    """Average trailing one-day high-low range, in price units.
+def hurst_exponent(close: pd.Series, window: int) -> pd.Series:
+    """Multi-scale variance-growth Hurst estimate, strictly backward-looking.
 
-    Strictly backward looking: both extrema are `.shift(1)`ed before the
-    average, so the value attached to bar t is fully determined by bars
-    strictly before t. The first RANGE_WINDOW + VOL_WINDOW bars are NaN and
-    fail closed downstream.
+    For each bar s, regress log(Var(tau-bar log returns)) over the trailing
+    `window` observations on log(tau) for tau in HURST_TAUS; H = slope / 2.
+    The tau-returns are overlapping (tau consecutive one-bar log returns,
+    equivalently log(Close_s / Close_{s-tau})). The returned series is shifted
+    one bar, so the value attached to bar t uses only data strictly before t.
+
+    NaN discipline: the rolling variance uses the strict full window
+    (min_periods = window), so the slowest column (tau = 32) is NaN for the
+    first window + 31 bars (the one-bar shift of log_ret adds one), and a NaN
+    in any of the six regression points makes the row-wise slope NaN — an
+    unwarmed bar therefore fails closed downstream instead of producing a
+    spuriously finite H.
     """
-    daily_range = (
-        high.rolling(RANGE_WINDOW).max().shift(1) - low.rolling(RANGE_WINDOW).min().shift(1)
-    )
-    return daily_range.rolling(VOL_WINDOW).mean()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_ret = np.log(close / close.shift(1))
+
+    # Fixed design: slope = dot(log(var_tau), (log(tau) - mean) / Sxx), since
+    # the tau ladder is the same on every bar. Sxx is ddof-free and constant.
+    x = np.log(np.asarray(HURST_TAUS, dtype=float))
+    x_mean = x.mean()
+    sxx = float(((x - x_mean) ** 2).sum())
+    weights = (x - x_mean) / sxx
+
+    log_vars = {}
+    for tau in HURST_TAUS:
+        tau_ret = log_ret.rolling(tau).sum()
+        var = tau_ret.rolling(window, min_periods=window).var()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_vars[tau] = np.log(var)
+
+    # Row-wise slope of log(Var) on log(tau) = 2H; a NaN in any column
+    # propagates through the dot product, so H is NaN before full warm-up.
+    slope = pd.DataFrame(log_vars, index=close.index).dot(weights)
+    return (slope / 2.0).shift(1)
 
 
 def generate_positions(
     df: pd.DataFrame,
-    trend_ma: int,
-    dip_lookback: int,
-    dip_frac: float,
+    hurst_window: int,
+    drift_lookback: int,
+    h_threshold: float,
     session: str | None = "New York",
 ) -> pd.Series:
     close = df["Close"].astype(float)
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
 
-    # Volatility unit: what "a normal day of movement" is worth in points right
-    # now, so the depth threshold is scale-free across 2022-2025 regimes.
-    vol_unit = volatility_unit(high, low)
+    # Multi-scale variance-growth Hurst of the trailing `hurst_window` bars,
+    # shifted so bar t sees only data strictly before t. NaN before
+    # hurst_window + 32 bars -> fails closed downstream.
+    hurst = hurst_exponent(close, int(hurst_window))
 
-    # Uptrend gate: price above its multi-week mean. This is what turns the
-    # dip-buy from a naked mean-reversion bet into a with-trend continuation
-    # entry, and it is why there is no short leg (shorting strength inside an
-    # uptrend is mean-reversion.md's pitfall #1).
-    trend_ok = close > close.rolling(int(trend_ma)).mean()
+    # Backward drift over the `drift_lookback` bars ending at t-1:
+    # Close_{t-1} / Close_{t-1-drift_lookback} - 1. NaN for the first
+    # drift_lookback + 1 bars.
+    drift = close.shift(1) / close.shift(1 + int(drift_lookback)) - 1.0
 
-    # Pullback depth: how far the current Close sits below the highest High of
-    # the last `dip_lookback` bars. The `.shift(1)` excludes the current bar's
-    # own High — without it a spike bar would set its own reference and the
-    # comparison would be self-referential.
-    depth = high.rolling(int(dip_lookback)).max().shift(1) - close
+    # Dense state with fail-closed NaN semantics. `known` marks bars where
+    # both sides are finite, i.e. where the state is a genuine boolean; on an
+    # unwarmed (NaN) or non-finite bar both comparisons evaluate False, so it
+    # can never arm a phantom entry, and `known` is False so it is never
+    # treated as a deliberate "off" (which would force a flatten).
+    known = np.isfinite(hurst) & np.isfinite(drift)
+    state_on = (hurst > float(h_threshold)) & (drift > 0.0)
 
-    # Dense arming state. NaN on either side of a comparison is False, so an
-    # unwarmed bar simply stands aside — no separate validity mask to keep in
-    # sync with this expression.
-    with np.errstate(invalid="ignore"):
-        long_signal = trend_ok & (depth >= float(dip_frac) * vol_unit)
-
-    # Raw, session-unaware entries: 1.0 where the strategy wants to be long,
-    # NaN everywhere else. NaN (not False/0.0) is load-bearing — it is what
-    # lets session.py's forward fill HOLD an open position through bars where
-    # the arming condition has switched off, so the only exit is the session
-    # flatten. There is no -1.0 branch: this family is long-only, so a
-    # non-qualifying day pays zero cost legs.
+    # Raw, session-unaware entries: 1.0 while the state is on, 0.0 while it is
+    # known-off (the flip-to-flat exit), NaN while unknown (hold). There is no
+    # -1.0 branch: this family is long-only, so a non-qualifying day pays zero
+    # cost legs. apply_session_constraint() forward-fills this, so a long opens
+    # on the first in-session on-bar, flattens on the first off-bar (0.0
+    # ffills through the off stretch), holds through NaN bars, and is
+    # force-flattened by session.py on the session's last bar.
     entries = pd.Series(np.nan, index=df.index)
-    entries[long_signal] = 1.0
+    entries[state_on & known] = 1.0
+    entries[known & ~state_on] = 0.0
 
     # session.py alone decides which bars are tradable and force-flattens on
     # the session's last bar.
@@ -224,14 +220,14 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    # All three are real points the intended grid searches (trend_ma
-    # 960/1440/1920, dip_lookback 96/192/288, dip_frac 0.5/0.75/1.0/1.5), so
-    # the post-edit sanity check exercises a genuine combo. trend_ma and
-    # dip_lookback are ints because they ARE bar counts and are meant to size
-    # wfo_engine's warm-up buffer; dip_frac is a float fraction of the
-    # volatility unit and must not.
-    "trend_ma": 960,
-    "dip_lookback": 96,
-    "dip_frac": 0.5,
+    # All three are real points the intended grid searches (hurst_window
+    # 384/768/1152, drift_lookback 96/192/384, h_threshold 0.5/0.55/0.6), so
+    # the post-edit sanity check exercises a genuine combo. hurst_window and
+    # drift_lookback are ints because they ARE bar counts and are meant to
+    # size wfo_engine's warm-up buffer; h_threshold is a float Hurst gate and
+    # must not.
+    "hurst_window": 384,
+    "drift_lookback": 96,
+    "h_threshold": 0.5,
     "session": "New York",
 }
