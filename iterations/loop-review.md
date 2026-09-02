@@ -138,3 +138,77 @@ reader can tell which gate produced which verdict without re-deriving it.
 `--symbol ES` with that iteration's own grid. Not part of the iteration log itself
 (no `idea_key`, wasn't produced by the researcher/implementer loop) — kept as the
 evidence backing this doc.
+
+---
+
+# Cost model v2 (written after iteration 44)
+
+Written after a cost-sensitivity audit found that the cost model, not idea
+quality, was the dominant false-negative generator in the loop's history.
+
+## What was wrong
+
+`metrics.py` charged `FEE_RATE = 0.001%` + `SLIPPAGE_RATE = 0.05%` per leg —
+a **10.2bp round trip ≈ $102 per contract round trip on NQ**. The slippage term
+alone (0.05% ≈ 10 points ≈ $50/leg) is ~10-40x realistic for NQ/ES day trading
+(0.25-1 tick = $1.25-2.50/leg; realistic round trip ~$5-15). The 22 of 38
+`no-edge` rejections were, on inspection, mostly "edge < the 10.2bp toll," not
+"no edge": iteration 38's own logged numbers already showed an 8.6bp gross edge
+fully erased by the toll.
+
+## Null-model calibration: the gate does NOT false-accept noise
+
+`tools/null_calibration.py` pushes a no-skill coin-flip strategy (deterministic,
+param-keyed, so the argmax-Sharpe grid search genuinely *selects* among noise
+realisations) through the real walk-forward pipeline and scores it with the
+gate-v2 replica in `tools/gate_v2.py`.
+
+| cost | trials | false-accept rate | noise median OOS Sharpe | noise median PF | max PF ex-top-5 |
+|---|---|---|---|---|---|
+| v1 (10.2bp) | 20 | **0/20 (0.0%)** | -1.86 | 0.62 | 0.83 |
+| v2 (1.2bp)  | 20 | **0/20 (0.0%)** | -0.46 | 0.90 | 1.10 |
+
+Pure noise never reaches `robust:true` (PF_ex5 ≥ 1.15), never clears 60% fold
+consistency, and never passes the absolute checklist — at either cost. The
+strict gate stays as-is; it is not the thing blocking success.
+
+## Cost-sensitivity + full re-runs: the real edges were hidden
+
+`tools/cost_sensitivity.py` reconstructs gross returns from saved trades and
+re-scores gate-v2 quantities at cost multipliers; `tools/rerun_report.py` runs
+the full pipeline (from each iteration's own commit via `git archive`) at the
+recalibrated cost so the fold-level optimizer re-selects under realistic costs.
+All four candidates clear gate v2 at cost v2 (round trip 1.2bp ≈ $12/contract):
+
+| iteration | old verdict (cost v1) | cost v2 OOS Sharpe | PF | PF ex-top-5 | folds profitable | verdict @ cost v2 |
+|---|---|---|---|---|---|---|
+| 6  | accepted (retro fragile) | 1.34 | 1.54 | 1.25 | 66.0% | accepted |
+| 11 | accepted (retro fragile) | 1.89 | 1.89 | 1.48 | 69.8% | accepted |
+| 36 | rejected (folds 55.6%)   | 1.78 | 1.73 | 1.48 | 67.4% | accepted |
+| 40 | accepted (unconfirmed)   | 1.88 | 1.80 | 1.54 | 70.5% | accepted |
+
+**Caveats**: iterations 6/11 predate the holdout convention (their grids were
+mined on 2022-2025), so they have no untouched confirmation; and iteration 40's
+2025 holdout still fails at cost v2 (OOS Sharpe -0.83, PF 0.71, 46.7% folds) —
+it lost in-sample on 2025, so that collapse is **regime fragility, not a cost
+artifact**. Cost fixes bookkeeping; it does not fix a strategy that dies in a
+different market regime.
+
+## What changed
+
+- `metrics.py` — `SLIPPAGE_RATE` 0.05% -> **0.005%** (cost v2); `FEE_RATE`
+  unchanged. Still conservative vs real limit-order fills.
+- `CLAUDE.md`, `iterate-strategy/SKILL.md`, `strategy-implementer/SKILL.md` —
+  documented the recalibration and the "never edit metrics.py per iteration" rule.
+- New tools: `tools/gate_v2.py` (evaluator replica), `tools/null_calibration.py`,
+  `tools/cost_sensitivity.py`, `tools/rerun_report.py`.
+
+## What this doesn't fix (still open)
+
+- **Regime-fragility** — the 2022-24 edges do not carry into 2025 (iteration 40's
+  holdout fails even at cost v2). This is now the loop's primary open problem,
+  not "find an edge." A per-calendar-year profitability check and ES
+  pseudo-holdouts are the two diagnostics that localize it.
+- **Engine contract** — the edges found are small and tail-dependent; the
+  `{-1,0,1}` single-strategy contract is the least favorable vehicle for those.
+  Sizing/ensemble remains a medium-term design decision, not an iteration-level knob.

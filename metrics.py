@@ -1,14 +1,22 @@
 """Performance metrics and trade-level accounting.
 
 Costs: every trade (an entry, an exit, or a stop-and-reverse flip counted as
-close+open) pays a 0.001% exchange fee + 0.05% slippage penalty, applied to
+close+open) pays a 0.001% exchange fee + 0.005% slippage penalty, applied to
 the price at the moment of the transaction.
+
+Cost model v2 (recalibrated Aug 2026): the previous SLIPPAGE_RATE of 0.05% was
+~10-40x realistic for NQ/ES day trading (~$50/leg on NQ at 20k vs ~$1-3 real
+limit-order slippage), and a cost-sensitivity audit showed it was manufacturing
+most of the loop's "no-edge" rejections (see tools/cost_sensitivity.py and the
+cost-audit section in .dsh/skills/iterate-strategy/SKILL.md). The recalibrated
+0.005%/leg (~1 point on NQ, ~$5/leg, ~$12 round trip) remains conservative vs
+real fills while letting genuine sub-10bp edges survive. FEE_RATE is unchanged.
 """
 import numpy as np
 import pandas as pd
 
 FEE_RATE = 0.00001       # 0.001%
-SLIPPAGE_RATE = 0.0005   # 0.05%
+SLIPPAGE_RATE = 0.00005  # 0.005% (cost v2 — was 0.05% before the Aug 2026 audit)
 COST_RATE = FEE_RATE + SLIPPAGE_RATE  # per transaction leg
 
 
