@@ -70,27 +70,28 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (two-sided Hurst-persistence drift momentum: a bar is LONG while "
-        "the multi-scale variance-growth Hurst estimate of the trailing --hurst-window "
-        "bars is strictly above --h-threshold (H > 0.5 is the canonical persistence "
-        "boundary: variance grows superlinearly, i.e. trending) AND the backward "
-        "--drift-lookback-bar drift Close[t-1]/Close[t-1-drift_lookback]-1 is positive; "
-        "SHORT when the same H gate holds and that drift is negative — trade sign(drift) "
-        "whenever H > h_threshold, in EITHER direction. Hurst is estimated per bar by "
-        "regressing log(Var(tau-bar log returns)) on log(tau) for tau in "
-        "{1,2,4,8,16,32}, H = slope/2, over OVERLAPPING tau-returns, shifted one bar so "
-        "bar t sees only data strictly before t; the naive overlapping estimator carries "
-        "a known scale bias, which is exactly why --h-threshold is gridded rather than "
-        "hardcoded. NO entry threshold on price magnitude, NO stop and NO target: the "
-        "persistence gate plus drift sign is the self-normalizing condition. The exit is "
-        "a FLIP-TO-FLAT — raw entries carry sign(drift) (+1.0/-1.0) while the state is "
-        "on and 0.0 while it is known-off (H <= h_threshold), so "
-        "session.apply_session_constraint flattens on the first off bar, REVERSES "
-        "long<->short when drift crosses zero while H stays above threshold, and stays "
-        "flat until a fresh on-state re-arms; NaN (unwarmed) bars hold. session.py "
-        "force-flattens on the session's last bar. NOTE: --hurst-window and "
-        "--drift-lookback are genuine bar counts and size wfo_engine's warm-up buffer — "
-        "see --hurst-window)"
+        "strategy grid (long-only trend-gated Hurst drift momentum: a bar is LONG only "
+        "while ALL THREE gates hold — (1) the multi-scale variance-growth Hurst estimate "
+        "of the trailing --hurst-window bars is strictly above --h-threshold (H > 0.5 is "
+        "the canonical persistence boundary: variance grows superlinearly, i.e. "
+        "trending), (2) the backward --drift-lookback-bar drift "
+        "Close[t-1]/Close[t-1-drift_lookback]-1 is positive, and (3) Close_t is above "
+        "its 960-bar SMA — a hardcoded zero-param higher-timeframe uptrend gate (NOT "
+        "grid-searched). There is NO short branch: a negative or zero drift is an "
+        "off-bar, never -1. Hurst is estimated per bar by regressing "
+        "log(Var(tau-bar log returns)) on log(tau) for tau in {1,2,4,8,16,32}, "
+        "H = slope/2, over OVERLAPPING tau-returns, shifted one bar so bar t sees only "
+        "data strictly before t; the naive overlapping estimator carries a known scale "
+        "bias, which is exactly why --h-threshold is gridded rather than hardcoded. "
+        "NO entry threshold on price magnitude, NO stop and NO target. The exit is a "
+        "FLIP-TO-FLAT — raw entries carry +1.0 while all three gates are on and 0.0 "
+        "while any is known-off (H <= h_threshold, drift <= 0, or Close <= SMA(960)), "
+        "so session.apply_session_constraint flattens on the first off bar and stays "
+        "flat until a fresh on-state re-arms; NaN (unwarmed) bars hold. Because there "
+        "is no -1 branch, a gate turning off can only close/re-open a long, never "
+        "reverse long<->short. session.py force-flattens on the session's last bar. "
+        "NOTE: --hurst-window and --drift-lookback are genuine bar counts and size "
+        "wfo_engine's warm-up buffer — see --hurst-window)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -109,12 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "Always pass --timeframe 15min")
     strat.add_argument("--drift-lookback", default="96,192,384",
                         help="comma-separated lookbacks IN BARS for the backward drift "
-                             "Close[t-1]/Close[t-1-lookback]-1 whose SIGN picks the "
-                             "direction while the state is on (positive -> long, negative "
-                             "-> short) (96/192/384 ~ 1/2/4 UTC days at 15min). "
-                             "Parsed as ints ON PURPOSE — same reason as --hurst-window. "
-                             "May be longer or shorter than --hurst-window; both orderings "
-                             "are meaningful and no combination is degenerate")
+                             "Close[t-1]/Close[t-1-lookback]-1, which must be POSITIVE "
+                             "to arm a long (drift <= 0 is an off-bar, never a short — "
+                             "this iteration is long-only) (96/192/384 ~ 1/2/4 UTC days "
+                             "at 15min). Parsed as ints ON PURPOSE — same reason as "
+                             "--hurst-window. May be longer or shorter than --hurst-window; "
+                             "both orderings are meaningful and no combination is degenerate")
     strat.add_argument("--h-threshold", default="0.5,0.55,0.6",
                         help="comma-separated Hurst gates: the state is on only while the "
                              "estimated H is strictly above this value. 0.5 is the "

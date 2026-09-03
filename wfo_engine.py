@@ -46,29 +46,39 @@ def build_grid(hurst_windows, drift_lookbacks, h_thresholds, session) -> list[di
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
     Three params are searched, and they are the strategy's only three degrees
-    of freedom:
+    of freedom (this iteration is long-only + trend-gated, so the grid itself
+    is byte-identical to the previous two-sided run):
       - `hurst_window` - trailing bars (in bars) over which the multi-scale
         variance-growth Hurst estimate is computed. 384/768/1152 bars are
         ~4/8/12 UTC days at 15min.
       - `drift_lookback` - bars of backward drift
-        (Close[t-1]/Close[t-1-drift_lookback] - 1) whose SIGN picks the
-        direction while the state is on (positive -> long, negative -> short).
-        96/192/384 bars are ~1/2/4 UTC days at 15min.
-      - `h_threshold` - the Hurst persistence gate: the state is on (in EITHER
-        direction) only while the estimated H is strictly above this value.
-        Gridded (0.5/0.55/0.6) rather than hardcoded because the naive
-        overlapping variance-growth estimator carries a known scale bias.
+        (Close[t-1]/Close[t-1-drift_lookback] - 1) which must be POSITIVE to
+        arm a long; drift <= 0 is an off-bar, never a short (the short branch
+        is retired). 96/192/384 bars are ~1/2/4 UTC days at 15min.
+      - `h_threshold` - the Hurst persistence gate: the state is on only while
+        the estimated H is strictly above this value. Gridded (0.5/0.55/0.6)
+        rather than hardcoded because the naive overlapping variance-growth
+        estimator carries a known scale bias.
 
     One param is fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md).
 
-    The tau ladder itself is not here at all: `strategy.HURST_TAUS`
-    (1/2/4/8/16/32 bars) is a module constant deliberately kept off the search
-    axes, so the persistence gate keeps exactly one degree of freedom
-    (`h_threshold`). There is no stop param and no target param either - the
-    exit is the flip-to-flat state decay (H <= h_threshold) plus the
-    drift-sign-cross reversal (long<->short while H stays above threshold)
-    plus the session flatten, nothing else.
+    Two things are deliberately NOT here, so they keep zero degrees of freedom:
+      - `strategy.HURST_TAUS` (1/2/4/8/16/32 bars) — the module-constant
+        multi-scale ladder, so the persistence gate keeps exactly one degree
+        of freedom (`h_threshold`).
+      - `strategy.TREND_MA` (960 bars) — the module-constant, zero-param
+        higher-timeframe uptrend gate: a long fires only while
+        Close > SMA(Close, 960). Because it is a module constant (not a grid
+        param), `_max_lookback_bars()` never sees it; that is safe since the
+        intended grid's binding int is `hurst_window = 1152`, whose
+        (1152 + 5) * 3 = 3,471-bar buffer clears the SMA's 960-bar warm-up
+        (and Hurst's 1152 + 32 = 1,184) at every grid corner.
+
+    There is no stop param and no target param either: the exit is the
+    flip-to-flat state decay (any gate off -> 0.0) plus the session flatten.
+    Because there is no short branch, a gate turning off can only close/re-open
+    a long — never reverse long<->short.
 
     No cross-param filter is applied and none is needed: every combination is
     a valid strategy (there is no degenerate pair the way a `fast_ma >=
@@ -85,8 +95,8 @@ def build_grid(hurst_windows, drift_lookbacks, h_thresholds, session) -> list[di
         not a bar count, so it must never feed that buffer. The cast is
         defensive: a grid point hand-written as `1` would otherwise arrive as
         an `int` and be read as a bar count.
-      - Consequently `_max_lookback_bars()` returns max(hurst_windows +
-        drift_lookbacks) = 1152 at the intended grid, the buffer is
+      - Consequently `_max_lookback_bars()` returns max(hurst_windows) = 1152
+        at the intended grid, the buffer is
         max((1152 + 5) * 3, bars_per_day + 5) = 3,471 bars, and
         `run_walk_forward()`'s fold-skip guard is `len(train_df) < 1162`.
         A 12-week train window at 15min is ~7,700 bars, so no fold is skipped
@@ -94,16 +104,16 @@ def build_grid(hurst_windows, drift_lookbacks, h_thresholds, session) -> list[di
         (above the guard, so folds still run, but with a heavy 3,471-bar
         warm-up buffer); at 4h/1d every fold is skipped. Run it at
         `--timeframe 15min`.
-      - Hand-check for the leg `_max_lookback_bars()` cannot see (the tau
-        ladder and the shift never appear in the grid): the Hurst regression's
-        slowest column (tau = 32) is non-NaN only after hurst_window + 31
-        bars, and `strategy.hurst_exponent` shifts by one more, so H needs
-        hurst_window + 32 bars of history; drift needs drift_lookback + 1
-        bars. The smallest buffer this grid can produce is (384 + 5) * 3 =
-        1,167 bars, which clears 384 + 32 = 416 at every grid corner. If it
-        ever did not, the failure is a NaN H/drift -> state unknown -> no
-        entry on the first bars of a test window: missed trades, never
-        lookahead.
+      - Hand-check for the legs `_max_lookback_bars()` cannot see (the tau
+        ladder, the shift, and the hardcoded trend SMA never appear in the
+        grid): the Hurst regression's slowest column (tau = 32) is non-NaN
+        only after hurst_window + 31 bars, and `strategy.hurst_exponent`
+        shifts by one more, so H needs hurst_window + 32 bars of history;
+        drift needs drift_lookback + 1 bars; the trend gate's SMA needs
+        TREND_MA = 960 bars. The intended buffer (3,471 bars) clears all three
+        at every grid corner (max needs: 1,184 / 385 / 960). If it ever did
+        not, the failure is a NaN gate -> state unknown -> no entry on the
+        first bars of a test window: missed trades, never lookahead.
     """
     grid = []
     for hurst_window, drift_lookback, h_threshold in product(hurst_windows, drift_lookbacks, h_thresholds):
