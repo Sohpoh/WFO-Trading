@@ -51,12 +51,13 @@ def build_grid(hurst_windows, drift_lookbacks, h_thresholds, session) -> list[di
         variance-growth Hurst estimate is computed. 384/768/1152 bars are
         ~4/8/12 UTC days at 15min.
       - `drift_lookback` - bars of backward drift
-        (Close[t-1]/Close[t-1-drift_lookback] - 1) that must be positive for
-        the state to be on. 96/192/384 bars are ~1/2/4 UTC days at 15min.
-      - `h_threshold` - the Hurst persistence gate: the state is on only while
-        the estimated H is strictly above this value. Gridded (0.5/0.55/0.6)
-        rather than hardcoded because the naive overlapping variance-growth
-        estimator carries a known scale bias.
+        (Close[t-1]/Close[t-1-drift_lookback] - 1) whose SIGN picks the
+        direction while the state is on (positive -> long, negative -> short).
+        96/192/384 bars are ~1/2/4 UTC days at 15min.
+      - `h_threshold` - the Hurst persistence gate: the state is on (in EITHER
+        direction) only while the estimated H is strictly above this value.
+        Gridded (0.5/0.55/0.6) rather than hardcoded because the naive
+        overlapping variance-growth estimator carries a known scale bias.
 
     One param is fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md).
@@ -65,8 +66,9 @@ def build_grid(hurst_windows, drift_lookbacks, h_thresholds, session) -> list[di
     (1/2/4/8/16/32 bars) is a module constant deliberately kept off the search
     axes, so the persistence gate keeps exactly one degree of freedom
     (`h_threshold`). There is no stop param and no target param either - the
-    exit is the flip-to-flat state decay plus the session flatten, nothing
-    else.
+    exit is the flip-to-flat state decay (H <= h_threshold) plus the
+    drift-sign-cross reversal (long<->short while H stays above threshold)
+    plus the session flatten, nothing else.
 
     No cross-param filter is applied and none is needed: every combination is
     a valid strategy (there is no degenerate pair the way a `fast_ma >=

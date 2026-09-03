@@ -29,6 +29,7 @@ Examples:
     python cli.py --list
 """
 import argparse
+import math
 import sys
 
 import pandas as pd
@@ -69,23 +70,27 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only Hurst-persistence drift state: a bar is LONG while BOTH "
-        "(a) the multi-scale variance-growth Hurst estimate of the trailing --hurst-window "
+        "strategy grid (two-sided Hurst-persistence drift momentum: a bar is LONG while "
+        "the multi-scale variance-growth Hurst estimate of the trailing --hurst-window "
         "bars is strictly above --h-threshold (H > 0.5 is the canonical persistence "
-        "boundary: variance grows superlinearly, i.e. trending) AND (b) the backward "
-        "--drift-lookback-bar drift Close[t-1]/Close[t-1-drift_lookback]-1 is positive. "
-        "Hurst is estimated per bar by regressing log(Var(tau-bar log returns)) on "
-        "log(tau) for tau in {1,2,4,8,16,32}, H = slope/2, over OVERLAPPING tau-returns, "
-        "shifted one bar so bar t sees only data strictly before t; the naive overlapping "
-        "estimator carries a known scale bias, which is exactly why --h-threshold is "
-        "gridded rather than hardcoded. NO short leg, NO entry threshold on price "
-        "magnitude, NO stop and NO target: the state itself is the self-normalizing "
-        "condition. The exit is a FLIP-TO-FLAT — raw entries carry 1.0 while the state is "
-        "on and 0.0 while it is known-off, so session.apply_session_constraint flattens "
-        "on the first off bar and stays flat until a fresh on-state re-arms; NaN "
-        "(unwarmed) bars hold. session.py force-flattens on the session's last bar, so "
-        "at most one round trip per on-session. NOTE: --hurst-window and --drift-lookback "
-        "are genuine bar counts and size wfo_engine's warm-up buffer — see --hurst-window)"
+        "boundary: variance grows superlinearly, i.e. trending) AND the backward "
+        "--drift-lookback-bar drift Close[t-1]/Close[t-1-drift_lookback]-1 is positive; "
+        "SHORT when the same H gate holds and that drift is negative — trade sign(drift) "
+        "whenever H > h_threshold, in EITHER direction. Hurst is estimated per bar by "
+        "regressing log(Var(tau-bar log returns)) on log(tau) for tau in "
+        "{1,2,4,8,16,32}, H = slope/2, over OVERLAPPING tau-returns, shifted one bar so "
+        "bar t sees only data strictly before t; the naive overlapping estimator carries "
+        "a known scale bias, which is exactly why --h-threshold is gridded rather than "
+        "hardcoded. NO entry threshold on price magnitude, NO stop and NO target: the "
+        "persistence gate plus drift sign is the self-normalizing condition. The exit is "
+        "a FLIP-TO-FLAT — raw entries carry sign(drift) (+1.0/-1.0) while the state is "
+        "on and 0.0 while it is known-off (H <= h_threshold), so "
+        "session.apply_session_constraint flattens on the first off bar, REVERSES "
+        "long<->short when drift crosses zero while H stays above threshold, and stays "
+        "flat until a fresh on-state re-arms; NaN (unwarmed) bars hold. session.py "
+        "force-flattens on the session's last bar. NOTE: --hurst-window and "
+        "--drift-lookback are genuine bar counts and size wfo_engine's warm-up buffer — "
+        "see --hurst-window)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -104,8 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "Always pass --timeframe 15min")
     strat.add_argument("--drift-lookback", default="96,192,384",
                         help="comma-separated lookbacks IN BARS for the backward drift "
-                             "Close[t-1]/Close[t-1-lookback]-1 that must be positive for "
-                             "the state to be on (96/192/384 ~ 1/2/4 UTC days at 15min). "
+                             "Close[t-1]/Close[t-1-lookback]-1 whose SIGN picks the "
+                             "direction while the state is on (positive -> long, negative "
+                             "-> short) (96/192/384 ~ 1/2/4 UTC days at 15min). "
                              "Parsed as ints ON PURPOSE — same reason as --hurst-window. "
                              "May be longer or shorter than --hurst-window; both orderings "
                              "are meaningful and no combination is degenerate")
@@ -239,13 +245,16 @@ def main(argv=None) -> int:
         fold_rets = pd.Series([f.oos_return for f in active_folds])
         fold_sharpes = pd.Series([f.oos_sharpe for f in active_folds])
         n_profitable = int((fold_rets > 0).sum())
+        pct = n_profitable / len(active_folds)
+        se = math.sqrt(pct * (1.0 - pct) / len(active_folds))
+        band = "clear pass" if pct >= 0.60 else ("near-miss" if pct >= 0.60 - se else "clear miss")
         idle_note = (
             f" ({len(folds) - len(active_folds)} folds took no trades)"
             if len(active_folds) < len(folds) else ""
         )
         print(
             f"Fold OOS consistency: {n_profitable}/{len(active_folds)} active folds profitable "
-            f"({n_profitable / len(active_folds) * 100:.1f}%), median fold OOS return "
+            f"({pct * 100:.1f}%, SE {se * 100:.1f}% -> {band}), median fold OOS return "
             f"{fold_rets.median() * 100:.2f}%, median fold OOS Sharpe {fold_sharpes.median():.2f}"
             f"{idle_note}"
         )
