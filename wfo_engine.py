@@ -52,9 +52,12 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
     of that statistic a bar has to rank before the strategy goes long). Nothing
     else is tunable: the exit is a momentum-decay flip to flat when the same
     statistic falls below its own trailing median (`EXIT_PCT = 0.5`, a module
-    constant in `strategy.py`, deliberately NOT a searched axis). There is no
-    stop and no profit target, so a winner still runs uncapped to `session.py`'s
-    forced flatten.
+    constant in `strategy.py`, deliberately NOT a searched axis), and the
+    entry additionally carries a zero-param volatility floor — the long is
+    withheld unless the formation σ is at or above its own trailing median
+    (`VOL_FLOOR_PCT = 0.5`, also a module constant, also NOT searched). There
+    is no stop and no profit target, so a winner still runs uncapped to
+    `session.py`'s forced flatten.
 
     Two params are fixed and threaded into every combo as-is, never searched:
     `session` (required by CLAUDE.md) and `rank_window`.

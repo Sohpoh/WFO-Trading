@@ -75,7 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
         "over the trailing --formation-lookback bars divided by its own sample std, vault "
         "eq. 269 R_mean/sigma — is ranked against its own trailing distribution: the "
         "--rank-pct quantile of that same statistic over the previous --rank-window bars, "
-        "current bar excluded. Top-quantile bars go LONG; there is NO short leg, so a "
+        "current bar excluded. Top-quantile bars go LONG, but ONLY when the formation sigma "
+        "is also at or above its own trailing median over the same --rank-window bars — a "
+        "zero-param volatility floor that removes the quiet-window entries ÷σ ranking "
+        "otherwise fabricates. There is NO short leg, so a "
         "down-state simply pays no legs at all instead of paying two to reverse. Exit is a "
         "momentum-decay flip to flat: the position is held while the statistic stays above "
         "the 0.5 quantile (the trailing median) of that same distribution and is closed the "
@@ -83,8 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
         "ordinary noise. Dividing by sigma makes 'top-quantile momentum' mean the same thing "
         "across vol regimes (2022 high-vol bear, 2024 low-vol grind, 2025). There is no stop "
         "and no profit target, so winners still run uncapped to session.py's forced flatten. "
-        "The exit quantile is a module constant in strategy.py and is NOT searched, so there "
-        "is no flag for it; because a decayed trade can re-enter later in the same session if "
+        "The exit quantile and the volatility-floor quantile are module constants in "
+        "strategy.py and are NOT searched, so there is no flag for either; because a decayed "
+        "trade can re-enter later in the same session if "
         "the rank climbs back above --rank-pct, a traded session is not exactly one round trip)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],

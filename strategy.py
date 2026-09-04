@@ -1,24 +1,29 @@
-"""Long-only risk-adjusted momentum rank (NQ 15min, New York session).
+"""Long-only risk-adjusted momentum rank with a volatility-floor entry guard
+(NQ 15min, New York session) — iteration 48, a variation of iteration 47.
 
-A new family that carries forward the repo's only clean robust:true
-construction — iteration 36's long-only, self-normalizing trailing-quantile
-momentum rank (slow formation grid 96-384, rank_window 960, decay-flip exit,
-no stop/target) — and changes exactly one thing: the statistic that gets
-ranked. Iteration 36 ranked the raw formation-period cumulative return
-`Close_t / Close_{t-formation_lookback} - 1` (vault eq. 267). This ranks the
-vault's documented volatility-normalized return `R_mean / σ` (eq. 269)
-instead, over the same trailing `formation_lookback` window.
+Iteration 47 ranked the volatility-normalized formation return `R_mean / σ`
+(vault eq. 269) against its own trailing quantile and was rejected overfit-gap
+(IS Sharpe 1.59 -> OOS 0.65). Its decisive diagnostic was the comparison to
+iteration 36, which ranked the *raw* formation return instead: both runs exit
+~90% of OOS trades at the forced session flatten with a ~0.97 payoff ratio,
+but 36's raw-return entry cleared Sharpe 1.24 / robust:true while 47's ÷σ
+entry reached only 0.65 with a lower win rate (56.5% vs 60.5%), thinner
+per-trade edge (6.2bp vs 12.9bp) and heavier top-5 concentration (70% vs
+47.5%) — so the exit is not the differentiator and the risk-adjusted
+statistic itself is the defect.
 
-Why: the loop's named primary open problem is regime fragility. A raw-return
-rank means "top-quantile momentum" only relative to the volatility regime it
-was calibrated in — iteration 40's raw-return rank collapsed exactly when the
-2025 vol regime differed from its train regime. Dividing the formation-period
-mean 1-bar return by its own sample σ makes "top-quantile momentum" mean the
-same thing across the 2022 high-vol bear, the 2024 low-vol grind, and 2025.
-It is distinct from the failed `intraday_tsmom_risk_adjusted` family (iters
-7/20) on three axes: slow 96-384 horizon instead of 24-192, percentile-rank
-self-normalization instead of an absolute t-stat threshold, and long-only
-instead of symmetric.
+The mechanism of that defect: ÷σ ranking up-weights low-volatility formation
+windows — a modest drift in a quiet window outranks a strong drift in a
+volatile one — and that is exactly the regime where momentum does not work
+(vault volatility.md: "Low-Volatility Regime … trend-following struggles").
+This iteration does NOT touch the exit or any stop/target. It adds a single
+type-(b) zero-param entry filter: a long now additionally requires the
+formation σ_t to be at least the trailing median of σ over the same
+`rank_window` bars. That removes the quiet-window degenerate entries without
+adding any grid axis or selection pressure — critical when the failure mode
+is overfit-gap and the optimizer is already fitting a noisy surface.
+Entry/exit/grids are otherwise byte-identical to 47 so the filter is the only
+change and the result is attributable.
 
 The mechanism
 -------------
@@ -42,7 +47,10 @@ Close_t -> Close_{t+1} return the signal never sees.
 
     σ_t <= 0 (flat-vol bars) or non-finite σ_t (unwarmed bars) sets risk_adj
     to NaN, so those bars fail closed. σ is a sample std over L >= 96
-    observations, so ddof=1 is never degenerate.
+    observations, so ddof=1 is never degenerate. σ_t itself is kept as the
+    raw std — finite 0.0 for a flat window, NaN only where unwarmed — so the
+    volatility-floor filter below can compare it against its own trailing
+    median rather than seeing flat windows as missing observations.
 
   - Self-referential entry threshold — the trailing `rank_pct` quantile of the
     same statistic, current bar excluded from its own distribution:
@@ -56,15 +64,30 @@ Close_t -> Close_{t+1} return the signal never sees.
     rather than `.apply(...)` on purpose: orders of magnitude faster across a
     12-combo grid x ~48 folds.
 
-Entry — a dense long-only state
--------------------------------
-A raw +1.0 long is emitted wherever `risk_adj_t > enter_threshold_t`, strict
-`>` (the top (1-rank_pct) quantile of the trailing distribution). Long-only:
-there is no short branch, so -1.0 is never emitted and a down-state simply
-pays no legs at all instead of paying two to reverse.
+  - Volatility floor (iteration 48's ONLY change from 47) — the trailing
+    median of σ over the same window, current bar excluded:
 
-Exit — decay-flip to flat, no stop, no target
----------------------------------------------
+        sigma_floor_t = σ_t.shift(1)
+                           .rolling(rank_window, min_periods=rank_window)
+                           .quantile(VOL_FLOOR_PCT)        # VOL_FLOOR_PCT = 0.5
+
+    A formation window whose σ_t sits below its own trailing median is a
+    below-median-volatility regime — precisely where ÷σ ranking fabricates
+    its degenerate top-quantile entries — so the long is withheld there.
+
+Entry — a dense long-only state gated on above-median volatility
+----------------------------------------------------------------
+A raw +1.0 long is emitted only where BOTH hold, strict comparisons:
+
+    (a) risk_adj_t > enter_threshold_t   (top (1-rank_pct) quantile)
+    (b) σ_t >= sigma_floor_t             (formation vol at/above its own
+                                          trailing median)
+
+Long-only: there is no short branch, so -1.0 is never emitted and a down-state
+simply pays no legs at all instead of paying two to reverse.
+
+Exit — decay-flip to flat, no stop, no target (unchanged from 47)
+----------------------------------------------------------------
 Plain `apply_session_constraint` (NOT the `with_stops` variant) — no stop, no
 target, upside uncapped, duration bounded by the session. Decay is a second
 hardcoded threshold on the same statistic:
@@ -75,19 +98,24 @@ hardcoded threshold on the same statistic:
 
 Raw entries are three-state:
 
-        1.0   where risk_adj_t > enter_threshold_t   (enter / stay long)
-        0.0   where risk_adj_t < exit_threshold_t    (decayed -> go flat)
-        NaN   in between                             (hysteresis band -> hold)
+        1.0   where (risk_adj > enter) AND (σ >= sigma_floor)  (enter / stay long)
+        0.0   where risk_adj < exit_threshold                  (decayed -> go flat)
+        NaN   in between                                       (hysteresis band -> hold)
 
-Exit is written first and entry second, so an entry wins on any overlap; at
-`rank_pct >= 0.80` against `EXIT_PCT = 0.5` the entry quantile is strictly
-above the exit quantile on any non-degenerate distribution, so the two masks
-are disjoint anyway, but the ordering makes that structural.
-`apply_session_constraint` forward-fills the sparse series: 0.0 is an explicit
-flat instruction, NaN a genuine hold, and the last bar of every session is
-force-flattened by `session.py`. A long is therefore held through ordinary
-noise (the entry-to-median band) and flattened on the first below-median bar;
-a still-trending winner runs uncapped to the forced session flatten.
+The volatility floor gates the entry side only: once long, the hold/exit is
+driven purely by risk_adj vs its own trailing median, so the floor does not
+truncate a winner mid-session. A bar whose risk_adj clears the entry quantile
+but whose σ is below its median emits NaN — while flat that keeps the position
+flat (the intended withhold), while long it leaves the existing long untouched
+(the floor is not an exit). Exit is written first and entry second so an entry
+wins on any overlap; the two masks are disjoint anyway (the entry quantile
+sits strictly above the median and the floor only prunes the entry set), but
+the ordering makes that structural. `apply_session_constraint` forward-fills
+the sparse series: 0.0 is an explicit flat instruction, NaN a genuine hold,
+and the last bar of every session is force-flattened by `session.py`. A long
+is therefore held through ordinary noise (the entry-to-median band) and
+flattened on the first below-median bar; a still-trending winner runs uncapped
+to the forced session flatten.
 
 Fail-closed is exact while flat: an unwarmed/flat-vol bar leaves both
 thresholds NaN, both comparisons False, the bar emits NaN, and the forward
@@ -111,9 +139,10 @@ Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`)
     re-checking that arithmetic *and* the fold-skip guard — see build_grid().
   - `rank_pct` is a quantile level in (0, 1), never a bar count, so it is
     passed as `float` and correctly ignored by the buffer sizing.
-  - `EXIT_PCT` is a module constant and is **never grid-searched**: it adds no
-    `build_grid()` / `DEFAULT_PARAMS` key, so the exit keeps zero degrees of
-    freedom.
+  - `EXIT_PCT` (the 0.5 decay quantile) and `VOL_FLOOR_PCT` (the 0.5
+    volatility-floor quantile) are module constants and are **never
+    grid-searched**: they add no `build_grid()` / `DEFAULT_PARAMS` key, so the
+    exit and the entry floor together keep zero degrees of freedom.
 
 Cost note: `metrics.py`'s per-leg toll (0.001% fee + 0.005% slippage) is
 unchanged and out of scope. The long-only construction still interacts with
@@ -135,32 +164,44 @@ from session import apply_session_constraint
 # value, and the exit keeps zero degrees of freedom.
 EXIT_PCT = 0.5
 
+# Quantile of the trailing formation-volatility (σ) distribution that σ_t must
+# meet or exceed before a long can open. Hardcoded, NOT grid-searched — the
+# iteration-48 volatility floor: "the formation window must be at least
+# median-volatility for its top-quantile ÷σ momentum to be trustworthy". This
+# is the only change from iteration 47 and keeps zero degrees of freedom.
+VOL_FLOOR_PCT = 0.5
 
-def risk_adjusted_return(close: pd.Series, formation_lookback: int) -> pd.Series:
-    """Volatility-normalized formation-period return (vault eq. 269).
+
+def formation_stats(close: pd.Series, formation_lookback: int) -> tuple[pd.Series, pd.Series]:
+    """Formation-period (risk_adj, sigma) pair (vault eqs. 269-270).
 
     Computes the 1-bar simple return r_t = Close_t/Close_{t-1} - 1, then the
     mean and sample std of r over the trailing `formation_lookback` bars, and
-    returns mean / std. Bars where std <= 0 (flat-vol) or std is non-finite
-    (unwarmed) are NaN, so they fail closed downstream. std is a sample std
-    (ddof=1) over L >= 96 observations, never degenerate.
+    returns (mean/std, std). risk_adj is NaN where std <= 0 (flat-vol) or std
+    is non-finite (unwarmed/overflow), so those bars fail closed downstream.
+    sigma is the raw sample std (ddof=1): NaN only where unwarmed, 0.0 for a
+    flat window — kept finite on purpose so the volatility-floor filter (σ_t
+    vs its trailing median) sees a flat window as *low* volatility, not as a
+    missing observation.
     """
     n = int(formation_lookback)
     with np.errstate(divide="ignore", invalid="ignore"):
         r = close / close.shift(1) - 1.0
 
     mean = r.rolling(n, min_periods=n).mean()
-    sigma = r.rolling(n, min_periods=n).std()
+    sigma = r.rolling(n, min_periods=n).std()  # ddof=1
 
     with np.errstate(divide="ignore", invalid="ignore"):
         risk_adj = mean / sigma
 
-    # sigma <= 0 (flat-vol) or non-finite sigma (unwarmed) -> NaN, so those
-    # bars carry no instruction. The replace also drops any non-finite ratio
-    # (mean/sigma overflow) so only genuine finite values reach the rank.
-    return risk_adj.where(np.isfinite(sigma) & (sigma > 0.0)).replace(
+    # std <= 0 (flat-vol) or non-finite std (unwarmed/overflow) -> NaN, so
+    # those bars carry no ratio instruction. The replace also drops any
+    # non-finite ratio (mean/std overflow) so only genuine finite values reach
+    # the rank. sigma itself is returned unmodified.
+    risk_adj = risk_adj.where(np.isfinite(sigma) & (sigma > 0.0)).replace(
         [np.inf, -np.inf], np.nan
     )
+    return risk_adj, sigma
 
 
 def trailing_rank_threshold(stat: pd.Series, rank_window: int, pct: float) -> pd.Series:
@@ -168,8 +209,10 @@ def trailing_rank_threshold(stat: pd.Series, rank_window: int, pct: float) -> pd
     the current bar from its own threshold.
 
     Strictly warm (`min_periods == rank_window`), so unwarmed bars are NaN and
-    fail closed downstream. Called twice per run — once at `rank_pct` for the
-    entry level, once at `EXIT_PCT` for the decay level — off the same series.
+    fail closed downstream. Called three times per run — once at `rank_pct`
+    for the entry level, once at `EXIT_PCT` for the decay level (both off the
+    risk-adjusted series), and once at `VOL_FLOOR_PCT` for the volatility
+    floor (off the σ series).
     """
     w = int(rank_window)
     return stat.shift(1).rolling(w, min_periods=w).quantile(float(pct))
@@ -184,17 +227,20 @@ def generate_positions(
 ) -> pd.Series:
     close = df["Close"].astype(float)
 
-    stat = risk_adjusted_return(close, formation_lookback)
+    stat, sigma = formation_stats(close, formation_lookback)
     enter_threshold = trailing_rank_threshold(stat, rank_window, rank_pct)
     exit_threshold = trailing_rank_threshold(stat, rank_window, EXIT_PCT)
+    sigma_floor = trailing_rank_threshold(sigma, rank_window, VOL_FLOOR_PCT)
 
-    # Top-quantile risk-adjusted return -> long; the same statistic below its
-    # own trailing median -> momentum has decayed, go flat. Strict comparisons;
-    # NaN on either side (unwarmed formation window or unwarmed rank window)
-    # compares False on both, so such a bar emits NaN = "no instruction" and
-    # the delegate's forward fill leaves the position where it already was.
+    # Long requires BOTH the top-quantile risk-adjusted return AND formation
+    # volatility at or above its own trailing median (the iteration-48 floor).
+    # Decay is the same statistic below its own trailing median. Strict
+    # comparisons; NaN on either side (unwarmed formation window or unwarmed
+    # rank window) compares False on both, so such a bar emits NaN = "no
+    # instruction" and the delegate's forward fill leaves the position where
+    # it already was.
     with np.errstate(invalid="ignore"):
-        long_signal = stat > enter_threshold
+        long_signal = (stat > enter_threshold) & (sigma >= sigma_floor)
         decay_signal = stat < exit_threshold
 
     # Raw, session-unaware entries: 1.0 long / 0.0 flat / NaN hold. Exit is
@@ -217,8 +263,9 @@ DEFAULT_PARAMS = {
     # quantile level and must not. formation_lookback (96/192/288/384) and
     # rank_pct (0.80/0.875/0.925) are the two grid-searched axes; rank_window
     # is fixed at 960 and threaded through, never searched. `session` is a
-    # fixed param. EXIT_PCT (the 0.5 decay quantile) is a module constant, so
-    # it deliberately has no entry here.
+    # fixed param. EXIT_PCT (the 0.5 decay quantile) and VOL_FLOOR_PCT (the
+    # 0.5 volatility-floor quantile) are module constants, so they
+    # deliberately have no entry here.
     "formation_lookback": 192,
     "rank_pct": 0.875,
     "rank_window": 960,
