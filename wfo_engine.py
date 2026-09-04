@@ -42,86 +42,56 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(hurst_windows, drift_lookbacks, h_thresholds, session) -> list[dict]:
+def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched, and they are the strategy's only three degrees
-    of freedom (this iteration is long-only + trend-gated, so the grid itself
-    is byte-identical to the previous two-sided run):
-      - `hurst_window` - trailing bars (in bars) over which the multi-scale
-        variance-growth Hurst estimate is computed. 384/768/1152 bars are
-        ~4/8/12 UTC days at 15min.
-      - `drift_lookback` - bars of backward drift
-        (Close[t-1]/Close[t-1-drift_lookback] - 1) which must be POSITIVE to
-        arm a long; drift <= 0 is an off-bar, never a short (the short branch
-        is retired). 96/192/384 bars are ~1/2/4 UTC days at 15min.
-      - `h_threshold` - the Hurst persistence gate: the state is on only while
-        the estimated H is strictly above this value. Gridded (0.5/0.55/0.6)
-        rather than hardcoded because the naive overlapping variance-growth
-        estimator carries a known scale bias.
+    Two params are searched: `formation_lookback` (how many completed bars the
+    volatility-normalized momentum statistic — the mean 1-bar simple return
+    over that window divided by its sample standard deviation, vault eq. 269 —
+    is computed over) and `rank_pct` (how deep into the trailing distribution
+    of that statistic a bar has to rank before the strategy goes long). Nothing
+    else is tunable: the exit is a momentum-decay flip to flat when the same
+    statistic falls below its own trailing median (`EXIT_PCT = 0.5`, a module
+    constant in `strategy.py`, deliberately NOT a searched axis). There is no
+    stop and no profit target, so a winner still runs uncapped to `session.py`'s
+    forced flatten.
 
-    One param is fixed and threaded into every combo as-is, never searched:
-    `session` (required by CLAUDE.md).
-
-    Two things are deliberately NOT here, so they keep zero degrees of freedom:
-      - `strategy.HURST_TAUS` (1/2/4/8/16/32 bars) — the module-constant
-        multi-scale ladder, so the persistence gate keeps exactly one degree
-        of freedom (`h_threshold`).
-      - `strategy.TREND_MA` (960 bars) — the module-constant, zero-param
-        higher-timeframe uptrend gate: a long fires only while
-        Close > SMA(Close, 960). Because it is a module constant (not a grid
-        param), `_max_lookback_bars()` never sees it; that is safe since the
-        intended grid's binding int is `hurst_window = 1152`, whose
-        (1152 + 5) * 3 = 3,471-bar buffer clears the SMA's 960-bar warm-up
-        (and Hurst's 1152 + 32 = 1,184) at every grid corner.
-
-    There is no stop param and no target param either: the exit is the
-    flip-to-flat state decay (any gate off -> 0.0) plus the session flatten.
-    Because there is no short branch, a gate turning off can only close/re-open
-    a long — never reverse long<->short.
-
-    No cross-param filter is applied and none is needed: every combination is
-    a valid strategy (there is no degenerate pair the way a `fast_ma >=
-    slow_ma` pair would be), so no CLI override can silently empty the grid.
-    `drift_lookback` may exceed or undercut `hurst_window` freely; both
-    orderings are meaningful.
+    Two params are fixed and threaded into every combo as-is, never searched:
+    `session` (required by CLAUDE.md) and `rank_window`.
 
     Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `hurst_window` and `drift_lookback` are cast to `int` **on purpose**.
-        They are genuine bar-count lookbacks, so they are exactly what
-        `_max_lookback_bars()` is meant to see when it sizes the
+      - `formation_lookback` and `rank_window` are both cast to plain `int`
+        **on purpose** — both are genuine bar counts and both should feed the
         pre-test-window warm-up buffer.
-      - `h_threshold` is cast to `float` **on purpose**. It is a Hurst gate,
-        not a bar count, so it must never feed that buffer. The cast is
-        defensive: a grid point hand-written as `1` would otherwise arrive as
-        an `int` and be read as a bar count.
-      - Consequently `_max_lookback_bars()` returns max(hurst_windows) = 1152
-        at the intended grid, the buffer is
-        max((1152 + 5) * 3, bars_per_day + 5) = 3,471 bars, and
-        `run_walk_forward()`'s fold-skip guard is `len(train_df) < 1162`.
-        A 12-week train window at 15min is ~7,700 bars, so no fold is skipped
-        - the intended timeframe. At 1h a 12-week train window is ~2,016 bars
-        (above the guard, so folds still run, but with a heavy 3,471-bar
-        warm-up buffer); at 4h/1d every fold is skipped. Run it at
-        `--timeframe 15min`.
-      - Hand-check for the legs `_max_lookback_bars()` cannot see (the tau
-        ladder, the shift, and the hardcoded trend SMA never appear in the
-        grid): the Hurst regression's slowest column (tau = 32) is non-NaN
-        only after hurst_window + 31 bars, and `strategy.hurst_exponent`
-        shifts by one more, so H needs hurst_window + 32 bars of history;
-        drift needs drift_lookback + 1 bars; the trend gate's SMA needs
-        TREND_MA = 960 bars. The intended buffer (3,471 bars) clears all three
-        at every grid corner (max needs: 1,184 / 385 / 960). If it ever did
-        not, the failure is a NaN gate -> state unknown -> no entry on the
-        first bars of a test window: missed trades, never lookahead.
+      - `rank_window` is the larger, so it is what sizes that buffer:
+        `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895 bars, which
+        covers the strategy's true requirement of
+        `rank_window + max(formation_lookback)` = 960 + 384 = 1344 at the top
+        of the slow-end formation grid 96/192/288/384. Both the entry
+        threshold and the decay-exit threshold are quantiles of the same
+        `rank_window` rolling window over the same risk-adjusted statistic, so
+        that single number is the whole warm-up story — there is no
+        module-constant window that `_max_lookback_bars()` cannot see.
+      - `rank_pct` is cast to `float` on purpose — it is a quantile level in
+        (0, 1), never a bar count. The cast is defensive: a grid point written
+        as `1` would otherwise arrive as an `int` and inflate the buffer.
+
+    COVERAGE HAZARD — do not raise `rank_window` (and be careful pointing this
+    strategy at a coarse timeframe) without redoing this arithmetic:
+    `run_walk_forward()` below skips any fold whose train window holds fewer
+    than `max_lookback + 10` bars, i.e. 970 here. A 12-week train window at
+    15min is ~5,700 bars and a 3-week test window ~1,900, so the guard is
+    comfortable at the intended timeframe. 1h (~1,400 bars per 12-week train
+    window) still clears it, with ~40% headroom; 4h (~350) does not, and every
+    fold there would be silently skipped — the iteration-31 failure mode.
     """
     grid = []
-    for hurst_window, drift_lookback, h_threshold in product(hurst_windows, drift_lookbacks, h_thresholds):
+    for formation_lookback, rank_pct in product(formation_lookbacks, rank_pcts):
         grid.append(
             {
-                "hurst_window": int(hurst_window),
-                "drift_lookback": int(drift_lookback),
-                "h_threshold": float(h_threshold),
+                "formation_lookback": int(formation_lookback),
+                "rank_pct": float(rank_pct),
+                "rank_window": int(rank_window),
                 "session": session,
             }
         )

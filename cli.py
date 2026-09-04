@@ -70,60 +70,56 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only trend-gated Hurst drift momentum: a bar is LONG only "
-        "while ALL THREE gates hold — (1) the multi-scale variance-growth Hurst estimate "
-        "of the trailing --hurst-window bars is strictly above --h-threshold (H > 0.5 is "
-        "the canonical persistence boundary: variance grows superlinearly, i.e. "
-        "trending), (2) the backward --drift-lookback-bar drift "
-        "Close[t-1]/Close[t-1-drift_lookback]-1 is positive, and (3) Close_t is above "
-        "its 960-bar SMA — a hardcoded zero-param higher-timeframe uptrend gate (NOT "
-        "grid-searched). There is NO short branch: a negative or zero drift is an "
-        "off-bar, never -1. Hurst is estimated per bar by regressing "
-        "log(Var(tau-bar log returns)) on log(tau) for tau in {1,2,4,8,16,32}, "
-        "H = slope/2, over OVERLAPPING tau-returns, shifted one bar so bar t sees only "
-        "data strictly before t; the naive overlapping estimator carries a known scale "
-        "bias, which is exactly why --h-threshold is gridded rather than hardcoded. "
-        "NO entry threshold on price magnitude, NO stop and NO target. The exit is a "
-        "FLIP-TO-FLAT — raw entries carry +1.0 while all three gates are on and 0.0 "
-        "while any is known-off (H <= h_threshold, drift <= 0, or Close <= SMA(960)), "
-        "so session.apply_session_constraint flattens on the first off bar and stays "
-        "flat until a fresh on-state re-arms; NaN (unwarmed) bars hold. Because there "
-        "is no -1 branch, a gate turning off can only close/re-open a long, never "
-        "reverse long<->short. session.py force-flattens on the session's last bar. "
-        "NOTE: --hurst-window and --drift-lookback are genuine bar counts and size "
-        "wfo_engine's warm-up buffer — see --hurst-window)"
+        "strategy grid (long-only risk-adjusted momentum rank: each bar's formation-period "
+        "volatility-normalized return — the mean 1-bar simple return Close_t/Close_{t-1} - 1 "
+        "over the trailing --formation-lookback bars divided by its own sample std, vault "
+        "eq. 269 R_mean/sigma — is ranked against its own trailing distribution: the "
+        "--rank-pct quantile of that same statistic over the previous --rank-window bars, "
+        "current bar excluded. Top-quantile bars go LONG; there is NO short leg, so a "
+        "down-state simply pays no legs at all instead of paying two to reverse. Exit is a "
+        "momentum-decay flip to flat: the position is held while the statistic stays above "
+        "the 0.5 quantile (the trailing median) of that same distribution and is closed the "
+        "bar it drops below, so the entry-to-median band is a hysteresis hold that rides out "
+        "ordinary noise. Dividing by sigma makes 'top-quantile momentum' mean the same thing "
+        "across vol regimes (2022 high-vol bear, 2024 low-vol grind, 2025). There is no stop "
+        "and no profit target, so winners still run uncapped to session.py's forced flatten. "
+        "The exit quantile is a module constant in strategy.py and is NOT searched, so there "
+        "is no flag for it; because a decayed trade can re-enter later in the same session if "
+        "the rank climbs back above --rank-pct, a traded session is not exactly one round trip)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--hurst-window", default="384,768,1152",
-                        help="comma-separated trailing-bar windows IN BARS over which the "
-                             "multi-scale variance-growth Hurst estimate is computed "
-                             "(384/768/1152 ~ 4/8/12 UTC days at 15min). Parsed as ints ON "
-                             "PURPOSE: a genuine lookback meant to feed wfo_engine's "
-                             "warm-up buffer. TIMEFRAME WARNING: at the 1152 top of this "
-                             "grid the buffer is (1152+5)*3 = 3,471 bars and "
-                             "run_walk_forward()'s fold-skip guard becomes len(train_df) < "
-                             "1162. A 12-week train window is ~7,700 bars at 15min (fine, "
-                             "and that is the intended timeframe) and ~2,016 bars at 1h "
-                             "(above the guard, so folds still run, but with the heavy "
-                             "buffer); at 4h/1d every fold is skipped. "
-                             "Always pass --timeframe 15min")
-    strat.add_argument("--drift-lookback", default="96,192,384",
-                        help="comma-separated lookbacks IN BARS for the backward drift "
-                             "Close[t-1]/Close[t-1-lookback]-1, which must be POSITIVE "
-                             "to arm a long (drift <= 0 is an off-bar, never a short — "
-                             "this iteration is long-only) (96/192/384 ~ 1/2/4 UTC days "
-                             "at 15min). Parsed as ints ON PURPOSE — same reason as "
-                             "--hurst-window. May be longer or shorter than --hurst-window; "
-                             "both orderings are meaningful and no combination is degenerate")
-    strat.add_argument("--h-threshold", default="0.5,0.55,0.6",
-                        help="comma-separated Hurst gates: the state is on only while the "
-                             "estimated H is strictly above this value. 0.5 is the "
-                             "canonical persistence boundary (H > 0.5 = trending, variance "
-                             "grows superlinearly; H < 0.5 = mean-reverting); 0.55/0.6 are "
-                             "safety margins against the naive overlapping estimator's "
-                             "known scale bias. Floats, NOT bar counts, so they must not "
-                             "feed the warm-up buffer")
+    strat.add_argument("--formation-lookback", default="96,192,288,384",
+                        help="comma-separated momentum formation periods, in bars — how far back "
+                             "the mean 1-bar return and its sample std (the R_mean/sigma "
+                             "risk-adjusted return that gets ranked) are measured over. "
+                             "Genuine bar-count lookbacks, passed as ints, so they feed "
+                             "wfo_engine's pre-test-window warm-up buffer (though --rank-window, "
+                             "being larger, is what actually sizes it). The default grid is the "
+                             "SLOW end only: the dead fast end (24/48) is retired and 288/384 "
+                             "are opened above the old boundary. Do not push past ~384 with "
+                             "--rank-window at 960: the trailing quantile then rests on only "
+                             "~960/L (~2.5 at 384) independent non-overlapping observations and "
+                             "the threshold itself gets jumpy")
+    strat.add_argument("--rank-pct", default="0.80,0.875,0.925",
+                        help="comma-separated quantile levels in (0,1) — a bar goes long when its "
+                             "risk-adjusted formation return is strictly above the rank_pct "
+                             "quantile of the trailing distribution, i.e. 0.90 means 'top decile'. "
+                             "Unlike every absolute threshold used in earlier iterations this "
+                             "re-scales itself with the volatility regime, so it should not churn "
+                             "across folds. Passed as floats and correctly ignored by the warm-up "
+                             "sizing")
+    strat.add_argument("--rank-window", type=int, default=960,
+                        help="FIXED, never grid-searched: how many trailing bars the rank "
+                             "threshold is computed over (960 = ~10 trading days of 15min bars). "
+                             "As the largest int in the grid this alone sizes the warm-up buffer "
+                             "to (960+5)*3 = 2895 bars, covering the true requirement of "
+                             "rank_window + max(formation_lookback) = 960 + 384 = 1344. Raising "
+                             "it also raises wfo_engine's fold-skip guard (max_lookback + 10 = 970 "
+                             "bars of train window); that is comfortable at 15min (~5,700 bars per "
+                             "12-week train window) and still clears at 1h (~1,400), but at 4h "
+                             "(~350) EVERY fold is silently skipped — so re-check both numbers "
+                             "before raising it or moving to a coarser timeframe")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -174,13 +170,13 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # hurst_window / drift_lookback are cast to int (genuine bar-count
-        # lookbacks that are meant to size wfo_engine's warm-up buffer);
-        # h_threshold is a float Hurst gate and must never feed it.
-        hurst_windows = parse_num_list(args.hurst_window, int)
-        drift_lookbacks = parse_num_list(args.drift_lookback, int)
-        h_thresholds = parse_num_list(args.h_threshold, float)
-        grid = build_grid(hurst_windows, drift_lookbacks, h_thresholds, session)
+        # formation_lookback is cast to int (a genuine bar-count lookback that
+        # is meant to size wfo_engine's warm-up buffer); rank_pct is a float
+        # quantile level and must never feed it. rank_window is a FIXED int
+        # (bar count) threaded through, never grid-searched.
+        formation_lookbacks = parse_num_list(args.formation_lookback, int)
+        rank_pcts = parse_num_list(args.rank_pct, float)
+        grid = build_grid(formation_lookbacks, rank_pcts, args.rank_window, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -221,18 +217,17 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the three grid-searched params are reported here; `session` is
-        # fixed across every combo, so its "distinct values" would always be 1
-        # and carry no stability information. (strategy.HURST_TAUS is a module
-        # constant, not a param, so it never appears in best_params.)
-        hurst_window_vals = sorted({p["hurst_window"] for p in chosen})
-        drift_lookback_vals = sorted({p["drift_lookback"] for p in chosen})
-        h_threshold_vals = sorted({p["h_threshold"] for p in chosen})
+        # Only the two grid-searched params are reported here; `session` and
+        # `rank_window` are fixed across every combo, so their "distinct
+        # values" would always be 1 and carry no stability information.
+        # (strategy.EXIT_PCT is a module constant, not a param, so it never
+        # appears in best_params.)
+        formation_lookback_vals = sorted({p["formation_lookback"] for p in chosen})
+        rank_pct_vals = sorted({p["rank_pct"] for p in chosen})
         print(
-            f"Fold param stability: {len(hurst_window_vals)} distinct hurst window "
-            f"{hurst_window_vals}, {len(drift_lookback_vals)} distinct drift lookback "
-            f"{drift_lookback_vals}, {len(h_threshold_vals)} distinct h threshold "
-            f"{h_threshold_vals}"
+            f"Fold param stability: {len(formation_lookback_vals)} distinct formation lookback "
+            f"{formation_lookback_vals}, {len(rank_pct_vals)} distinct rank pct "
+            f"{rank_pct_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -269,9 +264,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "hurst_window": f.best_params.get("hurst_window"),
-                "drift_lookback": f.best_params.get("drift_lookback"),
-                "h_threshold": f.best_params.get("h_threshold"),
+                "formation_lookback": f.best_params.get("formation_lookback"),
+                "rank_pct": f.best_params.get("rank_pct"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
