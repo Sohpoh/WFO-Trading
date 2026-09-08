@@ -52,8 +52,13 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
     of that statistic a bar has to rank before the strategy goes long). Nothing
     else is tunable: the exit is a momentum-decay flip to flat when the same
     statistic falls below its own trailing median (`EXIT_PCT = 0.5`, a module
-    constant in `strategy.py`, deliberately NOT a searched axis), and the
-    entry additionally carries a zero-param volatility floor — the long is
+    constant in `strategy.py`, deliberately NOT a searched axis), OR-ed with a
+    zero-param vol-spike crash exit that flattens an open long when the 6-bar
+    average true range reaches 3.0x the 96-bar average true range
+    (`CRASH_ATR_FAST = 6`, `CRASH_ATR_SLOW = 96`, `CRASH_ATR_RATIO = 3.0`,
+    all module constants, all NOT searched — the crash condition only
+    truncates an open long, never withholds/reduces an entry). The entry
+    additionally carries a zero-param volatility floor — the long is
     withheld unless the formation σ is at or above its own trailing median
     (`VOL_FLOOR_PCT = 0.5`, also a module constant, also NOT searched). There
     is no stop and no profit target, so a winner still runs uncapped to
@@ -73,8 +78,11 @@ def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dic
         of the slow-end formation grid 96/192/288/384. Both the entry
         threshold and the decay-exit threshold are quantiles of the same
         `rank_window` rolling window over the same risk-adjusted statistic, so
-        that single number is the whole warm-up story — there is no
-        module-constant window that `_max_lookback_bars()` cannot see.
+        that single number is the whole warm-up story. The crash exit's ATR
+        windows (`CRASH_ATR_FAST = 6`, `CRASH_ATR_SLOW = 96`) are module
+        constants `_max_lookback_bars()` cannot see, but both sit below
+        `rank_window` and `max(formation_lookback)`, so the buffer already
+        covers them.
       - `rank_pct` is cast to `float` on purpose — it is a quantile level in
         (0, 1), never a bar count. The cast is defensive: a grid point written
         as `1` would otherwise arrive as an `int` and inflate the buffer.
