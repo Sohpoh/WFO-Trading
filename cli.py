@@ -70,65 +70,33 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only risk-adjusted momentum rank: each bar's formation-period "
-        "volatility-normalized return — the mean 1-bar simple return Close_t/Close_{t-1} - 1 "
-        "over the trailing --formation-lookback bars divided by its own sample std, vault "
-        "eq. 269 R_mean/sigma — is ranked against its own trailing distribution: the "
-        "--rank-pct quantile of that same statistic over the previous --rank-window bars, "
-        "current bar excluded. Top-quantile bars go LONG, but ONLY when the formation sigma "
-        "is also at or above its own trailing median over the same --rank-window bars — a "
-        "zero-param volatility floor that removes the quiet-window entries ÷σ ranking "
-        "otherwise fabricates. There is NO short leg, so a "
-        "down-state simply pays no legs at all instead of paying two to reverse. Exit is a "
-        "momentum-decay flip to flat: the position is held while the statistic stays above "
-        "the 0.5 quantile (the trailing median) of that same distribution and is closed the "
-        "bar it drops below, so the entry-to-median band is a hysteresis hold that rides out "
-        "ordinary noise. A second, zero-param crash exit OR-ed into that flat mask also "
-        "flattens an open long when the 6-bar average true range reaches 3.0x the 96-bar "
-        "average true range (a scale-free panic signature that exits during a drop rather "
-        "than after it); it only truncates an already-open long and never withholds or "
-        "reduces an entry. Dividing by sigma makes 'top-quantile momentum' mean the same thing "
-        "across vol regimes (2022 high-vol bear, 2024 low-vol grind, 2025). There is no stop "
-        "and no profit target, so winners still run uncapped to session.py's forced flatten. "
-        "The exit quantile, the volatility-floor quantile, and the three crash-exit constants "
-        "(fast/slow ATR windows plus the 3.0 ratio) are module constants in "
-        "strategy.py and are NOT searched, so there is no flag for any of them; because a decayed "
-        "trade can re-enter later in the same session if "
-        "the rank climbs back above --rank-pct, a traded session is not exactly one round trip)"
+        "strategy grid (long-only Kalman-filter trend momentum: a local-linear-trend "
+        "Kalman filter over log(Close) recursively estimates a level and a per-bar "
+        "slope — slope_{t+1} = slope_t + w (process noise sigma_w), y_t = level_t + v "
+        "(observation noise sigma_v). Only the noise RATIO sigma_w/sigma_v is searched "
+        "(--kf-noise-ratio); sigma_v itself is estimated from the filter's residual as "
+        "an EMA of squared innovations, so slope/sigma_v is scale-free. LONG where "
+        "slope/sigma_v > --min-slope; there is NO short leg, so a down-state pays no "
+        "legs at all. Exit is a plain decay flip to flat where slope/sigma_v < 0 (the "
+        "adaptive trend has turned) — no stop, no target, so winners run uncapped to "
+        "session.py's forced flatten. The band (0, --min-slope) is a hysteresis hold, so "
+        "a traded session is not exactly one round trip. The noise-estimation and "
+        "warm-up machinery are module constants in strategy.py and are NOT searched, so "
+        "there is no flag for them)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--formation-lookback", default="96,192,288,384",
-                        help="comma-separated momentum formation periods, in bars — how far back "
-                             "the mean 1-bar return and its sample std (the R_mean/sigma "
-                             "risk-adjusted return that gets ranked) are measured over. "
-                             "Genuine bar-count lookbacks, passed as ints, so they feed "
-                             "wfo_engine's pre-test-window warm-up buffer (though --rank-window, "
-                             "being larger, is what actually sizes it). The default grid is the "
-                             "SLOW end only: the dead fast end (24/48) is retired and 288/384 "
-                             "are opened above the old boundary. Do not push past ~384 with "
-                             "--rank-window at 960: the trailing quantile then rests on only "
-                             "~960/L (~2.5 at 384) independent non-overlapping observations and "
-                             "the threshold itself gets jumpy")
-    strat.add_argument("--rank-pct", default="0.80,0.875,0.925",
-                        help="comma-separated quantile levels in (0,1) — a bar goes long when its "
-                             "risk-adjusted formation return is strictly above the rank_pct "
-                             "quantile of the trailing distribution, i.e. 0.90 means 'top decile'. "
-                             "Unlike every absolute threshold used in earlier iterations this "
-                             "re-scales itself with the volatility regime, so it should not churn "
-                             "across folds. Passed as floats and correctly ignored by the warm-up "
-                             "sizing")
-    strat.add_argument("--rank-window", type=int, default=960,
-                        help="FIXED, never grid-searched: how many trailing bars the rank "
-                             "threshold is computed over (960 = ~10 trading days of 15min bars). "
-                             "As the largest int in the grid this alone sizes the warm-up buffer "
-                             "to (960+5)*3 = 2895 bars, covering the true requirement of "
-                             "rank_window + max(formation_lookback) = 960 + 384 = 1344. Raising "
-                             "it also raises wfo_engine's fold-skip guard (max_lookback + 10 = 970 "
-                             "bars of train window); that is comfortable at 15min (~5,700 bars per "
-                             "12-week train window) and still clears at 1h (~1,400), but at 4h "
-                             "(~350) EVERY fold is silently skipped — so re-check both numbers "
-                             "before raising it or moving to a coarser timeframe")
+    strat.add_argument("--kf-noise-ratio", default="0.01,0.05,0.1,0.2,0.5",
+                        help="comma-separated Kalman noise ratios sigma_w/sigma_v (process "
+                             "noise over observation noise). Larger = the slope re-rates "
+                             "faster and tracks recent turns more tightly (shorter effective "
+                             "memory); smaller = smoother, slower-to-adapt slope. Passed as "
+                             "floats and correctly ignored by the warm-up sizing")
+    strat.add_argument("--min-slope", default="0.25,0.5,1.0,2.0",
+                        help="comma-separated dimensionless per-bar slope thresholds. A bar "
+                             "goes long when the Kalman slope, normalized by the estimated "
+                             "observation noise sigma_v, is strictly above this. Passed as "
+                             "floats and correctly ignored by the warm-up sizing")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -179,13 +147,12 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # formation_lookback is cast to int (a genuine bar-count lookback that
-        # is meant to size wfo_engine's warm-up buffer); rank_pct is a float
-        # quantile level and must never feed it. rank_window is a FIXED int
-        # (bar count) threaded through, never grid-searched.
-        formation_lookbacks = parse_num_list(args.formation_lookback, int)
-        rank_pcts = parse_num_list(args.rank_pct, float)
-        grid = build_grid(formation_lookbacks, rank_pcts, args.rank_window, session)
+        # kf_noise_ratio and min_slope are both floats: neither is a bar-count
+        # lookback, so neither must feed wfo_engine's warm-up buffer (the grid
+        # carries no int param, so the buffer collapses to the one-day floor).
+        kf_noise_ratios = parse_num_list(args.kf_noise_ratio, float)
+        min_slopes = parse_num_list(args.min_slope, float)
+        grid = build_grid(kf_noise_ratios, min_slopes, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -226,17 +193,16 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the two grid-searched params are reported here; `session` and
-        # `rank_window` are fixed across every combo, so their "distinct
-        # values" would always be 1 and carry no stability information.
-        # (strategy.EXIT_PCT is a module constant, not a param, so it never
-        # appears in best_params.)
-        formation_lookback_vals = sorted({p["formation_lookback"] for p in chosen})
-        rank_pct_vals = sorted({p["rank_pct"] for p in chosen})
+        # Only the two grid-searched params are reported here; `session` is
+        # fixed across every combo, so its "distinct values" would always be 1
+        # and carry no stability information. (strategy.SIGMA_EMA_SPAN etc. are
+        # module constants, not params, so they never appear in best_params.)
+        kf_noise_ratio_vals = sorted({p["kf_noise_ratio"] for p in chosen})
+        min_slope_vals = sorted({p["min_slope"] for p in chosen})
         print(
-            f"Fold param stability: {len(formation_lookback_vals)} distinct formation lookback "
-            f"{formation_lookback_vals}, {len(rank_pct_vals)} distinct rank pct "
-            f"{rank_pct_vals}"
+            f"Fold param stability: {len(kf_noise_ratio_vals)} distinct kf noise ratio "
+            f"{kf_noise_ratio_vals}, {len(min_slope_vals)} distinct min slope "
+            f"{min_slope_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -273,8 +239,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "formation_lookback": f.best_params.get("formation_lookback"),
-                "rank_pct": f.best_params.get("rank_pct"),
+                "kf_noise_ratio": f.best_params.get("kf_noise_ratio"),
+                "min_slope": f.best_params.get("min_slope"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

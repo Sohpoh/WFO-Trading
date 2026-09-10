@@ -42,67 +42,48 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(formation_lookbacks, rank_pcts, rank_window, session) -> list[dict]:
+def build_grid(kf_noise_ratios, min_slopes, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched: `formation_lookback` (how many completed bars the
-    volatility-normalized momentum statistic — the mean 1-bar simple return
-    over that window divided by its sample standard deviation, vault eq. 269 —
-    is computed over) and `rank_pct` (how deep into the trailing distribution
-    of that statistic a bar has to rank before the strategy goes long). Nothing
-    else is tunable: the exit is a momentum-decay flip to flat when the same
-    statistic falls below its own trailing median (`EXIT_PCT = 0.5`, a module
-    constant in `strategy.py`, deliberately NOT a searched axis), OR-ed with a
-    zero-param vol-spike crash exit that flattens an open long when the 6-bar
-    average true range reaches 3.0x the 96-bar average true range
-    (`CRASH_ATR_FAST = 6`, `CRASH_ATR_SLOW = 96`, `CRASH_ATR_RATIO = 3.0`,
-    all module constants, all NOT searched — the crash condition only
-    truncates an open long, never withholds/reduces an entry). The entry
-    additionally carries a zero-param volatility floor — the long is
-    withheld unless the formation σ is at or above its own trailing median
-    (`VOL_FLOOR_PCT = 0.5`, also a module constant, also NOT searched). There
-    is no stop and no profit target, so a winner still runs uncapped to
-    `session.py`'s forced flatten.
+    Two params are searched, both passed as `float` **on purpose**: they are
+    NOT bar-count lookbacks, so neither should feed `_max_lookback_bars()`'s
+    pre-test-window warm-up buffer (a grid point written as `1` would otherwise
+    arrive as an `int` and silently inflate it).
 
-    Two params are fixed and threaded into every combo as-is, never searched:
-    `session` (required by CLAUDE.md) and `rank_window`.
+      - `kf_noise_ratio` — the local-linear-trend Kalman filter's noise ratio
+        `sigma_w / sigma_v` (process noise over observation noise). The
+        filter's slope is the trend signal; `sigma_v` itself is estimated from
+        the filter's residual inside `strategy.py`, so only the *ratio* is a
+        searched knob.
+      - `min_slope` — the dimensionless per-bar slope threshold above which a
+        long opens (`slope / sigma_v > min_slope`).
 
-    Type discipline (see CLAUDE.md and `_max_lookback_bars()` below):
-      - `formation_lookback` and `rank_window` are both cast to plain `int`
-        **on purpose** — both are genuine bar counts and both should feed the
-        pre-test-window warm-up buffer.
-      - `rank_window` is the larger, so it is what sizes that buffer:
-        `buffer_bars = max((960 + 5) * 3, day_bars + 5)` = 2895 bars, which
-        covers the strategy's true requirement of
-        `rank_window + max(formation_lookback)` = 960 + 384 = 1344 at the top
-        of the slow-end formation grid 96/192/288/384. Both the entry
-        threshold and the decay-exit threshold are quantiles of the same
-        `rank_window` rolling window over the same risk-adjusted statistic, so
-        that single number is the whole warm-up story. The crash exit's ATR
-        windows (`CRASH_ATR_FAST = 6`, `CRASH_ATR_SLOW = 96`) are module
-        constants `_max_lookback_bars()` cannot see, but both sit below
-        `rank_window` and `max(formation_lookback)`, so the buffer already
-        covers them.
-      - `rank_pct` is cast to `float` on purpose — it is a quantile level in
-        (0, 1), never a bar count. The cast is defensive: a grid point written
-        as `1` would otherwise arrive as an `int` and inflate the buffer.
+    Nothing else is tunable: the exit is a decay flip to flat when
+    `slope / sigma_v` drops below zero, routed through the plain
+    `apply_session_constraint` (no stop, no target), and the noise-estimation
+    machinery (`SIGMA_EMA_SPAN`, `SIGMA_BURN`, `WARMUP_BARS`, `P0_SCALE`,
+    `SIGMA2_FLOOR`) are module constants in `strategy.py`, deliberately NOT
+    searched — the exit and the warm-up keep zero degrees of freedom.
 
-    COVERAGE HAZARD — do not raise `rank_window` (and be careful pointing this
-    strategy at a coarse timeframe) without redoing this arithmetic:
-    `run_walk_forward()` below skips any fold whose train window holds fewer
-    than `max_lookback + 10` bars, i.e. 970 here. A 12-week train window at
-    15min is ~5,700 bars and a 3-week test window ~1,900, so the guard is
-    comfortable at the intended timeframe. 1h (~1,400 bars per 12-week train
-    window) still clears it, with ~40% headroom; 4h (~350) does not, and every
-    fold there would be silently skipped — the iteration-31 failure mode.
+    `session` is fixed and threaded into every combo as-is, never searched
+    (required by CLAUDE.md).
+
+    COVERAGE HAZARD — with no int lookback param in the grid,
+    `_max_lookback_bars()` returns 0 and `run_walk_forward()` sizes the buffer
+    off the one-day floor alone (`day_bars + 5`, ~101 bars at 15min) and drops
+    its fold-skip guard to `max_lookback + 10` = 10 bars. That buffer covers
+    this strategy's `WARMUP_BARS = 48` (filter + sigma_v EMA settling) with
+    headroom, and the 10-bar guard means no timeframe silently skips every
+    fold. If a future iteration adds a genuine bar-count lookback param (e.g.
+    a moving-average period), it must be a plain `int` and this arithmetic
+    must be redone against it.
     """
     grid = []
-    for formation_lookback, rank_pct in product(formation_lookbacks, rank_pcts):
+    for kf_noise_ratio, min_slope in product(kf_noise_ratios, min_slopes):
         grid.append(
             {
-                "formation_lookback": int(formation_lookback),
-                "rank_pct": float(rank_pct),
-                "rank_window": int(rank_window),
+                "kf_noise_ratio": float(kf_noise_ratio),
+                "min_slope": float(min_slope),
                 "session": session,
             }
         )
