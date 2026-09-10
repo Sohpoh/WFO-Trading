@@ -42,11 +42,11 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(kf_noise_ratios, min_slopes, session) -> list[dict]:
+def build_grid(kf_noise_ratios, min_slopes, stop_atr_mults, atr_period, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched, both passed as `float` **on purpose**: they are
-    NOT bar-count lookbacks, so neither should feed `_max_lookback_bars()`'s
+    Three params are searched, all passed as `float` **on purpose**: they are
+    NOT bar-count lookbacks, so none should feed `_max_lookback_bars()`'s
     pre-test-window warm-up buffer (a grid point written as `1` would otherwise
     arrive as an `int` and silently inflate it).
 
@@ -57,33 +57,38 @@ def build_grid(kf_noise_ratios, min_slopes, session) -> list[dict]:
         searched knob.
       - `min_slope` — the dimensionless per-bar slope threshold above which a
         long opens (`slope / sigma_v > min_slope`).
+      - `stop_atr_mult` — the ATR multiplier on the hard stop's distance from
+        entry (entry − stop_atr_mult × ATR), searched so each fold's optimizer
+        re-fits the stop width to the prevailing volatility regime.
 
-    Nothing else is tunable: the exit is a decay flip to flat when
-    `slope / sigma_v` drops below zero, routed through the plain
-    `apply_session_constraint` (no stop, no target), and the noise-estimation
-    machinery (`SIGMA_EMA_SPAN`, `SIGMA_BURN`, `WARMUP_BARS`, `P0_SCALE`,
-    `SIGMA2_FLOOR`) are module constants in `strategy.py`, deliberately NOT
-    searched — the exit and the warm-up keep zero degrees of freedom.
+    `atr_period` is fixed and threaded as a plain `int` **on purpose**: it IS a
+    genuine bar-count lookback (the ATR window), so `_max_lookback_bars()` is
+    *meant* to pick it up and size the warm-up buffer for it. `session` is
+    fixed and threaded into every combo as-is, never searched (required by
+    CLAUDE.md).
 
-    `session` is fixed and threaded into every combo as-is, never searched
-    (required by CLAUDE.md).
+    Nothing else is tunable: the exit is a path-dependent ATR hard stop with no
+    profit target (an unreachable +inf constant in `strategy.py`, so winners
+    run uncapped to the session flatten), and the noise-estimation machinery
+    (`SIGMA_EMA_SPAN`, `SIGMA_BURN`, `WARMUP_BARS`, `P0_SCALE`, `SIGMA2_FLOOR`)
+    are module constants in `strategy.py`, deliberately NOT searched.
 
-    COVERAGE HAZARD — with no int lookback param in the grid,
-    `_max_lookback_bars()` returns 0 and `run_walk_forward()` sizes the buffer
-    off the one-day floor alone (`day_bars + 5`, ~101 bars at 15min) and drops
-    its fold-skip guard to `max_lookback + 10` = 10 bars. That buffer covers
-    this strategy's `WARMUP_BARS = 48` (filter + sigma_v EMA settling) with
-    headroom, and the 10-bar guard means no timeframe silently skips every
-    fold. If a future iteration adds a genuine bar-count lookback param (e.g.
-    a moving-average period), it must be a plain `int` and this arithmetic
-    must be redone against it.
+    COVERAGE HAZARD — with `atr_period` (14) the only int lookback in the grid,
+    `_max_lookback_bars()` returns 14 and `run_walk_forward()` sizes the buffer
+    to `max((14 + 5) * 3, day_bars + 5)` (~101 bars at 15min) and drops its
+    fold-skip guard to `max_lookback + 10` = 24 bars. That buffer covers
+    ATR(14) plus this strategy's `WARMUP_BARS = 48` (filter + sigma_v EMA
+    settling) with headroom, and the 24-bar guard means no timeframe silently
+    skips every fold.
     """
     grid = []
-    for kf_noise_ratio, min_slope in product(kf_noise_ratios, min_slopes):
+    for kf_noise_ratio, min_slope, stop_atr_mult in product(kf_noise_ratios, min_slopes, stop_atr_mults):
         grid.append(
             {
                 "kf_noise_ratio": float(kf_noise_ratio),
                 "min_slope": float(min_slope),
+                "stop_atr_mult": float(stop_atr_mult),
+                "atr_period": int(atr_period),
                 "session": session,
             }
         )

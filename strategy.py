@@ -67,55 +67,53 @@ converges quickly.
 
 Entry — long-only, scale-free slope above a floor
 -------------------------------------------------
-A raw +1.0 long is emitted where z_t > min_slope (strict). There is no short
+A raw long entry is emitted where z_t > min_slope (strict). There is no short
 branch, so -1.0 is never emitted and a down-state pays no legs at all instead
 of two to reverse. `min_slope` is dimensionless (units of per-bar slope
 measured in observation-noise units); grid-searched over {0.25, 0.5, 1.0, 2.0}.
 
-Exit — decay flip to flat when the trend turns, no stop, no target
-------------------------------------------------------------------
-Plain `apply_session_constraint` (NOT the `with_stops` variant) — no stop, no
-target, upside uncapped, duration bounded only by the session. A long is
-flattened where z_t < 0 (the adaptive trend has turned). Because min_slope >=
-0.25 > 0, the band (0, min_slope) is a hysteresis hold: a long entered at
-z > min_slope is held through z in (0, min_slope] and only flattened when the
-slope's sign actually flips.
+Exit — bounded ATR hard stop, no target, decay-flip retired
+-----------------------------------------------------------
+`apply_session_constraint_with_stops` (NOT the plain variant) — a
+path-dependent volatility-scaled hard stop, deliberately no profit target so
+winners stay uncapped to the forced session flatten. On a long entry at
+Close_e the stop is `entry - stop_atr_mult * ATR(atr_period)` (atr_period
+fixed at 14, not grid-searched), detected on the intrabar Low and flattened at
+that bar's Close (fill-price caveat documented in session.py). The target is
+an unreachable constant (+inf) so the target side of the walk never binds
+while still passing its entry gate (`inf > close` for a long).
 
-Raw entries are three-state:
+The previous iteration's decay-flip exit (flatten where z < 0) is retired: it
+was a *lagging* signal-based flatten that only turned after the loss had
+already run to the forced session flatten, and it is the direct cause of the
+left tail this stop is meant to truncate. Because the stop is priced from ATR
+and `stop_atr_mult` is grid-searched, the fold-by-fold optimizer re-fits the
+stop width to the prevailing volatility regime (wider in 2022, tighter in
+2024) rather than holding a fixed distance.
 
-        1.0   where z > min_slope        (enter / stay long)
-        0.0   where z < 0                (flatten)
-        NaN   in between                 (hold)
-
-The 0.0 flat mask is written first and the 1.0 second so an entry wins on any
-same-bar overlap (structurally moot here since the two thresholds are disjoint
-for min_slope > 0, but the ordering makes it explicit). `apply_session_constraint`
-forward-fills the sparse series: 0.0 is an explicit flat instruction, NaN a
-genuine hold, and the last bar of every session is force-flattened by
-`session.py`. A winner therefore runs uncapped to the forced session flatten.
-
-Fail-closed is exact while flat: a NaN z (unwarmed bar, or a degenerate
-division) makes both comparisons False, the bar emits NaN, and the forward
-fill leaves the flat position flat. Honesty item — while *long*, a NaN z is
-likewise both-False, emits NaN, and the forward fill **holds the long**. That
-is inherent to a hysteresis exit and is bounded by the end-of-session flatten,
-so the worst case is one session held on stale information; it is stated here
-rather than left for the evaluator to find.
+Raw signal hand-off: `long_signal` = z > min_slope (strict); `short_signal`
+is all-False (no short branch ever); `stop_distance` = stop_atr_mult * ATR
+(NaN during ATR warm-up, so an unwarmed bar fails closed); `target_price` =
++inf everywhere. Fail-closed is exact: a NaN z (unwarmed bar, or a degenerate
+division) makes the long comparison False, so that bar emits no long.
 
 Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`)
 ---------------------------------------------------------------------------
-  - `kf_noise_ratio` and `min_slope` are both `float` **on purpose** — neither
-    is a bar-count lookback, so neither should feed `_max_lookback_bars()`'s
-    warm-up sizing. `kf_noise_ratio` is a noise ratio and `min_slope` a
-    dimensionless threshold; both are grid-searched and both are cast to
-    float in `build_grid()` so a grid point written as `1` can never arrive
-    as an int and silently inflate the buffer.
-  - With no int lookback param in the grid, `_max_lookback_bars()` returns 0
-    and `run_walk_forward()` sizes the buffer purely off the one-day floor
-    (`day_bars + 5`, ~101 bars at 15min). That comfortably covers this
-    strategy's WARMUP_BARS = 48 (filter + sigma_v EMA settling) before each
-    test window; see `build_grid()` for the fold-skip arithmetic (the guard
-    collapses to ~10 bars, so no timeframe silently skips every fold).
+  - `kf_noise_ratio`, `min_slope`, and `stop_atr_mult` are all `float` **on
+    purpose** — none is a bar-count lookback, so none should feed
+    `_max_lookback_bars()`'s warm-up sizing. `kf_noise_ratio` is a noise
+    ratio, `min_slope` a dimensionless threshold, and `stop_atr_mult` an ATR
+    multiplier; all three are grid-searched and all three are cast to float in
+    `build_grid()` so a grid point written as `1` can never arrive as an int
+    and silently inflate the buffer.
+  - `atr_period` IS a genuine bar-count lookback (the ATR window), so it is a
+    plain `int` **on purpose**: it *should* feed `_max_lookback_bars()`, which
+    returns 14 and sizes the pre-test-window buffer to
+    `max((14 + 5) * 3, day_bars + 5)` (~101 bars at 15min). That comfortably
+    covers ATR(14) plus this strategy's WARMUP_BARS = 48 (filter + sigma_v EMA
+    settling) before each test window; see `build_grid()` for the fold-skip
+    arithmetic (the guard is ~24 bars, so no timeframe silently skips every
+    fold).
   - `SIGMA_EMA_SPAN`, `SIGMA_BURN`, `WARMUP_BARS`, `P0_SCALE`, and
     `SIGMA2_FLOOR` are module constants and are **never grid-searched**: they
     add no `build_grid()` / `DEFAULT_PARAMS` key, so the noise-estimation and
@@ -123,20 +121,21 @@ Param types / warm-up (see CLAUDE.md and `wfo_engine._max_lookback_bars()`)
 
 Cost note: `metrics.py`'s per-leg toll (0.001% fee + 0.005% slippage) is
 unchanged and out of scope. The long-only construction interacts with it
-favourably: a down-state costs zero legs instead of two, and the decay-flip
-exit only ever closes a long already open (one exit leg), never adds a
-reversal leg.
+favourably: a down-state costs zero legs instead of two, and the stop exit
+only ever closes a long already open (one exit leg), never adds a reversal
+leg.
 
-This module decides only *when* the strategy wants to be long and when that
-wish has decayed. All day-trade gating and the end-of-session flatten are
-delegated to `session.py`; see its docstring for that contract.
+This module decides only *when* the strategy wants to be long and how far it
+lets a loser run before the ATR stop exits. All day-trade gating and the
+end-of-session flatten are delegated to `session.py`; see its docstring for
+that contract.
 """
 import math
 
 import numpy as np
 import pandas as pd
 
-from session import apply_session_constraint
+from session import apply_session_constraint_with_stops
 
 # Effective bar-count of the EMA that estimates observation noise sigma_v from
 # the filter's residual. Hardcoded, NOT grid-searched — "how quickly should
@@ -241,20 +240,48 @@ def kalman_slope_series(y: np.ndarray, kf_noise_ratio: float) -> tuple[np.ndarra
     return slope_out, sigma_out
 
 
+def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """Wilder's Average True Range over `period` bars, index-aligned to `close`.
+
+    True range uses the prior bar's close as the reference so session/overnight
+    gaps count. The Wilder average is a recursive EMA with alpha = 1/period
+    (adjust=False) so it carries state and never uses a fixed trailing window —
+    the same "no fixed window" property the Kalman entry relies on. The first
+    `period` bars are NaN (the recursion hasn't seen a full window yet), so a
+    stop distance built from them fails closed and cannot open a position.
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / float(period), adjust=False).mean()
+    atr.iloc[:period] = np.nan
+    return atr
+
+
 def generate_positions(
     df: pd.DataFrame,
     kf_noise_ratio: float,
     min_slope: float,
+    stop_atr_mult: float,
+    atr_period: int,
     session: str | None = "New York",
 ) -> pd.Series:
     """Build the long-only Kalman-slope position series from OHLCV bars.
 
     `kf_noise_ratio` is sigma_w / sigma_v (the single grid-searched noise
     knob); `min_slope` is the dimensionless per-bar slope threshold above which
-    a long opens. Returns a {-1, 0, 1} position series via
-    `session.apply_session_constraint` (plain variant — no stop, no target).
+    a long opens. The exit is a path-dependent ATR hard stop with no profit
+    target, routed through `session.apply_session_constraint_with_stops`:
+    `stop_atr_mult` scales the stop distance off `ATR(atr_period)`, and the
+    target is an unreachable +inf constant so winners run uncapped to the
+    session flatten. Returns a {-1, 0, 1} position series.
     """
     close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+
     y = np.log(close.to_numpy())
     slope, sigma = kalman_slope_series(y, kf_noise_ratio)
 
@@ -264,35 +291,49 @@ def generate_positions(
     z[:WARMUP_BARS] = np.nan
     z = pd.Series(z, index=df.index)
 
-    # Long requires the scale-free slope strictly above min_slope; decay is
-    # that same statistic below zero (the adaptive trend has turned). NaN on
-    # either side (unwarmed / degenerate) compares False on both, so such a
-    # bar emits NaN = "no instruction" and the delegate's forward fill leaves
-    # the position where it already was.
+    # Long requires the scale-free slope strictly above min_slope; there is no
+    # short branch. A NaN z (unwarmed / degenerate) compares False, so it never
+    # opens a long.
     with np.errstate(invalid="ignore"):
         long_signal = z > float(min_slope)
-        decay_signal = z < 0.0
+    short_signal = pd.Series(False, index=df.index, dtype=bool)
 
-    # Raw, session-unaware entries: 1.0 long / 0.0 flat / NaN hold. Flat is
-    # written first and entry second so an entry wins on any same-bar overlap.
-    entries = pd.Series(np.nan, index=df.index, dtype=float)
-    entries[decay_signal] = 0.0
-    entries[long_signal] = 1.0
+    # ATR hard stop distance, measured from the entry Close. stop_atr_mult is a
+    # float multiplier (NOT a lookback); atr_period is the bar-count lookback.
+    atr = atr_series(high, low, close, atr_period)
+    stop_distance = float(stop_atr_mult) * atr
 
-    # session.py alone decides which bars are tradable, forward-fills the
-    # sparse instruction series into a held position, and force-flattens on
-    # the session's last bar.
-    return apply_session_constraint(entries, session)
+    # No profit target: an unreachable +inf constant so the target side of the
+    # stop/target walk never binds, while remaining a valid entry gate for a
+    # long (inf > close is always true). Winners run uncapped to session.py's
+    # forced flatten.
+    target_price = pd.Series(np.inf, index=df.index)
+
+    # session.py alone decides which bars are tradable, walks the stop/target
+    # bookkeeping bar-by-bar, and force-flattens on the session's last bar.
+    return apply_session_constraint_with_stops(
+        close,
+        high,
+        low,
+        long_signal,
+        short_signal,
+        stop_distance,
+        target_price,
+        session,
+    )
 
 
 DEFAULT_PARAMS = {
-    # kf_noise_ratio and min_slope are floats because they are NOT bar-count
-    # lookbacks and must not feed wfo_engine's warm-up buffer. Both are
-    # grid-searched (0.01/0.05/0.1/0.2/0.5 and 0.25/0.5/1.0/2.0); `session`
-    # is a fixed param. The five module constants above (SIGMA_EMA_SPAN,
-    # SIGMA_BURN, WARMUP_BARS, P0_SCALE, SIGMA2_FLOOR) deliberately have no
-    # entry here.
+    # kf_noise_ratio, min_slope, and stop_atr_mult are floats because they are
+    # NOT bar-count lookbacks and must not feed wfo_engine's warm-up buffer;
+    # all three are grid-searched (0.01/0.05/0.1/0.2/0.5, 0.25/0.5/1.0/2.0,
+    # 1.0/1.5/2.0/3.0). atr_period IS a bar-count lookback, so it is a plain
+    # int and correctly feeds the buffer. `session` is a fixed param. The five
+    # module constants above (SIGMA_EMA_SPAN, SIGMA_BURN, WARMUP_BARS,
+    # P0_SCALE, SIGMA2_FLOOR) deliberately have no entry here.
     "kf_noise_ratio": 0.1,
     "min_slope": 1.0,
+    "stop_atr_mult": 2.0,
+    "atr_period": 14,
     "session": "New York",
 }

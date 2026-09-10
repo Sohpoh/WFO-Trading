@@ -77,12 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
         "(--kf-noise-ratio); sigma_v itself is estimated from the filter's residual as "
         "an EMA of squared innovations, so slope/sigma_v is scale-free. LONG where "
         "slope/sigma_v > --min-slope; there is NO short leg, so a down-state pays no "
-        "legs at all. Exit is a plain decay flip to flat where slope/sigma_v < 0 (the "
-        "adaptive trend has turned) — no stop, no target, so winners run uncapped to "
-        "session.py's forced flatten. The band (0, --min-slope) is a hysteresis hold, so "
-        "a traded session is not exactly one round trip. The noise-estimation and "
-        "warm-up machinery are module constants in strategy.py and are NOT searched, so "
-        "there is no flag for them)"
+        "legs at all. Exit is a path-dependent ATR hard stop (entry − --stop-atr-mult × "
+        "ATR(14)) with NO profit target, so winners run uncapped to session.py's forced "
+        "flatten; the ATR window is fixed at 14 (a genuine bar-count lookback, not "
+        "grid-searched, so there is no flag for it). The noise-estimation and warm-up "
+        "machinery are module constants in strategy.py and are NOT searched, so there "
+        "is no flag for them)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -97,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "goes long when the Kalman slope, normalized by the estimated "
                              "observation noise sigma_v, is strictly above this. Passed as "
                              "floats and correctly ignored by the warm-up sizing")
+    strat.add_argument("--stop-atr-mult", default="1.0,1.5,2.0,3.0",
+                        help="comma-separated ATR multipliers on the hard stop's distance "
+                             "from entry (entry − mult × ATR(14), detected on the intrabar "
+                             "Low, flattened at that bar's Close). Searched so each fold "
+                             "re-fits the stop width to the prevailing volatility regime. "
+                             "Passed as floats and correctly ignored by the warm-up sizing")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -147,12 +153,16 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # kf_noise_ratio and min_slope are both floats: neither is a bar-count
-        # lookback, so neither must feed wfo_engine's warm-up buffer (the grid
-        # carries no int param, so the buffer collapses to the one-day floor).
+        # kf_noise_ratio, min_slope, and stop_atr_mult are all floats: none is
+        # a bar-count lookback, so none must feed wfo_engine's warm-up buffer.
+        # atr_period IS a genuine bar-count lookback (fixed at 14, not
+        # grid-searched), so it is threaded as a plain int and correctly feeds
+        # _max_lookback_bars().
         kf_noise_ratios = parse_num_list(args.kf_noise_ratio, float)
         min_slopes = parse_num_list(args.min_slope, float)
-        grid = build_grid(kf_noise_ratios, min_slopes, session)
+        stop_atr_mults = parse_num_list(args.stop_atr_mult, float)
+        atr_period = 14
+        grid = build_grid(kf_noise_ratios, min_slopes, stop_atr_mults, atr_period, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -193,16 +203,19 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the two grid-searched params are reported here; `session` is
-        # fixed across every combo, so its "distinct values" would always be 1
-        # and carry no stability information. (strategy.SIGMA_EMA_SPAN etc. are
-        # module constants, not params, so they never appear in best_params.)
+        # Only the three grid-searched params are reported here; `session` and
+        # `atr_period` are fixed across every combo, so their "distinct values"
+        # would always be 1 and carry no stability information.
+        # (strategy.SIGMA_EMA_SPAN etc. are module constants, not params, so
+        # they never appear in best_params.)
         kf_noise_ratio_vals = sorted({p["kf_noise_ratio"] for p in chosen})
         min_slope_vals = sorted({p["min_slope"] for p in chosen})
+        stop_atr_mult_vals = sorted({p["stop_atr_mult"] for p in chosen})
         print(
             f"Fold param stability: {len(kf_noise_ratio_vals)} distinct kf noise ratio "
             f"{kf_noise_ratio_vals}, {len(min_slope_vals)} distinct min slope "
-            f"{min_slope_vals}"
+            f"{min_slope_vals}, {len(stop_atr_mult_vals)} distinct stop atr mult "
+            f"{stop_atr_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -241,6 +254,7 @@ def main(argv=None) -> int:
                 "test_start": f.test_start, "test_end": f.test_end,
                 "kf_noise_ratio": f.best_params.get("kf_noise_ratio"),
                 "min_slope": f.best_params.get("min_slope"),
+                "stop_atr_mult": f.best_params.get("stop_atr_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
