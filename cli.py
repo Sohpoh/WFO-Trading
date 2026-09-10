@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--kf-noise-ratio", default="0.01,0.05,0.1,0.2,0.5",
+    strat.add_argument("--kf-noise-ratio", default="0.5,1.0,2.0",
                         help="comma-separated Kalman noise ratios sigma_w/sigma_v (process "
                              "noise over observation noise). Larger = the slope re-rates "
                              "faster and tracks recent turns more tightly (shorter effective "

@@ -326,12 +326,12 @@ def generate_positions(
 DEFAULT_PARAMS = {
     # kf_noise_ratio, min_slope, and stop_atr_mult are floats because they are
     # NOT bar-count lookbacks and must not feed wfo_engine's warm-up buffer;
-    # all three are grid-searched (0.01/0.05/0.1/0.2/0.5, 0.25/0.5/1.0/2.0,
+    # all three are grid-searched (0.5/1.0/2.0, 0.25/0.5/1.0/2.0,
     # 1.0/1.5/2.0/3.0). atr_period IS a bar-count lookback, so it is a plain
     # int and correctly feeds the buffer. `session` is a fixed param. The five
     # module constants above (SIGMA_EMA_SPAN, SIGMA_BURN, WARMUP_BARS,
     # P0_SCALE, SIGMA2_FLOOR) deliberately have no entry here.
-    "kf_noise_ratio": 0.1,
+    "kf_noise_ratio": 1.0,
     "min_slope": 1.0,
     "stop_atr_mult": 2.0,
     "atr_period": 14,
