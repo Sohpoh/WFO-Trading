@@ -70,7 +70,7 @@ Entry — long-only, scale-free slope above a floor
 A raw long entry is emitted where z_t > min_slope (strict). There is no short
 branch, so -1.0 is never emitted and a down-state pays no legs at all instead
 of two to reverse. `min_slope` is dimensionless (units of per-bar slope
-measured in observation-noise units); grid-searched over {0.25, 0.5, 1.0, 2.0}.
+measured in observation-noise units); grid-searched over {2.0, 3.0, 4.0, 6.0}.
 
 Exit — bounded ATR hard stop, no target, decay-flip retired
 -----------------------------------------------------------
@@ -326,13 +326,13 @@ def generate_positions(
 DEFAULT_PARAMS = {
     # kf_noise_ratio, min_slope, and stop_atr_mult are floats because they are
     # NOT bar-count lookbacks and must not feed wfo_engine's warm-up buffer;
-    # all three are grid-searched (0.5/1.0/2.0, 0.25/0.5/1.0/2.0,
+    # all three are grid-searched (0.5/1.0/2.0, 2.0/3.0/4.0/6.0,
     # 1.0/1.5/2.0/3.0). atr_period IS a bar-count lookback, so it is a plain
     # int and correctly feeds the buffer. `session` is a fixed param. The five
     # module constants above (SIGMA_EMA_SPAN, SIGMA_BURN, WARMUP_BARS,
     # P0_SCALE, SIGMA2_FLOOR) deliberately have no entry here.
     "kf_noise_ratio": 1.0,
-    "min_slope": 1.0,
+    "min_slope": 3.0,
     "stop_atr_mult": 2.0,
     "atr_period": 14,
     "session": "New York",

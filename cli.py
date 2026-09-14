@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "faster and tracks recent turns more tightly (shorter effective "
                              "memory); smaller = smoother, slower-to-adapt slope. Passed as "
                              "floats and correctly ignored by the warm-up sizing")
-    strat.add_argument("--min-slope", default="0.25,0.5,1.0,2.0",
+    strat.add_argument("--min-slope", default="2.0,3.0,4.0,6.0",
                         help="comma-separated dimensionless per-bar slope thresholds. A bar "
                              "goes long when the Kalman slope, normalized by the estimated "
                              "observation noise sigma_v, is strictly above this. Passed as "
