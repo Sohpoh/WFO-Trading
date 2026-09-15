@@ -70,39 +70,37 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only Kalman-filter trend momentum: a local-linear-trend "
-        "Kalman filter over log(Close) recursively estimates a level and a per-bar "
-        "slope — slope_{t+1} = slope_t + w (process noise sigma_w), y_t = level_t + v "
-        "(observation noise sigma_v). Only the noise RATIO sigma_w/sigma_v is searched "
-        "(--kf-noise-ratio); sigma_v itself is estimated from the filter's residual as "
-        "an EMA of squared innovations, so slope/sigma_v is scale-free. LONG where "
-        "slope/sigma_v > --min-slope; there is NO short leg, so a down-state pays no "
-        "legs at all. Exit is a path-dependent ATR hard stop (entry − --stop-atr-mult × "
-        "ATR(14)) with NO profit target, so winners run uncapped to session.py's forced "
-        "flatten; the ATR window is fixed at 14 (a genuine bar-count lookback, not "
-        "grid-searched, so there is no flag for it). The noise-estimation and warm-up "
-        "machinery are module constants in strategy.py and are NOT searched, so there "
-        "is no flag for them)"
+        "strategy grid (ES 1h Bollinger-band reversion to mean: on each bar compute the "
+        "trailing mean μ and population std σ of Close over --band-lookback bars, then "
+        "fade a band touch back to the middle — SHORT where Close >= μ + --entry-z·σ "
+        "(upper-band touch/penetration), LONG where Close <= μ − --entry-z·σ (lower-band "
+        "touch). Symmetric both directions; no opposite-signal flip. Exit is a "
+        "path-dependent stop/target via apply_session_constraint_with_stops: target = the "
+        "trailing mean μ (direction-resolved by session.py), stop = entry ± "
+        "--stop-sigma-mult·σ, both quoted in trailing σ so they re-fit each fold to the "
+        "prevailing volatility regime. The New York session force-flattens at 16:00 ET, "
+        "so every trade closes within the session (day-trade only)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--kf-noise-ratio", default="0.5,1.0,2.0",
-                        help="comma-separated Kalman noise ratios sigma_w/sigma_v (process "
-                             "noise over observation noise). Larger = the slope re-rates "
-                             "faster and tracks recent turns more tightly (shorter effective "
-                             "memory); smaller = smoother, slower-to-adapt slope. Passed as "
-                             "floats and correctly ignored by the warm-up sizing")
-    strat.add_argument("--min-slope", default="2.0,3.0,4.0,6.0",
-                        help="comma-separated dimensionless per-bar slope thresholds. A bar "
-                             "goes long when the Kalman slope, normalized by the estimated "
-                             "observation noise sigma_v, is strictly above this. Passed as "
-                             "floats and correctly ignored by the warm-up sizing")
-    strat.add_argument("--stop-atr-mult", default="1.0,1.5,2.0,3.0",
-                        help="comma-separated ATR multipliers on the hard stop's distance "
-                             "from entry (entry − mult × ATR(14), detected on the intrabar "
-                             "Low, flattened at that bar's Close). Searched so each fold "
+    strat.add_argument("--band-lookback", default="20,40,60,80",
+                        help="comma-separated trailing-window bar counts for the Bollinger "
+                             "mean μ and population std σ (the window ends at the current "
+                             "bar, so it is causal). A genuine bar-count lookback, passed "
+                             "as ints so it correctly feeds wfo_engine's warm-up buffer")
+    strat.add_argument("--entry-z", default="2.0,2.5,3.0",
+                        help="comma-separated σ-multiples defining the entry bands. A bar "
+                             "goes short where Close >= μ + entry_z·σ and long where "
+                             "Close <= μ − entry_z·σ. A dimensionless threshold (NOT a "
+                             "lookback), passed as floats and correctly ignored by the "
+                             "warm-up sizing")
+    strat.add_argument("--stop-sigma-mult", default="1.0,1.5,2.0,2.5",
+                        help="comma-separated σ-multiples on the hard stop's distance from "
+                             "entry (entry ± mult·σ, detected on the intrabar High/Low, "
+                             "flattened at that bar's Close). Searched so each fold "
                              "re-fits the stop width to the prevailing volatility regime. "
-                             "Passed as floats and correctly ignored by the warm-up sizing")
+                             "A σ-multiple (NOT a lookback), passed as floats and correctly "
+                             "ignored by the warm-up sizing")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -153,16 +151,14 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # kf_noise_ratio, min_slope, and stop_atr_mult are all floats: none is
-        # a bar-count lookback, so none must feed wfo_engine's warm-up buffer.
-        # atr_period IS a genuine bar-count lookback (fixed at 14, not
-        # grid-searched), so it is threaded as a plain int and correctly feeds
-        # _max_lookback_bars().
-        kf_noise_ratios = parse_num_list(args.kf_noise_ratio, float)
-        min_slopes = parse_num_list(args.min_slope, float)
-        stop_atr_mults = parse_num_list(args.stop_atr_mult, float)
-        atr_period = 14
-        grid = build_grid(kf_noise_ratios, min_slopes, stop_atr_mults, atr_period, session)
+        # band_lookback IS a genuine bar-count lookback, so it is parsed as int
+        # and correctly feeds wfo_engine's warm-up buffer. entry_z and
+        # stop_sigma_mult are σ-multiples (not lookbacks), so they are parsed
+        # as float and correctly ignored by _max_lookback_bars().
+        band_lookbacks = parse_num_list(args.band_lookback, int)
+        entry_zs = parse_num_list(args.entry_z, float)
+        stop_sigma_mults = parse_num_list(args.stop_sigma_mult, float)
+        grid = build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -203,19 +199,17 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the three grid-searched params are reported here; `session` and
-        # `atr_period` are fixed across every combo, so their "distinct values"
-        # would always be 1 and carry no stability information.
-        # (strategy.SIGMA_EMA_SPAN etc. are module constants, not params, so
-        # they never appear in best_params.)
-        kf_noise_ratio_vals = sorted({p["kf_noise_ratio"] for p in chosen})
-        min_slope_vals = sorted({p["min_slope"] for p in chosen})
-        stop_atr_mult_vals = sorted({p["stop_atr_mult"] for p in chosen})
+        # Only the three grid-searched params are reported here; `session` is
+        # fixed across every combo, so its "distinct values" would always be 1
+        # and carry no stability information.
+        band_lookback_vals = sorted({p["band_lookback"] for p in chosen})
+        entry_z_vals = sorted({p["entry_z"] for p in chosen})
+        stop_sigma_mult_vals = sorted({p["stop_sigma_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(kf_noise_ratio_vals)} distinct kf noise ratio "
-            f"{kf_noise_ratio_vals}, {len(min_slope_vals)} distinct min slope "
-            f"{min_slope_vals}, {len(stop_atr_mult_vals)} distinct stop atr mult "
-            f"{stop_atr_mult_vals}"
+            f"Fold param stability: {len(band_lookback_vals)} distinct band lookback "
+            f"{band_lookback_vals}, {len(entry_z_vals)} distinct entry z "
+            f"{entry_z_vals}, {len(stop_sigma_mult_vals)} distinct stop sigma mult "
+            f"{stop_sigma_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -252,9 +246,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "kf_noise_ratio": f.best_params.get("kf_noise_ratio"),
-                "min_slope": f.best_params.get("min_slope"),
-                "stop_atr_mult": f.best_params.get("stop_atr_mult"),
+                "band_lookback": f.best_params.get("band_lookback"),
+                "entry_z": f.best_params.get("entry_z"),
+                "stop_sigma_mult": f.best_params.get("stop_sigma_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

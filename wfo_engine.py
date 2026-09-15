@@ -42,53 +42,45 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(kf_noise_ratios, min_slopes, stop_atr_mults, atr_period, session) -> list[dict]:
+def build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched, all passed as `float` **on purpose**: they are
-    NOT bar-count lookbacks, so none should feed `_max_lookback_bars()`'s
-    pre-test-window warm-up buffer (a grid point written as `1` would otherwise
-    arrive as an `int` and silently inflate it).
+    Three params are searched for the ES 1h Bollinger-band reversion-to-mean
+    strategy:
 
-      - `kf_noise_ratio` — the local-linear-trend Kalman filter's noise ratio
-        `sigma_w / sigma_v` (process noise over observation noise). The
-        filter's slope is the trend signal; `sigma_v` itself is estimated from
-        the filter's residual inside `strategy.py`, so only the *ratio* is a
-        searched knob.
-      - `min_slope` — the dimensionless per-bar slope threshold above which a
-        long opens (`slope / sigma_v > min_slope`).
-      - `stop_atr_mult` — the ATR multiplier on the hard stop's distance from
-        entry (entry − stop_atr_mult × ATR), searched so each fold's optimizer
-        re-fits the stop width to the prevailing volatility regime.
+      - `band_lookback` — the trailing-window bar count for the rolling mean μ
+        and population std σ that define the bands. This IS a genuine bar-count
+        lookback, so it is threaded as a plain `int` **on purpose**:
+        `_max_lookback_bars()` is *meant* to pick it up and size the warm-up
+        buffer for it (max grid value 80 → buffer `max((80 + 5) * 3,
+        day_bars + 5)` ≈ 255 bars at 1h).
+      - `entry_z` — the σ-multiple defining the upper/lower entry band
+        (short at Close >= μ + entry_z·σ, long at Close <= μ − entry_z·σ).
+        A dimensionless threshold, NOT a lookback, so it is passed as a `float`
+        **on purpose** and correctly ignored by `_max_lookback_bars()`.
+      - `stop_sigma_mult` — the σ-multiple on the hard stop's distance from
+        entry (entry ± stop_sigma_mult·σ). A σ-multiple, NOT a lookback, so it
+        is passed as a `float` **on purpose** and correctly ignored by
+        `_max_lookback_bars()`.
 
-    `atr_period` is fixed and threaded as a plain `int` **on purpose**: it IS a
-    genuine bar-count lookback (the ATR window), so `_max_lookback_bars()` is
-    *meant* to pick it up and size the warm-up buffer for it. `session` is
-    fixed and threaded into every combo as-is, never searched (required by
-    CLAUDE.md).
+    `session` is fixed and threaded into every combo as-is, never searched
+    (required by CLAUDE.md). The profit target is the trailing mean μ itself
+    (computed inside `strategy.py`), so there is no separate target param.
 
-    Nothing else is tunable: the exit is a path-dependent ATR hard stop with no
-    profit target (an unreachable +inf constant in `strategy.py`, so winners
-    run uncapped to the session flatten), and the noise-estimation machinery
-    (`SIGMA_EMA_SPAN`, `SIGMA_BURN`, `WARMUP_BARS`, `P0_SCALE`, `SIGMA2_FLOOR`)
-    are module constants in `strategy.py`, deliberately NOT searched.
-
-    COVERAGE HAZARD — with `atr_period` (14) the only int lookback in the grid,
-    `_max_lookback_bars()` returns 14 and `run_walk_forward()` sizes the buffer
-    to `max((14 + 5) * 3, day_bars + 5)` (~101 bars at 15min) and drops its
-    fold-skip guard to `max_lookback + 10` = 24 bars. That buffer covers
-    ATR(14) plus this strategy's `WARMUP_BARS = 48` (filter + sigma_v EMA
-    settling) with headroom, and the 24-bar guard means no timeframe silently
-    skips every fold.
+    COVERAGE HAZARD — with `band_lookback` (max 80) the only int lookback in
+    the grid, `_max_lookback_bars()` returns 80 and `run_walk_forward()` sizes
+    the buffer to `max((80 + 5) * 3, day_bars + 5)` and drops its fold-skip
+    guard to `max_lookback + 10` = 90 bars. That buffer covers the 79-bar
+    band warm-up with headroom, and the 90-bar guard means no timeframe
+    silently skips every fold.
     """
     grid = []
-    for kf_noise_ratio, min_slope, stop_atr_mult in product(kf_noise_ratios, min_slopes, stop_atr_mults):
+    for band_lookback, entry_z, stop_sigma_mult in product(band_lookbacks, entry_zs, stop_sigma_mults):
         grid.append(
             {
-                "kf_noise_ratio": float(kf_noise_ratio),
-                "min_slope": float(min_slope),
-                "stop_atr_mult": float(stop_atr_mult),
-                "atr_period": int(atr_period),
+                "band_lookback": int(band_lookback),
+                "entry_z": float(entry_z),
+                "stop_sigma_mult": float(stop_sigma_mult),
                 "session": session,
             }
         )
