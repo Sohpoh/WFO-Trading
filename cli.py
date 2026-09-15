@@ -70,11 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (ES 1h Bollinger-band reversion to mean: on each bar compute the "
-        "trailing mean μ and population std σ of Close over --band-lookback bars, then "
-        "fade a band touch back to the middle — SHORT where Close >= μ + --entry-z·σ "
-        "(upper-band touch/penetration), LONG where Close <= μ − --entry-z·σ (lower-band "
-        "touch). Symmetric both directions; no opposite-signal flip. Exit is a "
+        "strategy grid (ES 1h Bollinger-band reversion to mean, variance-ratio-regime-"
+        "gated: on each bar compute the trailing mean μ and population std σ of Close "
+        "over --band-lookback bars, then fade a band touch back to the middle — SHORT "
+        "where Close >= μ + --entry-z·σ (upper-band touch/penetration), LONG where "
+        "Close <= μ − --entry-z·σ (lower-band touch). Symmetric both directions; no "
+        "opposite-signal flip. A zero-param variance-ratio regime gate (hardcoded, NOT "
+        "searched) licenses the fade only while the rolling VR = Var(Close.pct_change(12)) "
+        "÷ (12 × Var(Close.pct_change(1))) over a 96-bar window is < 1.0 (mean-reverting) "
+        "and suppresses both sides when VR >= 1.0 (trending / random walk). Exit is a "
         "path-dependent stop/target via apply_session_constraint_with_stops: target = the "
         "trailing mean μ (direction-resolved by session.py), stop = entry ± "
         "--stop-sigma-mult·σ, both quoted in trailing σ so they re-fit each fold to the "
@@ -199,9 +203,10 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the three grid-searched params are reported here; `session` is
-        # fixed across every combo, so its "distinct values" would always be 1
-        # and carry no stability information.
+        # Only the three grid-searched params are reported here; `session` and
+        # the variance-ratio gate constants (vr_horizon/vr_lookback/vr_threshold)
+        # are fixed across every combo, so their "distinct values" would always
+        # be 1 and carry no stability information.
         band_lookback_vals = sorted({p["band_lookback"] for p in chosen})
         entry_z_vals = sorted({p["entry_z"] for p in chosen})
         stop_sigma_mult_vals = sorted({p["stop_sigma_mult"] for p in chosen})

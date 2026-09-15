@@ -46,14 +46,13 @@ def build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session) -> list[dict
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
     Three params are searched for the ES 1h Bollinger-band reversion-to-mean
-    strategy:
+    strategy (now variance-ratio-regime-gated):
 
       - `band_lookback` — the trailing-window bar count for the rolling mean μ
         and population std σ that define the bands. This IS a genuine bar-count
         lookback, so it is threaded as a plain `int` **on purpose**:
         `_max_lookback_bars()` is *meant* to pick it up and size the warm-up
-        buffer for it (max grid value 80 → buffer `max((80 + 5) * 3,
-        day_bars + 5)` ≈ 255 bars at 1h).
+        buffer for it.
       - `entry_z` — the σ-multiple defining the upper/lower entry band
         (short at Close >= μ + entry_z·σ, long at Close <= μ − entry_z·σ).
         A dimensionless threshold, NOT a lookback, so it is passed as a `float`
@@ -67,13 +66,26 @@ def build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session) -> list[dict
     (required by CLAUDE.md). The profit target is the trailing mean μ itself
     (computed inside `strategy.py`), so there is no separate target param.
 
-    COVERAGE HAZARD — with `band_lookback` (max 80) the only int lookback in
-    the grid, `_max_lookback_bars()` returns 80 and `run_walk_forward()` sizes
-    the buffer to `max((80 + 5) * 3, day_bars + 5)` and drops its fold-skip
-    guard to `max_lookback + 10` = 90 bars. That buffer covers the 79-bar
-    band warm-up with headroom, and the 90-bar guard means no timeframe
-    silently skips every fold.
+    The zero-param variance-ratio regime gate (`strategy.VR_HORIZON`,
+    `strategy.VR_LOOKBACK`, `strategy.VR_THRESHOLD`) is also fixed and
+    threaded into every combo as-is, never searched — exactly like `session`.
+    `vr_horizon` (12) and `vr_lookback` (96) are genuine bar-count lookbacks
+    (the pct_change lag and rolling-variance window in the VR numerator), so
+    they are passed as plain `int`s **on purpose** so `_max_lookback_bars()`
+    accounts for the VR warm-up; `vr_threshold` (1.0) is a dimensionless gate
+    threshold, NOT a lookback, so it is passed as a `float` and correctly
+    ignored.
+
+    COVERAGE HAZARD — `vr_lookback` (96) is the largest int in the grid, so
+    `_max_lookback_bars()` returns 96 and `run_walk_forward()` sizes the
+    buffer to `max((96 + 5) * 3, day_bars + 5)` ≈ 303 bars at 1h and drops its
+    fold-skip guard to `max_lookback + 10` = 106 bars. The variance-ratio's
+    total warm-up need is `vr_lookback + vr_horizon` = 108 bars, and the
+    303-bar buffer covers that (and the 79-bar band warm-up) with headroom;
+    the 106-bar guard means no timeframe silently skips every fold.
     """
+    from strategy import VR_HORIZON, VR_LOOKBACK, VR_THRESHOLD
+
     grid = []
     for band_lookback, entry_z, stop_sigma_mult in product(band_lookbacks, entry_zs, stop_sigma_mults):
         grid.append(
@@ -81,6 +93,9 @@ def build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session) -> list[dict
                 "band_lookback": int(band_lookback),
                 "entry_z": float(entry_z),
                 "stop_sigma_mult": float(stop_sigma_mult),
+                "vr_horizon": int(VR_HORIZON),
+                "vr_lookback": int(VR_LOOKBACK),
+                "vr_threshold": float(VR_THRESHOLD),
                 "session": session,
             }
         )
