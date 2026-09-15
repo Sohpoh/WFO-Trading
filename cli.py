@@ -70,41 +70,26 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (ES 1h Bollinger-band reversion to mean, variance-ratio-regime-"
-        "gated: on each bar compute the trailing mean μ and population std σ of Close "
-        "over --band-lookback bars, then fade a band touch back to the middle — SHORT "
-        "where Close >= μ + --entry-z·σ (upper-band touch/penetration), LONG where "
-        "Close <= μ − --entry-z·σ (lower-band touch). Symmetric both directions; no "
-        "opposite-signal flip. A zero-param variance-ratio regime gate (hardcoded, NOT "
-        "searched) licenses the fade only while the rolling VR = Var(Close.pct_change(12)) "
-        "÷ (12 × Var(Close.pct_change(1))) over a 96-bar window is < 1.0 (mean-reverting) "
-        "and suppresses both sides when VR >= 1.0 (trending / random walk). Exit is a "
-        "path-dependent stop/target via apply_session_constraint_with_stops: target = the "
-        "trailing mean μ (direction-resolved by session.py), stop = entry ± "
-        "--stop-sigma-mult·σ, both quoted in trailing σ so they re-fit each fold to the "
-        "prevailing volatility regime. The New York session force-flattens at 16:00 ET, "
-        "so every trade closes within the session (day-trade only)"
+        "strategy grid (NY 5min overnight-range breakout: Donchian channel + vol-regime "
+        "gate, failed-breakout stop, no target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--band-lookback", default="20,40,60,80",
-                        help="comma-separated trailing-window bar counts for the Bollinger "
-                             "mean μ and population std σ (the window ends at the current "
-                             "bar, so it is causal). A genuine bar-count lookback, passed "
-                             "as ints so it correctly feeds wfo_engine's warm-up buffer")
-    strat.add_argument("--entry-z", default="2.0,2.5,3.0",
-                        help="comma-separated σ-multiples defining the entry bands. A bar "
-                             "goes short where Close >= μ + entry_z·σ and long where "
-                             "Close <= μ − entry_z·σ. A dimensionless threshold (NOT a "
-                             "lookback), passed as floats and correctly ignored by the "
-                             "warm-up sizing")
-    strat.add_argument("--stop-sigma-mult", default="1.0,1.5,2.0,2.5",
-                        help="comma-separated σ-multiples on the hard stop's distance from "
-                             "entry (entry ± mult·σ, detected on the intrabar High/Low, "
-                             "flattened at that bar's Close). Searched so each fold "
-                             "re-fits the stop width to the prevailing volatility regime. "
-                             "A σ-multiple (NOT a lookback), passed as floats and correctly "
-                             "ignored by the warm-up sizing")
+    strat.add_argument("--range-lookback", default="72,144,288,576",
+                        help="comma-separated Donchian channel lengths in bars, shifted one bar so the "
+                             "current bar is excluded from the channel it has to break. Defaults are sized "
+                             "for 5min bars (72/144/288/576 = 6h/12h/24h/48h). NOTE: the hardcoded 1152-bar "
+                             "slow leg of the volatility-regime gate is threaded as a fixed int, so "
+                             "wfo_engine's warm-up buffer is sized off it (not off this grid) — narrowing "
+                             "this list will not starve the gate")
+    strat.add_argument("--buffer-frac", default="0.05,0.10,0.15,0.20",
+                        help="comma-separated breakout buffers as a fraction of channel width: LONG when "
+                             "Close > upper + frac*width, SHORT when Close < lower - frac*width. Both sides "
+                             "are AND-ed with the zero-parameter vol-regime gate (strategy.ATR_FAST_BARS / "
+                             "ATR_SLOW_BARS = 288/1152 bars, i.e. 24h vs 96h at 5min). The stop "
+                             "(strategy.STOP_WIDTH_MULT = 0.5 x the trigger bar's channel width) and the "
+                             "deliberately unreachable 'no target' are likewise hardcoded, keeping the "
+                             "search at two dimensions")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -155,14 +140,14 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # band_lookback IS a genuine bar-count lookback, so it is parsed as int
-        # and correctly feeds wfo_engine's warm-up buffer. entry_z and
-        # stop_sigma_mult are σ-multiples (not lookbacks), so they are parsed
-        # as float and correctly ignored by _max_lookback_bars().
-        band_lookbacks = parse_num_list(args.band_lookback, int)
-        entry_zs = parse_num_list(args.entry_z, float)
-        stop_sigma_mults = parse_num_list(args.stop_sigma_mult, float)
-        grid = build_grid(band_lookbacks, entry_zs, stop_sigma_mults, session)
+        # range_lookback IS a genuine bar-count lookback, so it is parsed as int
+        # and correctly feeds wfo_engine's warm-up buffer. buffer_frac is a
+        # dimensionless ratio (not a lookback), so it is parsed as float and
+        # correctly ignored by _max_lookback_bars(). atr_fast/atr_slow are
+        # fixed ints threaded inside build_grid() (not CLI flags).
+        range_lookbacks = parse_num_list(args.range_lookback, int)
+        buffer_fracs = parse_num_list(args.buffer_frac, float)
+        grid = build_grid(range_lookbacks, buffer_fracs, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -203,18 +188,16 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the three grid-searched params are reported here; `session` and
-        # the variance-ratio gate constants (vr_horizon/vr_lookback/vr_threshold)
-        # are fixed across every combo, so their "distinct values" would always
-        # be 1 and carry no stability information.
-        band_lookback_vals = sorted({p["band_lookback"] for p in chosen})
-        entry_z_vals = sorted({p["entry_z"] for p in chosen})
-        stop_sigma_mult_vals = sorted({p["stop_sigma_mult"] for p in chosen})
+        # Only the two grid-searched params are reported here; `session` and
+        # the vol-gate windows (atr_fast/atr_slow) are fixed across every combo,
+        # so their "distinct values" would always be 1 and carry no stability
+        # information.
+        range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
+        buffer_frac_vals = sorted({p["buffer_frac"] for p in chosen})
         print(
-            f"Fold param stability: {len(band_lookback_vals)} distinct band lookback "
-            f"{band_lookback_vals}, {len(entry_z_vals)} distinct entry z "
-            f"{entry_z_vals}, {len(stop_sigma_mult_vals)} distinct stop sigma mult "
-            f"{stop_sigma_mult_vals}"
+            f"Fold param stability: {len(range_lookback_vals)} distinct range lookback "
+            f"{range_lookback_vals}, {len(buffer_frac_vals)} distinct buffer frac "
+            f"{buffer_frac_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -251,9 +234,8 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "band_lookback": f.best_params.get("band_lookback"),
-                "entry_z": f.best_params.get("entry_z"),
-                "stop_sigma_mult": f.best_params.get("stop_sigma_mult"),
+                "range_lookback": f.best_params.get("range_lookback"),
+                "buffer_frac": f.best_params.get("buffer_frac"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
