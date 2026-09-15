@@ -42,21 +42,27 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(range_lookbacks, buffer_fracs, session) -> list[dict]:
+def build_grid(range_lookbacks, confirm_barss, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
     Two params are searched for the NY 5min overnight-range breakout (Donchian
-    channel + vol-regime gate, failed-breakout stop, no target):
+    channel + vol-regime gate, persistence-confirmed entry, failed-breakout
+    stop, no target):
 
       - `range_lookback` — the Donchian channel window in bars. This IS a
         genuine bar-count lookback, so it is threaded as a plain `int`
         **on purpose**: `_max_lookback_bars()` is *meant* to pick it up and
         size the warm-up buffer for it.
-      - `buffer_frac` — the proportional breakout buffer as a fraction of
-        channel width (LONG when Close > upper + frac·width, SHORT when
-        Close < lower − frac·width). A dimensionless ratio, NOT a lookback, so
-        it is passed as a `float` **on purpose** and correctly ignored by
-        `_max_lookback_bars()`.
+      - `confirm_bars` — the persistence requirement: the Close must stay
+        beyond the broken channel level for this many consecutive bars before
+        entry. Also a genuine bar-count lookback (a `confirm_bars`-bar rolling
+        window over the beyond-level condition), so it too is threaded as a
+        plain `int` **on purpose**. The build_grid parameter is spelled
+        `confirm_barss` — the grid-search naming convention is
+        "<DEFAULT_PARAMS key> + 's'" (see tools/check_strategy.py, which is
+        infrastructure and enforces this spelling), applied to a key that
+        already ends in 's'; it is the double-'s' consequence of that rule,
+        not a typo.
 
     The strategy's zero-parameter overlays — the volatility-regime gate windows
     (`strategy.ATR_FAST_BARS` = 288 / `strategy.ATR_SLOW_BARS` = 1152) — are
@@ -82,11 +88,11 @@ def build_grid(range_lookbacks, buffer_fracs, session) -> list[dict]:
     from strategy import ATR_FAST_BARS, ATR_SLOW_BARS
 
     grid = []
-    for lookback, frac in product(range_lookbacks, buffer_fracs):
+    for lookback, confirm in product(range_lookbacks, confirm_barss):
         grid.append(
             {
                 "range_lookback": int(lookback),
-                "buffer_frac": float(frac),
+                "confirm_bars": int(confirm),
                 "atr_fast": int(ATR_FAST_BARS),
                 "atr_slow": int(ATR_SLOW_BARS),
                 "session": session,

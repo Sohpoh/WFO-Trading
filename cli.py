@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     strat = p.add_argument_group(
         "strategy grid (NY 5min overnight-range breakout: Donchian channel + vol-regime "
-        "gate, failed-breakout stop, no target)"
+        "gate, persistence-confirmed entry, failed-breakout stop, no target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -82,10 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "slow leg of the volatility-regime gate is threaded as a fixed int, so "
                              "wfo_engine's warm-up buffer is sized off it (not off this grid) — narrowing "
                              "this list will not starve the gate")
-    strat.add_argument("--buffer-frac", default="0.05,0.10,0.15,0.20",
-                        help="comma-separated breakout buffers as a fraction of channel width: LONG when "
-                             "Close > upper + frac*width, SHORT when Close < lower - frac*width. Both sides "
-                             "are AND-ed with the zero-parameter vol-regime gate (strategy.ATR_FAST_BARS / "
+    strat.add_argument("--confirm-bars", default="1,2,3",
+                        help="comma-separated persistence requirements: the Close must stay beyond the "
+                             "broken channel level for this many consecutive bars before entry. 1 = plain "
+                             "single-bar breakout (no persistence); 2-3 filter one-bar noise wicks. Measured "
+                             "against the RAW channel level (no proportional buffer). Both sides are AND-ed "
+                             "with the zero-parameter vol-regime gate (strategy.ATR_FAST_BARS / "
                              "ATR_SLOW_BARS = 288/1152 bars, i.e. 24h vs 96h at 5min). The stop "
                              "(strategy.STOP_WIDTH_MULT = 0.5 x the trigger bar's channel width) and the "
                              "deliberately unreachable 'no target' are likewise hardcoded, keeping the "
@@ -140,14 +142,16 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # range_lookback IS a genuine bar-count lookback, so it is parsed as int
-        # and correctly feeds wfo_engine's warm-up buffer. buffer_frac is a
-        # dimensionless ratio (not a lookback), so it is parsed as float and
-        # correctly ignored by _max_lookback_bars(). atr_fast/atr_slow are
-        # fixed ints threaded inside build_grid() (not CLI flags).
+        # range_lookback and confirm_bars are genuine bar-count lookbacks (the
+        # Donchian channel window and the persistence window over it), so both
+        # are parsed as int and correctly feed wfo_engine's warm-up buffer.
+        # atr_fast/atr_slow are fixed ints threaded inside build_grid() (not CLI
+        # flags). The build_grid argument is `confirm_barss` — the grid-search
+        # naming convention is "<param> + 's'", applied to a param that already
+        # ends in 's'.
         range_lookbacks = parse_num_list(args.range_lookback, int)
-        buffer_fracs = parse_num_list(args.buffer_frac, float)
-        grid = build_grid(range_lookbacks, buffer_fracs, session)
+        confirm_barss = parse_num_list(args.confirm_bars, int)
+        grid = build_grid(range_lookbacks, confirm_barss, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -193,11 +197,11 @@ def main(argv=None) -> int:
         # so their "distinct values" would always be 1 and carry no stability
         # information.
         range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
-        buffer_frac_vals = sorted({p["buffer_frac"] for p in chosen})
+        confirm_bars_vals = sorted({p["confirm_bars"] for p in chosen})
         print(
             f"Fold param stability: {len(range_lookback_vals)} distinct range lookback "
-            f"{range_lookback_vals}, {len(buffer_frac_vals)} distinct buffer frac "
-            f"{buffer_frac_vals}"
+            f"{range_lookback_vals}, {len(confirm_bars_vals)} distinct confirm bars "
+            f"{confirm_bars_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -235,7 +239,7 @@ def main(argv=None) -> int:
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
                 "range_lookback": f.best_params.get("range_lookback"),
-                "buffer_frac": f.best_params.get("buffer_frac"),
+                "confirm_bars": f.best_params.get("confirm_bars"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

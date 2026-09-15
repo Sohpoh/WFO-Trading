@@ -1,25 +1,24 @@
 """NY 5min overnight-range breakout — Donchian channel, vol-regime gate,
-failed-breakout stop (session port of iteration 15's 5min config).
+persistence-confirmed entry, failed-breakout stop (variation of iteration 56).
 
-A one-axis slice change on this repo's only demonstrated edge. Accepted
-iterations 6/10/11 (NQ 15min, New York) paired a Donchian breakout with two
-*zero-parameter* overlays — an ATR volatility-regime gate and a
-channel-width-quoted failed-breakout stop — and cleared the gate. Iteration 15
-ported that identical entry primitive to 5min bars in the *London* overnight
-window and got `no-edge`, its own reasoning concluding "the London session
-itself, not the entry primitive, is the binding constraint." This iteration
-changes exactly one economic thing — the session, London -> New York — and
-holds everything else byte-identical: symbol NQ, 5min bars, both grids, the
-288/1152-bar vol gate, the 0.5x-channel stop, no target, and the 12/3 train/test
-schedule. A clean pass localizes the edge to the NY session where the 15min
-version lives; a clean fail says the breakout edge was 15min-specific rather
-than session-specific.
-
-Why the wall-clock-matched 5min form of iteration 6/10/11's gate: the 15min run
-used ATR windows of 96/384 bars (24h vs 96h). At 5min those same wall-clock
-horizons are 288/1152 bars, so the gate windows are re-expressed 3x (see
-constants below). Leaving them at 96/384 would silently redefine the gate as an
-8h-vs-32h measure, which is a different indicator wearing the same name.
+Iteration 56 (this repo's NY 5min session port of the accepted 15min breakout)
+was rejected as overfit-gap, not no-edge: median train Sharpe 2.98 vs median
+fold OOS Sharpe -0.31, 48.7% fold consistency, and borderline robustness (top 5
+of 142 trades = 99.4% of the +12.2% return). Its fold_table.csv showed no
+grid-boundary pinning on either axis (range_lookback 72/144/288/576 in
+13/12/15/8 folds; buffer_frac 0.05/0.1/0.15/0.2 in 5/23/11/9), so the searched
+region was not the limiter and a param-range extension was out. The defect that
+shape exposes is 5min-specific: a single bar's Close can pierce the channel on
+a noise spike and reverse, producing false breakouts the optimizer curve-fits
+in-sample. This iteration retires `buffer_frac` (the diffuse proportional-margin
+axis the optimizer could not settle on) 1-for-1 and replaces it with
+`confirm_bars` — a persistence requirement that the Close stays beyond the
+broken channel level for N consecutive bars before entry. Requiring the break
+to hold for 2-3 bars filters one-bar wicks while keeping genuine order-flow
+breakouts, raising win rate rather than merely trading less (the difference
+from iterations 8/9's failed magnitude-threshold filters). This is the one
+lever iteration 4 proposed but never actually ran (it errored on a build_grid
+naming issue).
 
 Rules (all computed on continuous, session-unaware bars):
 
@@ -34,13 +33,19 @@ Rules (all computed on continuous, session-unaware bars):
     unwarmed bars NaN so every comparison against them is False: the signal
     fails *closed*.
 
-  - Breakout with a proportional buffer, so the required push scales with how
-    wide the range already is:
-        LONG  where Close > upper + buffer_frac * channel_width
-        SHORT where Close < lower - buffer_frac * channel_width
-    Mutually exclusive by construction: for any channel_width >= 0 the long
-    threshold sits at or above the short threshold, so a single Close cannot
-    clear both. The delegate's long-first if/elif tie-break never binds.
+  - Persistence-confirmed breakout against the RAW channel level (no
+    proportional buffer — `buffer_frac` is retired):
+        break_above = Close > upper
+        break_below = Close < lower
+        LONG  where break_above has been True for `confirm_bars` consecutive
+              bars ending on the current bar
+        SHORT where break_below has been True for `confirm_bars` consecutive
+              bars ending on the current bar
+    `confirm_bars = 1` degenerates to the plain single-bar breakout (the old
+    buffer_frac = 0 case) and is retained as a control. Mutually exclusive by
+    construction for any channel_width >= 0: upper >= lower, so a single Close
+    cannot be simultaneously above upper and below lower, hence no bar can
+    satisfy both persistence counts at once.
 
   - Volatility-regime gate, AND-ed into both sides. Carried over *unchanged in
     meaning* from accepted iterations 6/10/11, with its two windows scaled 3x
@@ -58,8 +63,7 @@ flatten, all owned by `apply_session_constraint_with_stops()`:
   - stop_distance = STOP_WIDTH_MULT * channel_width of the trigger bar, with
     STOP_WIDTH_MULT = 0.5 a hardcoded module constant that is NOT
     grid-searched. This is the settled dimension from accepted iterations
-    10/11 and is unchanged in *price* terms here, since channel_width spans
-    the same wall-clock horizon as it did at 15min. The economic reading is
+    10/11 and is unchanged in *price* terms here. The economic reading is
     "a breakout that gives back half the range it broke out of was a failed
     breakout", and it self-scales with `range_lookback` without refitting.
 
@@ -94,24 +98,24 @@ Contract notes, stated rather than assumed:
 
 Cost note: `metrics.py`'s per-leg toll is cost model v2 (0.001% fee + 0.005%
 slippage, ~1.2bp round trip, recalibrated Aug 2026) and is out of scope for
-this file. Iteration 15 was judged under the old ~10.2bp model and its own
-caveat flagged that a fixed RTH slippage understated true overnight spreads;
-cost v2 removes that cost-to-excursion objection, and a New York session trades
-during RTH anyway, so no overnight-spread caveat applies here. Nothing about
-costs is implemented in this file.
+this file. Nothing about costs is implemented in this file.
 
 Warm-up: the binding requirement is the *gate*, not the channel —
 atr_slow (1152) + 1 for the rolling mean's shift + 1 for TR's own
-`Close.shift(1)` = 1154 bars, versus range_lookback + 1 <= 577 for the channel.
-`range_lookback`, `atr_fast`, and `atr_slow` are genuine bar-count lookbacks
-and are threaded through `build_grid()` as plain `int`s **on purpose**, so they
-feed `_max_lookback_bars()` — whose max over the grid (1152 here) sizes the
-engine's pre-test-window warm-up buffer to max((1152 + 5) * 3, day_bars + 5) =
-3471 bars at 5min, comfortably covering the 1154-bar gate warm-up even if the
-`range_lookback` grid later shrinks. `buffer_frac` is a ratio (dimensionless)
-and is passed as a `float` **on purpose** so it can never inflate that buffer;
-`STOP_WIDTH_MULT` and `TARGET_WIDTH_MULT` are module constants that never enter
-the grid at all.
+`Close.shift(1)` = 1154 bars. The persistence-confirmed channel needs
+range_lookback + confirm_bars bars (range_lookback + 1 for the shifted rolling
+extreme, plus confirm_bars - 1 more so the last bar of the persistence window
+sees a warmed channel), at most 576 + 3 = 579. `range_lookback`, `confirm_bars`,
+`atr_fast`, and `atr_slow` are genuine bar-count lookbacks and are threaded
+through `build_grid()` as plain `int`s **on purpose**, so they feed
+`_max_lookback_bars()` — whose max over the grid (1152 here) sizes the engine's
+pre-test-window warm-up buffer to max((1152 + 5) * 3, day_bars + 5) = 3471 bars
+at 5min, comfortably covering the 1154-bar gate warm-up. `confirm_bars` is an
+int *because* it is a rolling lookback (a `confirm_bars`-bar persistence
+window), not an integer threshold: a huge grid value there genuinely would
+require that much extra warm-up, so feeding the buffer is correct. `buffer_frac`
+is gone entirely. `STOP_WIDTH_MULT` and `TARGET_WIDTH_MULT` are module constants
+that never enter the grid at all.
 
 This module decides only *when* the strategy wants to be long or short. All
 day-trade gating and the end-of-session flatten are delegated to
@@ -177,7 +181,7 @@ def average_true_range(df: pd.DataFrame, period: int) -> pd.Series:
 def generate_positions(
     df: pd.DataFrame,
     range_lookback: int,
-    buffer_frac: float,
+    confirm_bars: int,
     session: str | None = "New York",
     atr_fast: int = ATR_FAST_BARS,
     atr_slow: int = ATR_SLOW_BARS,
@@ -201,16 +205,26 @@ def generate_positions(
     atr_slow_series = average_true_range(df, atr_slow)
     vol_regime = (atr_fast_series >= atr_slow_series).fillna(False)
 
-    # Proportional-buffer breakout. Mutually exclusive by construction for any
-    # channel_width >= 0. `.astype(bool)` is deliberate: the delegate indexes
-    # these arrays with plain truthiness, and a stray object-dtype NaN is
-    # truthy — this is what makes an unwarmed bar fail closed rather than open.
-    long_signal = (
-        (close > upper + buffer_frac * channel_width).fillna(False) & vol_regime
-    ).astype(bool)
-    short_signal = (
-        (close < lower - buffer_frac * channel_width).fillna(False) & vol_regime
-    ).astype(bool)
+    # Persistence-confirmed breakout against the raw channel level (no
+    # proportional buffer — `buffer_frac` is retired). `break_above`/`break_below`
+    # are clean bools; the rolling `confirm_bars`-window sum counts consecutive
+    # beyond-level bars, and `.eq(confirm_bars)` is True only when the whole
+    # window (including the current bar) is beyond the level. `confirm_bars = 1`
+    # degenerates to the plain single-bar breakout. `.astype(bool)` is
+    # deliberate: the delegate indexes these arrays with plain truthiness, and a
+    # stray object-dtype NaN is truthy — this is what makes an unwarmed bar fail
+    # closed rather than open.
+    break_above = close.gt(upper).fillna(False).astype(bool)
+    break_below = close.lt(lower).fillna(False).astype(bool)
+    confirmed_above = (
+        break_above.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+    )
+    confirmed_below = (
+        break_below.rolling(confirm_bars, min_periods=confirm_bars).sum().eq(confirm_bars)
+    )
+
+    long_signal = (confirmed_above & vol_regime).astype(bool)
+    short_signal = (confirmed_below & vol_regime).astype(bool)
 
     # Failed-breakout stop, in channel-width units — symmetric, resolved to a
     # side by the delegate. A zero/NaN width makes the delegate refuse the entry.
@@ -241,11 +255,10 @@ def generate_positions(
 
 
 DEFAULT_PARAMS = {
-    # range_lookback is a plain int because it IS a genuine bar-count lookback
-    # (the Donchian channel window) and must feed wfo_engine's warm-up buffer;
-    # buffer_frac is a float because it is a dimensionless ratio (NOT a
-    # lookback) and must NOT feed the buffer. Both are grid-searched
-    # ({72,144,288,576} bars, {0.05,0.10,0.15,0.20}). atr_fast/atr_slow are
+    # range_lookback and confirm_bars are plain ints because they ARE genuine
+    # bar-count lookbacks (the Donchian channel window and the persistence
+    # window over it) and must feed wfo_engine's warm-up buffer. Both are
+    # grid-searched ({72,144,288,576} bars, {1,2,3} bars). atr_fast/atr_slow are
     # fixed plain-int lookbacks (288 / 1152) — never grid-searched, but threaded
     # through build_grid() as fixed params so _max_lookback_bars() accounts for
     # the 1154-bar vol-gate warm-up. STOP_WIDTH_MULT (0.5) and TARGET_WIDTH_MULT
@@ -253,7 +266,7 @@ DEFAULT_PARAMS = {
     # fixed param. These are also the concrete set the sanity checker runs
     # generate_positions() against.
     "range_lookback": 144,
-    "buffer_frac": 0.10,
+    "confirm_bars": 2,
     "session": "New York",
     "atr_fast": ATR_FAST_BARS,
     "atr_slow": ATR_SLOW_BARS,
