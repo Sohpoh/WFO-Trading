@@ -42,12 +42,12 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(range_lookbacks, confirm_barss, session) -> list[dict]:
+def build_grid(range_lookbacks, confirm_barss, target_width_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Two params are searched for the NY 5min overnight-range breakout (Donchian
-    channel + vol-regime gate, persistence-confirmed entry, failed-breakout
-    stop, no target):
+    Three params are searched for the NY 5min overnight-range breakout
+    (Donchian channel + vol-regime gate, persistence-confirmed entry,
+    failed-breakout stop, bounded profit target):
 
       - `range_lookback` — the Donchian channel window in bars. This IS a
         genuine bar-count lookback, so it is threaded as a plain `int`
@@ -63,15 +63,21 @@ def build_grid(range_lookbacks, confirm_barss, session) -> list[dict]:
         infrastructure and enforces this spelling), applied to a key that
         already ends in 's'; it is the double-'s' consequence of that rule,
         not a typo.
+      - `target_width_mult` — the bounded profit-target width in channel-width
+        units (grid {0.5, 1.0, 1.5, 2.0} = 1R/2R/3R/4R against the 0.5x-width
+        stop). A dimensionless multiplier, NOT a bar-count lookback, so it is
+        threaded as a **float** on purpose: `_max_lookback_bars()` only picks
+        up plain `int`s, so a huge grid value here must not buy extra warm-up.
+        The build_grid parameter is `target_width_mults` — the same
+        "<DEFAULT_PARAMS key> + 's'" convention.
 
     The strategy's zero-parameter overlays — the volatility-regime gate windows
     (`strategy.ATR_FAST_BARS` = 288 / `strategy.ATR_SLOW_BARS` = 1152) — are
     fixed (never searched), but they are genuine bar-count lookbacks, so they
     are threaded into every combo as plain `int`s **on purpose** so
-    `_max_lookback_bars()` accounts for the gate's warm-up. The exit constants
-    (`strategy.STOP_WIDTH_MULT` = 0.5, `strategy.TARGET_WIDTH_MULT` = 1000.0)
-    are dimensionless and deliberately never enter the grid, which keeps the
-    search at two dimensions.
+    `_max_lookback_bars()` accounts for the gate's warm-up. The stop constant
+    (`strategy.STOP_WIDTH_MULT` = 0.5) is dimensionless and deliberately never
+    enters the grid.
 
     `session` is fixed and threaded into every combo as-is, never searched
     (required by CLAUDE.md).
@@ -88,11 +94,12 @@ def build_grid(range_lookbacks, confirm_barss, session) -> list[dict]:
     from strategy import ATR_FAST_BARS, ATR_SLOW_BARS
 
     grid = []
-    for lookback, confirm in product(range_lookbacks, confirm_barss):
+    for lookback, confirm, target_mult in product(range_lookbacks, confirm_barss, target_width_mults):
         grid.append(
             {
                 "range_lookback": int(lookback),
                 "confirm_bars": int(confirm),
+                "target_width_mult": float(target_mult),
                 "atr_fast": int(ATR_FAST_BARS),
                 "atr_slow": int(ATR_SLOW_BARS),
                 "session": session,

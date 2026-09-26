@@ -1,24 +1,23 @@
 """NY 5min overnight-range breakout — Donchian channel, vol-regime gate,
-persistence-confirmed entry, failed-breakout stop (variation of iteration 56).
+persistence-confirmed entry, failed-breakout stop, bounded profit target
+(variation of iteration 57).
 
-Iteration 56 (this repo's NY 5min session port of the accepted 15min breakout)
-was rejected as overfit-gap, not no-edge: median train Sharpe 2.98 vs median
-fold OOS Sharpe -0.31, 48.7% fold consistency, and borderline robustness (top 5
-of 142 trades = 99.4% of the +12.2% return). Its fold_table.csv showed no
-grid-boundary pinning on either axis (range_lookback 72/144/288/576 in
-13/12/15/8 folds; buffer_frac 0.05/0.1/0.15/0.2 in 5/23/11/9), so the searched
-region was not the limiter and a param-range extension was out. The defect that
-shape exposes is 5min-specific: a single bar's Close can pierce the channel on
-a noise spike and reverse, producing false breakouts the optimizer curve-fits
-in-sample. This iteration retires `buffer_frac` (the diffuse proportional-margin
-axis the optimizer could not settle on) 1-for-1 and replaces it with
-`confirm_bars` — a persistence requirement that the Close stays beyond the
-broken channel level for N consecutive bars before entry. Requiring the break
-to hold for 2-3 bars filters one-bar wicks while keeping genuine order-flow
-breakouts, raising win rate rather than merely trading less (the difference
-from iterations 8/9's failed magnitude-threshold filters). This is the one
-lever iteration 4 proposed but never actually ran (it errored on a build_grid
-naming issue).
+Iteration 57 (persistence-confirmed entry: `confirm_bars` grid replacing the
+retired `buffer_frac`) was rejected fragile-concentration — not no-edge, and
+not a second fragile-concentration in a row (56 was overfit-gap) — so the
+family stays addressable and the prescribed fix is variation type (d): an exit
+change that harvests the outsized winners rather than a filter that just
+trades less. Iteration 57's own reasoning blamed its failure on winner-tail
+dependence — "profit factor collapses 1.2267 -> 1.0306 once the top 5 trades
+are removed" and total return 0.1632 -> 0.0216 — so the lever is the exit, not
+the entry. What changed from iteration 57: the unreachable
+`TARGET_WIDTH_MULT = 1000.0` (winners ran uncapped to the 16:00 ET flatten) is
+replaced by a grid-searched bounded profit target quoted in the same
+channel-width units as the unchanged 0.5x-width failed-breakout stop, so
+winners are banked at 1-4R instead of left to round-trip. The entry signal,
+vol-regime gate, stop width, `range_lookback`/`confirm_bars` grids,
+symbol/timeframe/session/schedule are all held byte-identical so the target is
+the sole variable.
 
 Rules (all computed on continuous, session-unaware bars):
 
@@ -57,8 +56,8 @@ Rules (all computed on continuous, session-unaware bars):
     freedom. Strict `min_periods` again means the gate fails closed while
     unwarmed.
 
-Exit — path-dependent stop, *no* profit target, plus the forced session
-flatten, all owned by `apply_session_constraint_with_stops()`:
+Exit — path-dependent stop *and* bounded profit target, plus the forced
+session flatten, all owned by `apply_session_constraint_with_stops()`:
 
   - stop_distance = STOP_WIDTH_MULT * channel_width of the trigger bar, with
     STOP_WIDTH_MULT = 0.5 a hardcoded module constant that is NOT
@@ -67,15 +66,15 @@ flatten, all owned by `apply_session_constraint_with_stops()`:
     "a breakout that gives back half the range it broke out of was a failed
     breakout", and it self-scales with `range_lookback` without refitting.
 
-  - No target. The delegate refuses any entry whose target is NaN or on the
-    wrong side of the entry Close, so "no target" has to be expressed as an
-    unreachable level rather than omitted:
-        LONG  -> Close + TARGET_WIDTH_MULT * channel_width
-        SHORT -> Close - TARGET_WIDTH_MULT * channel_width
-    with TARGET_WIDTH_MULT = 1000.0. Winners therefore run to the 16:00 ET
-    session flatten. It is a `float` on purpose and never enters the grid — an
-    int 1000 in a param dict would buy 3000 bars of meaningless warm-up via
-    `_max_lookback_bars()`.
+  - Bounded profit target (the sole change from iteration 57 — grid-searched):
+        LONG  -> entry Close + target_width_mult * channel_width
+        SHORT -> entry Close - target_width_mult * channel_width
+    `target_width_mult` replaces the unreachable 1000.0 constant; the grid
+    {0.5, 1.0, 1.5, 2.0} banks winners at 1R/2R/3R/4R against the 0.5x-width
+    stop, converting the momentum family's "fewer, larger trades" tail into a
+    "frequent small wins" profile that survives gate v2's leave-top-5-out
+    check. The target is an absolute, direction-resolved level — the shape the
+    delegate expects — and is only read on actual entry bars.
 
 Contract notes, stated rather than assumed:
 
@@ -88,10 +87,11 @@ Contract notes, stated rather than assumed:
     without a strictly positive stop distance and a strictly correctly-sided
     target.
 
-  - **Fill-model caveat, unchanged and stated up front.** A stop hit is
+  - **Fill-model caveat, unchanged and stated up front.** A stop/target hit is
     *detected* intrabar on High/Low against the stored level, but the exit is
     priced at that bar's Close. Realized losses can therefore exceed
-    stop_distance; results must not be described as capping loss at the stop.
+    stop_distance (and realized gains fall short of the target) — results must
+    not be described as capping loss at the stop or guaranteeing the target.
     Relatedly, the walk never flips long->short directly — a stopped-out trade
     followed by an opposite-side entry is two trades and two round-trip cost
     legs.
@@ -114,12 +114,16 @@ at 5min, comfortably covering the 1154-bar gate warm-up. `confirm_bars` is an
 int *because* it is a rolling lookback (a `confirm_bars`-bar persistence
 window), not an integer threshold: a huge grid value there genuinely would
 require that much extra warm-up, so feeding the buffer is correct. `buffer_frac`
-is gone entirely. `STOP_WIDTH_MULT` and `TARGET_WIDTH_MULT` are module constants
-that never enter the grid at all.
+is gone entirely. `STOP_WIDTH_MULT` is a module constant that never enters the
+grid. `target_width_mult` is a **float on purpose**: it is a dimensionless
+profit-target multiplier (channel-width units), NOT a bar-count lookback, so a
+huge grid value there must *not* buy extra warm-up — threading it as a float
+keeps `_max_lookback_bars()` from picking it up.
 
 This module decides only *when* the strategy wants to be long or short. All
-day-trade gating and the end-of-session flatten are delegated to
-`apply_session_constraint_with_stops()`; see its docstring for that contract.
+day-trade gating, the end-of-session flatten, and the stop/target exit
+bookkeeping are delegated to `apply_session_constraint_with_stops()`; see its
+docstring for that contract.
 """
 import numpy as np
 import pandas as pd
@@ -140,11 +144,6 @@ ATR_SLOW_BARS = 1152
 # iterations 10/11. A dimensionless ratio (not a lookback), so it never enters
 # the grid and never feeds `_max_lookback_bars()`.
 STOP_WIDTH_MULT = 0.5
-
-# "No target", expressed as an unreachable level because the delegate refuses
-# any entry with a NaN or wrong-sided target. A float on purpose so it could
-# never be mistaken for a bar-count lookback if it ever entered a param dict.
-TARGET_WIDTH_MULT = 1000.0
 
 
 def true_range(df: pd.DataFrame) -> pd.Series:
@@ -182,6 +181,7 @@ def generate_positions(
     df: pd.DataFrame,
     range_lookback: int,
     confirm_bars: int,
+    target_width_mult: float,
     session: str | None = "New York",
     atr_fast: int = ATR_FAST_BARS,
     atr_slow: int = ATR_SLOW_BARS,
@@ -230,14 +230,17 @@ def generate_positions(
     # side by the delegate. A zero/NaN width makes the delegate refuse the entry.
     stop_distance = STOP_WIDTH_MULT * channel_width
 
-    # "No target": an unreachable level, so the only exits are the stop and the
-    # forced session flatten. Absolute and already direction-resolved, which is
-    # the shape the delegate expects. Only read on actual entry bars.
+    # Bounded profit target (the sole change from iteration 57). Grid-searched
+    # `target_width_mult` x the trigger bar's channel width, resolved to a side
+    # and anchored off the entry Close. Absolute and direction-resolved, which
+    # is the shape the delegate expects. Only read on actual entry bars.
+    # `target_width_mult` is a float (a dimensionless profit-target multiplier,
+    # not a bar-count lookback), so it must never feed the warm-up buffer.
     target_price = pd.Series(
         np.where(
             long_signal,
-            close + TARGET_WIDTH_MULT * channel_width,
-            close - TARGET_WIDTH_MULT * channel_width,
+            close + target_width_mult * channel_width,
+            close - target_width_mult * channel_width,
         ),
         index=df.index,
     )
@@ -258,15 +261,19 @@ DEFAULT_PARAMS = {
     # range_lookback and confirm_bars are plain ints because they ARE genuine
     # bar-count lookbacks (the Donchian channel window and the persistence
     # window over it) and must feed wfo_engine's warm-up buffer. Both are
-    # grid-searched ({72,144,288,576} bars, {1,2,3} bars). atr_fast/atr_slow are
-    # fixed plain-int lookbacks (288 / 1152) — never grid-searched, but threaded
-    # through build_grid() as fixed params so _max_lookback_bars() accounts for
-    # the 1154-bar vol-gate warm-up. STOP_WIDTH_MULT (0.5) and TARGET_WIDTH_MULT
-    # (1000.0) are module constants that never enter the grid. `session` is a
-    # fixed param. These are also the concrete set the sanity checker runs
-    # generate_positions() against.
+    # grid-searched ({72,144,288,576} bars, {1,2,3} bars). target_width_mult is
+    # a float — a dimensionless profit-target multiplier in channel-width units
+    # (grid-searched {0.5,1.0,1.5,2.0} = 1R/2R/3R/4R against the 0.5x-width
+    # stop), NOT a lookback, so it must not inflate the warm-up buffer.
+    # atr_fast/atr_slow are fixed plain-int lookbacks (288 / 1152) — never
+    # grid-searched, but threaded through build_grid() as fixed params so
+    # _max_lookback_bars() accounts for the 1154-bar vol-gate warm-up.
+    # STOP_WIDTH_MULT (0.5) is a module constant that never enters the grid.
+    # `session` is a fixed param. These are also the concrete set the sanity
+    # checker runs generate_positions() against.
     "range_lookback": 144,
     "confirm_bars": 2,
+    "target_width_mult": 1.0,
     "session": "New York",
     "atr_fast": ATR_FAST_BARS,
     "atr_slow": ATR_SLOW_BARS,

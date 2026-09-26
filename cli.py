@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     strat = p.add_argument_group(
         "strategy grid (NY 5min overnight-range breakout: Donchian channel + vol-regime "
-        "gate, persistence-confirmed entry, failed-breakout stop, no target)"
+        "gate, persistence-confirmed entry, failed-breakout stop, bounded profit target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -89,9 +89,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "against the RAW channel level (no proportional buffer). Both sides are AND-ed "
                              "with the zero-parameter vol-regime gate (strategy.ATR_FAST_BARS / "
                              "ATR_SLOW_BARS = 288/1152 bars, i.e. 24h vs 96h at 5min). The stop "
-                             "(strategy.STOP_WIDTH_MULT = 0.5 x the trigger bar's channel width) and the "
-                             "deliberately unreachable 'no target' are likewise hardcoded, keeping the "
-                             "search at two dimensions")
+                             "(strategy.STOP_WIDTH_MULT = 0.5 x the trigger bar's channel width) is likewise "
+                             "hardcoded; the profit target is the third searched dimension (see "
+                             "--target-width-mult)")
+    strat.add_argument("--target-width-mult", default="0.5,1.0,1.5,2.0",
+                        help="comma-separated bounded profit-target widths, in units of the trigger bar's "
+                             "Donchian channel width. Long target = entry Close + target_width_mult*width; "
+                             "short = entry Close - target_width_mult*width. Against the hardcoded "
+                             "0.5x-width failed-breakout stop these are 1R/2R/3R/4R. A float (a dimensionless "
+                             "multiplier, not a lookback), so it does NOT feed wfo_engine's warm-up buffer")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -145,13 +151,17 @@ def main(argv=None) -> int:
         # range_lookback and confirm_bars are genuine bar-count lookbacks (the
         # Donchian channel window and the persistence window over it), so both
         # are parsed as int and correctly feed wfo_engine's warm-up buffer.
-        # atr_fast/atr_slow are fixed ints threaded inside build_grid() (not CLI
-        # flags). The build_grid argument is `confirm_barss` — the grid-search
-        # naming convention is "<param> + 's'", applied to a param that already
-        # ends in 's'.
+        # target_width_mult is a dimensionless profit-target multiplier (NOT a
+        # lookback), so it is parsed as float (parse_num_list's default cast)
+        # and deliberately excluded from the warm-up buffer. atr_fast/atr_slow
+        # are fixed ints threaded inside build_grid() (not CLI flags). The
+        # build_grid arguments are `confirm_barss` / `target_width_mults` — the
+        # grid-search naming convention is "<param> + 's'", applied to params
+        # that already end in 's'.
         range_lookbacks = parse_num_list(args.range_lookback, int)
         confirm_barss = parse_num_list(args.confirm_bars, int)
-        grid = build_grid(range_lookbacks, confirm_barss, session)
+        target_width_mults = parse_num_list(args.target_width_mult)
+        grid = build_grid(range_lookbacks, confirm_barss, target_width_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -192,16 +202,18 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the two grid-searched params are reported here; `session` and
+        # Only the three grid-searched params are reported here; `session` and
         # the vol-gate windows (atr_fast/atr_slow) are fixed across every combo,
         # so their "distinct values" would always be 1 and carry no stability
         # information.
         range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
         confirm_bars_vals = sorted({p["confirm_bars"] for p in chosen})
+        target_width_mult_vals = sorted({p["target_width_mult"] for p in chosen})
         print(
             f"Fold param stability: {len(range_lookback_vals)} distinct range lookback "
             f"{range_lookback_vals}, {len(confirm_bars_vals)} distinct confirm bars "
-            f"{confirm_bars_vals}"
+            f"{confirm_bars_vals}, {len(target_width_mult_vals)} distinct target widths "
+            f"{target_width_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -240,6 +252,7 @@ def main(argv=None) -> int:
                 "test_start": f.test_start, "test_end": f.test_end,
                 "range_lookback": f.best_params.get("range_lookback"),
                 "confirm_bars": f.best_params.get("confirm_bars"),
+                "target_width_mult": f.best_params.get("target_width_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
