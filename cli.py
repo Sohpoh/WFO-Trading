@@ -6,18 +6,17 @@ Useful for batch runs, cron/CI, or piping results into other tools instead of
 clicking through the sidebar every time.
 
 Examples:
-    # the strategy's intended config (NQ 15min, New York session). NQ over ES
-    # on purpose: ES's smaller overnight moves would starve the 0.40% floor on
-    # --min-gap-pct. Every searched param is a float, so wfo_engine's warm-up
-    # buffer comes from the one-day floor (~97 bars at 15min) and its fold-skip
-    # guard drops to 10 bars of train window — unlike previous iterations there
-    # is no timeframe that silently skips every fold.
+    # the strategy's intended config (NQ 15min, New York session): long-only
+    # KNN next-session return prediction. `k` is threaded as a float (neighbor
+    # count, not a lookback); feature_lookback/norm_lookback are int bar
+    # counts, so wfo_engine's warm-up buffer is sized off norm_lookback (1440
+    # bars -> ~45 days).
     python cli.py --symbol NQ --timeframe 15min --train-weeks 12 --test-weeks 3
 
     # override strategy/grid + walk-forward schedule
     python cli.py --symbol NQ --timeframe 15min --session "New York" \\
-        --min-gap-pct 0.004,0.006,0.009,0.013 --stop-gap-frac 0.5,0.75,1.0 \\
-        --target-frac 0.75,1.0 --train-weeks 12 --test-weeks 3
+        --k 5,10,15 --feature-lookback 288,480,768 \\
+        --pred-threshold 0.0,0.0005,0.001 --train-weeks 12 --test-weeks 3
 
     # yfinance source, daily bars, no session filter
     python cli.py --source yfinance --symbol NQ=F --timeframe 1d
@@ -70,34 +69,27 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (NY 5min overnight-range breakout: Donchian channel + vol-regime "
-        "gate, persistence-confirmed entry, failed-breakout stop, bounded profit target)"
+        "strategy grid (long-only KNN next-session return prediction: bar-scale "
+        "warm-up fix)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--range-lookback", default="72,144,288,576",
-                        help="comma-separated Donchian channel lengths in bars, shifted one bar so the "
-                             "current bar is excluded from the channel it has to break. Defaults are sized "
-                             "for 5min bars (72/144/288/576 = 6h/12h/24h/48h). NOTE: the hardcoded 1152-bar "
-                             "slow leg of the volatility-regime gate is threaded as a fixed int, so "
-                             "wfo_engine's warm-up buffer is sized off it (not off this grid) — narrowing "
-                             "this list will not starve the gate")
-    strat.add_argument("--confirm-bars", default="1,2,3",
-                        help="comma-separated persistence requirements: the Close must stay beyond the "
-                             "broken channel level for this many consecutive bars before entry. 1 = plain "
-                             "single-bar breakout (no persistence); 2-3 filter one-bar noise wicks. Measured "
-                             "against the RAW channel level (no proportional buffer). Both sides are AND-ed "
-                             "with the zero-parameter vol-regime gate (strategy.ATR_FAST_BARS / "
-                             "ATR_SLOW_BARS = 288/1152 bars, i.e. 24h vs 96h at 5min). The stop "
-                             "(strategy.STOP_WIDTH_MULT = 0.5 x the trigger bar's channel width) is likewise "
-                             "hardcoded; the profit target is the third searched dimension (see "
-                             "--target-width-mult)")
-    strat.add_argument("--target-width-mult", default="0.5,1.0,1.5,2.0",
-                        help="comma-separated bounded profit-target widths, in units of the trigger bar's "
-                             "Donchian channel width. Long target = entry Close + target_width_mult*width; "
-                             "short = entry Close - target_width_mult*width. Against the hardcoded "
-                             "0.5x-width failed-breakout stop these are 1R/2R/3R/4R. A float (a dimensionless "
-                             "multiplier, not a lookback), so it does NOT feed wfo_engine's warm-up buffer")
+    strat.add_argument("--k", default="5,10,15",
+                        help="comma-separated nearest-neighbor counts: pred_d = mean of the k nearest "
+                             "neighbors' next-day returns in normalized daily-return feature space. A "
+                             "neighbor count, NOT a bar-count lookback, so it is parsed as float and "
+                             "does NOT feed wfo_engine's warm-up buffer")
+    strat.add_argument("--feature-lookback", default="288,480,768",
+                        help="comma-separated feature-window lengths in BARS (288/480/768 = 3/5/8 days at "
+                             "15min). The feature vector is the trailing H = feature_lookback // bars_per_day "
+                             "daily close-to-close returns, each divided by the trailing norm_lookback std. "
+                             "A genuine bar-count lookback, parsed as int and fed to wfo_engine's warm-up "
+                             "buffer")
+    strat.add_argument("--pred-threshold", default="0.0,0.0005,0.001",
+                        help="comma-separated daily-return thresholds: emit a long entry for the session iff "
+                             "the frozen next-session return prediction exceeds this (0.0005 = 5bp/day). A "
+                             "return threshold (float, not a lookback), so it does NOT feed wfo_engine's "
+                             "warm-up buffer")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -148,20 +140,19 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # range_lookback and confirm_bars are genuine bar-count lookbacks (the
-        # Donchian channel window and the persistence window over it), so both
-        # are parsed as int and correctly feed wfo_engine's warm-up buffer.
-        # target_width_mult is a dimensionless profit-target multiplier (NOT a
-        # lookback), so it is parsed as float (parse_num_list's default cast)
-        # and deliberately excluded from the warm-up buffer. atr_fast/atr_slow
-        # are fixed ints threaded inside build_grid() (not CLI flags). The
-        # build_grid arguments are `confirm_barss` / `target_width_mults` — the
-        # grid-search naming convention is "<param> + 's'", applied to params
-        # that already end in 's'.
-        range_lookbacks = parse_num_list(args.range_lookback, int)
-        confirm_barss = parse_num_list(args.confirm_bars, int)
-        target_width_mults = parse_num_list(args.target_width_mult)
-        grid = build_grid(range_lookbacks, confirm_barss, target_width_mults, session)
+        # k is a neighbor count (NOT a bar-count lookback), so it is parsed as
+        # float and deliberately excluded from wfo_engine's warm-up buffer.
+        # feature_lookback is a genuine bar-count lookback (the H-feature
+        # window's bar length), so it is parsed as int and correctly feeds the
+        # warm-up buffer. pred_threshold is a daily-return threshold (float).
+        # norm_lookback (1440 bars = 15 days) is a fixed int threaded inside
+        # build_grid() (not a CLI flag). The build_grid arguments are
+        # ks / feature_lookbacks / pred_thresholds — the grid-search naming
+        # convention is "<param> + 's'".
+        ks = parse_num_list(args.k)
+        feature_lookbacks = parse_num_list(args.feature_lookback, int)
+        pred_thresholds = parse_num_list(args.pred_threshold)
+        grid = build_grid(ks, feature_lookbacks, pred_thresholds, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -203,17 +194,17 @@ def main(argv=None) -> int:
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
         # Only the three grid-searched params are reported here; `session` and
-        # the vol-gate windows (atr_fast/atr_slow) are fixed across every combo,
-        # so their "distinct values" would always be 1 and carry no stability
+        # the fixed norm_lookback are constant across every combo, so their
+        # "distinct values" would always be 1 and carry no stability
         # information.
-        range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
-        confirm_bars_vals = sorted({p["confirm_bars"] for p in chosen})
-        target_width_mult_vals = sorted({p["target_width_mult"] for p in chosen})
+        k_vals = sorted({p["k"] for p in chosen})
+        feature_lookback_vals = sorted({p["feature_lookback"] for p in chosen})
+        pred_threshold_vals = sorted({p["pred_threshold"] for p in chosen})
         print(
-            f"Fold param stability: {len(range_lookback_vals)} distinct range lookback "
-            f"{range_lookback_vals}, {len(confirm_bars_vals)} distinct confirm bars "
-            f"{confirm_bars_vals}, {len(target_width_mult_vals)} distinct target widths "
-            f"{target_width_mult_vals}"
+            f"Fold param stability: {len(k_vals)} distinct k "
+            f"{k_vals}, {len(feature_lookback_vals)} distinct feature lookbacks "
+            f"{feature_lookback_vals}, {len(pred_threshold_vals)} distinct pred thresholds "
+            f"{pred_threshold_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -250,9 +241,9 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
-                "range_lookback": f.best_params.get("range_lookback"),
-                "confirm_bars": f.best_params.get("confirm_bars"),
-                "target_width_mult": f.best_params.get("target_width_mult"),
+                "k": f.best_params.get("k"),
+                "feature_lookback": f.best_params.get("feature_lookback"),
+                "pred_threshold": f.best_params.get("pred_threshold"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

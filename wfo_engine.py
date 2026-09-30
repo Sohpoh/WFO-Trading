@@ -42,66 +42,54 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(range_lookbacks, confirm_barss, target_width_mults, session) -> list[dict]:
+def build_grid(ks, feature_lookbacks, pred_thresholds, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched for the NY 5min overnight-range breakout
-    (Donchian channel + vol-regime gate, persistence-confirmed entry,
-    failed-breakout stop, bounded profit target):
+    Three params are searched for the long-only KNN next-session return
+    prediction (bar-scale warm-up fix):
 
-      - `range_lookback` — the Donchian channel window in bars. This IS a
-        genuine bar-count lookback, so it is threaded as a plain `int`
-        **on purpose**: `_max_lookback_bars()` is *meant* to pick it up and
-        size the warm-up buffer for it.
-      - `confirm_bars` — the persistence requirement: the Close must stay
-        beyond the broken channel level for this many consecutive bars before
-        entry. Also a genuine bar-count lookback (a `confirm_bars`-bar rolling
-        window over the beyond-level condition), so it too is threaded as a
-        plain `int` **on purpose**. The build_grid parameter is spelled
-        `confirm_barss` — the grid-search naming convention is
-        "<DEFAULT_PARAMS key> + 's'" (see tools/check_strategy.py, which is
-        infrastructure and enforces this spelling), applied to a key that
-        already ends in 's'; it is the double-'s' consequence of that rule,
-        not a typo.
-      - `target_width_mult` — the bounded profit-target width in channel-width
-        units (grid {0.5, 1.0, 1.5, 2.0} = 1R/2R/3R/4R against the 0.5x-width
-        stop). A dimensionless multiplier, NOT a bar-count lookback, so it is
-        threaded as a **float** on purpose: `_max_lookback_bars()` only picks
-        up plain `int`s, so a huge grid value here must not buy extra warm-up.
-        The build_grid parameter is `target_width_mults` — the same
+      - `k` — the number of nearest neighbors whose next-day returns are
+        averaged into the prediction (grid {5,10,15}). A neighbor count, NOT a
+        bar-count lookback, so it is threaded as a **float** on purpose:
+        `_max_lookback_bars()` only picks up plain `int`s, and a huge grid
+        value here must not buy extra warm-up. The build_grid parameter is
+        spelled `ks` — the grid-search naming convention is
+        "<DEFAULT_PARAMS key> + 's'" (see tools/check_strategy.py).
+      - `feature_lookback` — the feature-window length in bars (grid
+        {288,480,768} = 3/5/8 days at 15min). A genuine bar-count lookback, so
+        it is threaded as a plain `int` **on purpose** (feeds the warm-up
+        buffer). The build_grid parameter is `feature_lookbacks` — the same
         "<DEFAULT_PARAMS key> + 's'" convention.
+      - `pred_threshold` — the daily-return threshold above which a long is
+        emitted (grid {0.0,0.0005,0.001}). A return threshold (float), NOT a
+        lookback. The build_grid parameter is `pred_thresholds`.
 
-    The strategy's zero-parameter overlays — the volatility-regime gate windows
-    (`strategy.ATR_FAST_BARS` = 288 / `strategy.ATR_SLOW_BARS` = 1152) — are
-    fixed (never searched), but they are genuine bar-count lookbacks, so they
-    are threaded into every combo as plain `int`s **on purpose** so
-    `_max_lookback_bars()` accounts for the gate's warm-up. The stop constant
-    (`strategy.STOP_WIDTH_MULT` = 0.5) is dimensionless and deliberately never
-    enters the grid.
+    The strategy's fixed `norm_lookback` (`strategy.NORM_LOOKBACK_BARS` = 1440
+    bars = 15 days at 15min) is never searched, but it is a genuine bar-count
+    lookback, so it is threaded into every combo as a plain `int` **on
+    purpose** so `_max_lookback_bars()` accounts for the KNN's warm-up.
 
     `session` is fixed and threaded into every combo as-is, never searched
     (required by CLAUDE.md).
 
-    WARM-UP — `ATR_SLOW_BARS` (1152) is the largest int in the grid, so
-    `_max_lookback_bars()` returns 1152 and `run_walk_forward()` sizes the
-    buffer to `max((1152 + 5) * 3, day_bars + 5)` = 3471 bars at 5min. The
-    vol-gate's total warm-up need is `ATR_SLOW_BARS + 2` = 1154 bars (the
-    rolling-mean shift plus true-range's `Close.shift(1)`), so the buffer
-    covers it with headroom; the fold-skip guard of `max_lookback + 10` =
-    1162 bars is far below any 12-week train window at 5min, so no fold is
-    silently skipped.
+    WARM-UP — `NORM_LOOKBACK_BARS` (1440) is the largest int in the grid, so
+    `_max_lookback_bars()` returns 1440 and `run_walk_forward()` sizes the
+    buffer to `max((1440 + 5) * 3, day_bars + 5)` = 4335 bars (~45 days) at
+    15min. The KNN's total warm-up need is bounded by norm_days (15) + k (at
+    most 15) = ~30 days, so the buffer covers it with headroom; the fold-skip
+    guard of `max_lookback + 10` = 1450 bars is far below any 12-week train
+    window at 15min, so no fold is silently skipped.
     """
-    from strategy import ATR_FAST_BARS, ATR_SLOW_BARS
+    from strategy import NORM_LOOKBACK_BARS
 
     grid = []
-    for lookback, confirm, target_mult in product(range_lookbacks, confirm_barss, target_width_mults):
+    for k, flb, pt in product(ks, feature_lookbacks, pred_thresholds):
         grid.append(
             {
-                "range_lookback": int(lookback),
-                "confirm_bars": int(confirm),
-                "target_width_mult": float(target_mult),
-                "atr_fast": int(ATR_FAST_BARS),
-                "atr_slow": int(ATR_SLOW_BARS),
+                "k": float(k),
+                "feature_lookback": int(flb),
+                "pred_threshold": float(pt),
+                "norm_lookback": int(NORM_LOOKBACK_BARS),
                 "session": session,
             }
         )
