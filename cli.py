@@ -69,8 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only KNN next-session return prediction: bar-scale "
-        "warm-up fix)"
+        "strategy grid (long-only KNN next-session return prediction + ATR "
+        "hard stop, no target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
@@ -90,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "the frozen next-session return prediction exceeds this (0.0005 = 5bp/day). A "
                              "return threshold (float, not a lookback), so it does NOT feed wfo_engine's "
                              "warm-up buffer")
+    strat.add_argument("--stop-atr-mult", default="1.0,1.5,2.0,3.0",
+                        help="comma-separated ATR hard-stop multipliers: stop distance = entry - "
+                             "stop_atr_mult * ATR(14) for a long, detected on the intrabar Low and "
+                             "flattened at that bar's Close (no profit target, so winners stay uncapped "
+                             "to the session flatten). An ATR multiplier (float, not a lookback), so it "
+                             "does NOT feed wfo_engine's warm-up buffer")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -145,14 +151,16 @@ def main(argv=None) -> int:
         # feature_lookback is a genuine bar-count lookback (the H-feature
         # window's bar length), so it is parsed as int and correctly feeds the
         # warm-up buffer. pred_threshold is a daily-return threshold (float).
-        # norm_lookback (1440 bars = 15 days) is a fixed int threaded inside
-        # build_grid() (not a CLI flag). The build_grid arguments are
-        # ks / feature_lookbacks / pred_thresholds — the grid-search naming
-        # convention is "<param> + 's'".
+        # stop_atr_mult is an ATR multiplier for the hard-stop distance (float,
+        # NOT a lookback). norm_lookback (1440 bars = 15 days) and atr_period
+        # (14 bars) are fixed ints threaded inside build_grid() (not CLI flags).
+        # The build_grid arguments are ks / feature_lookbacks / pred_thresholds /
+        # stop_atr_mults — the grid-search naming convention is "<param> + 's'".
         ks = parse_num_list(args.k)
         feature_lookbacks = parse_num_list(args.feature_lookback, int)
         pred_thresholds = parse_num_list(args.pred_threshold)
-        grid = build_grid(ks, feature_lookbacks, pred_thresholds, session)
+        stop_atr_mults = parse_num_list(args.stop_atr_mult)
+        grid = build_grid(ks, feature_lookbacks, pred_thresholds, stop_atr_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -193,18 +201,20 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the three grid-searched params are reported here; `session` and
-        # the fixed norm_lookback are constant across every combo, so their
-        # "distinct values" would always be 1 and carry no stability
+        # Only the four grid-searched params are reported here; `session` and
+        # the fixed norm_lookback/atr_period are constant across every combo, so
+        # their "distinct values" would always be 1 and carry no stability
         # information.
         k_vals = sorted({p["k"] for p in chosen})
         feature_lookback_vals = sorted({p["feature_lookback"] for p in chosen})
         pred_threshold_vals = sorted({p["pred_threshold"] for p in chosen})
+        stop_atr_mult_vals = sorted({p["stop_atr_mult"] for p in chosen})
         print(
             f"Fold param stability: {len(k_vals)} distinct k "
             f"{k_vals}, {len(feature_lookback_vals)} distinct feature lookbacks "
             f"{feature_lookback_vals}, {len(pred_threshold_vals)} distinct pred thresholds "
-            f"{pred_threshold_vals}"
+            f"{pred_threshold_vals}, {len(stop_atr_mult_vals)} distinct stop ATR mults "
+            f"{stop_atr_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -244,6 +254,7 @@ def main(argv=None) -> int:
                 "k": f.best_params.get("k"),
                 "feature_lookback": f.best_params.get("feature_lookback"),
                 "pred_threshold": f.best_params.get("pred_threshold"),
+                "stop_atr_mult": f.best_params.get("stop_atr_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,

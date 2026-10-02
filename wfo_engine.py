@@ -42,11 +42,11 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(ks, feature_lookbacks, pred_thresholds, session) -> list[dict]:
+def build_grid(ks, feature_lookbacks, pred_thresholds, stop_atr_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched for the long-only KNN next-session return
-    prediction (bar-scale warm-up fix):
+    Four params are searched for the long-only KNN next-session return
+    prediction + ATR hard stop:
 
       - `k` — the number of nearest neighbors whose next-day returns are
         averaged into the prediction (grid {5,10,15}). A neighbor count, NOT a
@@ -63,11 +63,19 @@ def build_grid(ks, feature_lookbacks, pred_thresholds, session) -> list[dict]:
       - `pred_threshold` — the daily-return threshold above which a long is
         emitted (grid {0.0,0.0005,0.001}). A return threshold (float), NOT a
         lookback. The build_grid parameter is `pred_thresholds`.
+      - `stop_atr_mult` — the ATR multiplier for the hard-stop distance
+        (grid {1.0,1.5,2.0,3.0}). An ATR multiplier (float), NOT a lookback,
+        so it must not feed `_max_lookback_bars()`. The build_grid parameter
+        is `stop_atr_mults` — the same "<DEFAULT_PARAMS key> + 's'"
+        convention.
 
-    The strategy's fixed `norm_lookback` (`strategy.NORM_LOOKBACK_BARS` = 1440
-    bars = 15 days at 15min) is never searched, but it is a genuine bar-count
-    lookback, so it is threaded into every combo as a plain `int` **on
-    purpose** so `_max_lookback_bars()` accounts for the KNN's warm-up.
+    The strategy's fixed lookbacks are never searched, but both are genuine
+    bar-count lookbacks, so they are threaded into every combo as plain `int`s
+    **on purpose** so `_max_lookback_bars()` accounts for them:
+      - `norm_lookback` (`strategy.NORM_LOOKBACK_BARS` = 1440 bars = 15 days at
+        15min) — the KNN vol-normalization window.
+      - `atr_period` (`strategy.ATR_PERIOD` = 14 bars) — the ATR window for the
+        hard-stop distance.
 
     `session` is fixed and threaded into every combo as-is, never searched
     (required by CLAUDE.md).
@@ -76,20 +84,23 @@ def build_grid(ks, feature_lookbacks, pred_thresholds, session) -> list[dict]:
     `_max_lookback_bars()` returns 1440 and `run_walk_forward()` sizes the
     buffer to `max((1440 + 5) * 3, day_bars + 5)` = 4335 bars (~45 days) at
     15min. The KNN's total warm-up need is bounded by norm_days (15) + k (at
-    most 15) = ~30 days, so the buffer covers it with headroom; the fold-skip
-    guard of `max_lookback + 10` = 1450 bars is far below any 12-week train
-    window at 15min, so no fold is silently skipped.
+    most 15) = ~30 days and the ATR(14) window is 14 bars, so the buffer covers
+    both with headroom; the fold-skip guard of `max_lookback + 10` = 1450 bars
+    is far below any 12-week train window at 15min, so no fold is silently
+    skipped.
     """
-    from strategy import NORM_LOOKBACK_BARS
+    from strategy import ATR_PERIOD, NORM_LOOKBACK_BARS
 
     grid = []
-    for k, flb, pt in product(ks, feature_lookbacks, pred_thresholds):
+    for k, flb, pt, sam in product(ks, feature_lookbacks, pred_thresholds, stop_atr_mults):
         grid.append(
             {
                 "k": float(k),
                 "feature_lookback": int(flb),
                 "pred_threshold": float(pt),
+                "stop_atr_mult": float(sam),
                 "norm_lookback": int(NORM_LOOKBACK_BARS),
+                "atr_period": int(ATR_PERIOD),
                 "session": session,
             }
         )
