@@ -42,65 +42,62 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(ks, feature_lookbacks, pred_thresholds, stop_atr_mults, session) -> list[dict]:
+def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Four params are searched for the long-only KNN next-session return
-    prediction + ATR hard stop:
+    Three params are searched for the long-only volatility-squeeze Donchian
+    breakout + bounded ATR target:
 
-      - `k` — the number of nearest neighbors whose next-day returns are
-        averaged into the prediction (grid {5,10,15}). A neighbor count, NOT a
-        bar-count lookback, so it is threaded as a **float** on purpose:
-        `_max_lookback_bars()` only picks up plain `int`s, and a huge grid
-        value here must not buy extra warm-up. The build_grid parameter is
-        spelled `ks` — the grid-search naming convention is
-        "<DEFAULT_PARAMS key> + 's'" (see tools/check_strategy.py).
-      - `feature_lookback` — the feature-window length in bars (grid
-        {288,480,768} = 3/5/8 days at 15min). A genuine bar-count lookback, so
-        it is threaded as a plain `int` **on purpose** (feeds the warm-up
-        buffer). The build_grid parameter is `feature_lookbacks` — the same
-        "<DEFAULT_PARAMS key> + 's'" convention.
-      - `pred_threshold` — the daily-return threshold above which a long is
-        emitted (grid {0.0,0.0005,0.001}). A return threshold (float), NOT a
-        lookback. The build_grid parameter is `pred_thresholds`.
-      - `stop_atr_mult` — the ATR multiplier for the hard-stop distance
-        (grid {1.0,1.5,2.0,3.0}). An ATR multiplier (float), NOT a lookback,
-        so it must not feed `_max_lookback_bars()`. The build_grid parameter
-        is `stop_atr_mults` — the same "<DEFAULT_PARAMS key> + 's'"
-        convention.
+      - `range_lookback` — the Donchian channel trailing window in bars (grid
+        {24,48,96,192} = 1/2/4/8 days at 15min). A genuine bar-count lookback,
+        so it is threaded as a plain `int` **on purpose** (feeds the warm-up
+        buffer). The build_grid parameter is `range_lookbacks` — the
+        grid-search naming convention is "<DEFAULT_PARAMS key> + 's'" (see
+        tools/check_strategy.py).
+      - `squeeze_ratio` — the vol-ratio threshold at/below which the setup is
+        armed (grid {0.5,0.6,0.7,0.8}). A ratio threshold (float), NOT a
+        lookback, so it must not feed `_max_lookback_bars()`. The build_grid
+        parameter is `squeeze_ratios`.
+      - `target_atr_mult` — the ATR multiplier for the bounded profit target
+        (grid {1.0,1.5,2.0,3.0}). An ATR multiplier (float), NOT a lookback.
+        The build_grid parameter is `target_atr_mults`.
 
-    The strategy's fixed lookbacks are never searched, but both are genuine
-    bar-count lookbacks, so they are threaded into every combo as plain `int`s
-    **on purpose** so `_max_lookback_bars()` accounts for them:
-      - `norm_lookback` (`strategy.NORM_LOOKBACK_BARS` = 1440 bars = 15 days at
-        15min) — the KNN vol-normalization window.
-      - `atr_period` (`strategy.ATR_PERIOD` = 14 bars) — the ATR window for the
-        hard-stop distance.
+    The strategy's fixed params are never searched, but the three ATR windows
+    are genuine bar-count lookbacks, so they are threaded into every combo as
+    plain `int`s **on purpose** so `_max_lookback_bars()` accounts for them:
+      - `atr_slow_period` (`strategy.ATR_SLOW_PERIOD` = 960 bars ~ 10 days at
+        15min) — the slow squeeze-ratio ATR.
+      - `atr_fast_period` (`strategy.ATR_FAST_PERIOD` = 96 bars ~ 1 day) — the
+        fast squeeze-ratio ATR.
+      - `atr_stop_period` (`strategy.ATR_STOP_PERIOD` = 14 bars) — the ATR
+        window for the stop/target distance.
+    `stop_atr_mult` (`strategy.STOP_ATR_MULT` = 2.0) is a float multiplier, NOT
+    a lookback, so it is threaded as a float.
 
     `session` is fixed and threaded into every combo as-is, never searched
     (required by CLAUDE.md).
 
-    WARM-UP — `NORM_LOOKBACK_BARS` (1440) is the largest int in the grid, so
-    `_max_lookback_bars()` returns 1440 and `run_walk_forward()` sizes the
-    buffer to `max((1440 + 5) * 3, day_bars + 5)` = 4335 bars (~45 days) at
-    15min. The KNN's total warm-up need is bounded by norm_days (15) + k (at
-    most 15) = ~30 days and the ATR(14) window is 14 bars, so the buffer covers
-    both with headroom; the fold-skip guard of `max_lookback + 10` = 1450 bars
-    is far below any 12-week train window at 15min, so no fold is silently
-    skipped.
+    WARM-UP — `ATR_SLOW_PERIOD` (960) is the largest int in the grid, so
+    `_max_lookback_bars()` returns 960 and `run_walk_forward()` sizes the
+    buffer to `max((960 + 5) * 3, day_bars + 5)` = 2895 bars (~30 days) at
+    15min. The ATR(960) Wilder warm-up, the Donchian window (at most 192 bars)
+    and ATR(14) are all covered with headroom; the fold-skip guard of
+    `max_lookback + 10` = 970 bars is far below any 12-week train window at
+    15min, so no fold is silently skipped.
     """
-    from strategy import ATR_PERIOD, NORM_LOOKBACK_BARS
+    from strategy import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, ATR_STOP_PERIOD, STOP_ATR_MULT
 
     grid = []
-    for k, flb, pt, sam in product(ks, feature_lookbacks, pred_thresholds, stop_atr_mults):
+    for rl, sr, tam in product(range_lookbacks, squeeze_ratios, target_atr_mults):
         grid.append(
             {
-                "k": float(k),
-                "feature_lookback": int(flb),
-                "pred_threshold": float(pt),
-                "stop_atr_mult": float(sam),
-                "norm_lookback": int(NORM_LOOKBACK_BARS),
-                "atr_period": int(ATR_PERIOD),
+                "range_lookback": int(rl),
+                "squeeze_ratio": float(sr),
+                "target_atr_mult": float(tam),
+                "stop_atr_mult": float(STOP_ATR_MULT),
+                "atr_fast_period": int(ATR_FAST_PERIOD),
+                "atr_slow_period": int(ATR_SLOW_PERIOD),
+                "atr_stop_period": int(ATR_STOP_PERIOD),
                 "session": session,
             }
         )
