@@ -74,12 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--range-lookback", default="24,48,96,192",
-                        help="comma-separated Donchian channel lookbacks in BARS (24/48/96/192 = "
-                             "1/2/4/8 days at 15min). The upper channel is the highest High of the "
+    strat.add_argument("--range-lookback", default="8,12,24,48",
+                        help="comma-separated Donchian channel lookbacks in BARS (8/12/24/48 = "
+                             "2h/3h/1d/2d at 15min). The upper channel is the highest High of the "
                              "trailing range_lookback PRIOR bars (no lookahead). A genuine bar-count "
                              "lookback, parsed as int and fed to wfo_engine's warm-up buffer")
-    strat.add_argument("--squeeze-ratio", default="0.5,0.6,0.7,0.8",
+    strat.add_argument("--squeeze-ratio", default="0.8,0.9,1.0,1.1",
                         help="comma-separated squeeze thresholds: the setup is armed when "
                              "ATR(96)/ATR(960) <= squeeze_ratio (a multi-day realized-vol contraction). "
                              "A vol-ratio threshold (float, not a lookback), so it does NOT feed "

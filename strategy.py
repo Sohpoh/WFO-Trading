@@ -35,7 +35,7 @@ Warm-up: ATR_SLOW_PERIOD (960 bars) is the largest bar-count lookback and is
 threaded through build_grid() as a plain int so _max_lookback_bars() sizes the
 test-window buffer off it (960 -> (960+5)*3 = 2895 bars ~ 30 days at 15min),
 comfortably covering the ATR(960) Wilder warm-up, the Donchian window
-(range_lookback grid {24,48,96,192}), and ATR(14). range_lookback is a genuine
+(range_lookback grid {8,12,24,48}), and ATR(14). range_lookback is a genuine
 bar-count lookback and is a plain int on purpose. squeeze_ratio and
 target_atr_mult are thresholds/multipliers, NOT lookbacks, so they are floats
 and must not inflate the warm-up buffer. stop_atr_mult (fixed 2.0) is also a
@@ -154,8 +154,8 @@ def generate_positions(
 
 DEFAULT_PARAMS = {
     # range_lookback is a genuine bar-count lookback (the Donchian trailing
-    # window; grid {24,48,96,192}) and is a plain int on purpose so it feeds
-    # the warm-up buffer. squeeze_ratio (grid {0.5,0.6,0.7,0.8}) is a vol-ratio
+    # window; grid {8,12,24,48}) and is a plain int on purpose so it feeds
+    # the warm-up buffer. squeeze_ratio (grid {0.8,0.9,1.0,1.1}) is a vol-ratio
     # threshold and target_atr_mult (grid {1.0,1.5,2.0,3.0}) is an ATR
     # multiplier — both floats, NOT lookbacks. stop_atr_mult (fixed 2.0) is a
     # float multiplier. atr_fast_period (96), atr_slow_period (960) and
@@ -163,8 +163,8 @@ DEFAULT_PARAMS = {
     # but threaded through build_grid() so _max_lookback_bars() returns 960.
     # `session` is a fixed param. These are the concrete set the sanity checker
     # runs generate_positions() against.
-    "range_lookback": 96,
-    "squeeze_ratio": 0.7,
+    "range_lookback": 24,
+    "squeeze_ratio": 1.0,
     "target_atr_mult": 2.0,
     "stop_atr_mult": STOP_ATR_MULT,
     "atr_fast_period": ATR_FAST_PERIOD,

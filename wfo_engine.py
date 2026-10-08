@@ -49,13 +49,13 @@ def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session) -> li
     breakout + bounded ATR target:
 
       - `range_lookback` — the Donchian channel trailing window in bars (grid
-        {24,48,96,192} = 1/2/4/8 days at 15min). A genuine bar-count lookback,
+        {8,12,24,48} = 2h/3h/1d/2d at 15min). A genuine bar-count lookback,
         so it is threaded as a plain `int` **on purpose** (feeds the warm-up
         buffer). The build_grid parameter is `range_lookbacks` — the
         grid-search naming convention is "<DEFAULT_PARAMS key> + 's'" (see
         tools/check_strategy.py).
       - `squeeze_ratio` — the vol-ratio threshold at/below which the setup is
-        armed (grid {0.5,0.6,0.7,0.8}). A ratio threshold (float), NOT a
+        armed (grid {0.8,0.9,1.0,1.1}). A ratio threshold (float), NOT a
         lookback, so it must not feed `_max_lookback_bars()`. The build_grid
         parameter is `squeeze_ratios`.
       - `target_atr_mult` — the ATR multiplier for the bounded profit target
@@ -80,7 +80,7 @@ def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session) -> li
     WARM-UP — `ATR_SLOW_PERIOD` (960) is the largest int in the grid, so
     `_max_lookback_bars()` returns 960 and `run_walk_forward()` sizes the
     buffer to `max((960 + 5) * 3, day_bars + 5)` = 2895 bars (~30 days) at
-    15min. The ATR(960) Wilder warm-up, the Donchian window (at most 192 bars)
+    15min. The ATR(960) Wilder warm-up, the Donchian window (at most 48 bars)
     and ATR(14) are all covered with headroom; the fold-skip guard of
     `max_lookback + 10` = 970 bars is far below any 12-week train window at
     15min, so no fold is silently skipped.
