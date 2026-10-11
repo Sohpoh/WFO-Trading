@@ -27,7 +27,7 @@ stop/target bookkeeping are delegated to `apply_session_constraint_with_stops`):
     churn bug that sank the prior iteration's stop variant). No short branch.
 
   - Exit: path-dependent stop + target via `apply_session_constraint_with_stops`.
-    Stop = entry - stop_atr_mult * ATR(14) (stop_atr_mult fixed 2.0);
+    Stop = entry - stop_atr_mult * ATR(14) (stop_atr_mult grid-searched);
     target = entry + target_atr_mult * ATR(14). Both distances are read at the
     entry bar and the position force-flattens at session close (session.py).
 
@@ -38,8 +38,9 @@ comfortably covering the ATR(960) Wilder warm-up, the Donchian window
 (range_lookback grid {8,12,24,48}), and ATR(14). range_lookback is a genuine
 bar-count lookback and is a plain int on purpose. squeeze_ratio and
 target_atr_mult are thresholds/multipliers, NOT lookbacks, so they are floats
-and must not inflate the warm-up buffer. stop_atr_mult (fixed 2.0) is also a
-float multiplier.
+and must not inflate the warm-up buffer. stop_atr_mult (grid
+{0.75,1.0,1.5,2.0}) is also a float multiplier and must not inflate the
+buffer.
 
 Contract notes: `generate_positions` builds session-unaware raw signals and
 delegates all session gating, stop/target bookkeeping, and end-of-session
@@ -65,9 +66,6 @@ ATR_SLOW_PERIOD = 960   # ~10 days at 15min
 # Fixed ATR window, in BARS, for the stop/target distance. Genuine bar-count
 # lookback (subsumed by ATR_SLOW_PERIOD when sizing the warm-up buffer).
 ATR_STOP_PERIOD = 14
-
-# Fixed stop multiplier (float, NOT a lookback). Never grid-searched.
-STOP_ATR_MULT = 2.0
 
 
 def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
@@ -95,8 +93,8 @@ def generate_positions(
     range_lookback: int,
     squeeze_ratio: float,
     target_atr_mult: float,
+    stop_atr_mult: float,
     session: str | None = "New York",
-    stop_atr_mult: float = STOP_ATR_MULT,
     atr_fast_period: int = ATR_FAST_PERIOD,
     atr_slow_period: int = ATR_SLOW_PERIOD,
     atr_stop_period: int = ATR_STOP_PERIOD,
@@ -157,8 +155,9 @@ DEFAULT_PARAMS = {
     # window; grid {8,12,24,48}) and is a plain int on purpose so it feeds
     # the warm-up buffer. squeeze_ratio (grid {0.8,0.9,1.0,1.1}) is a vol-ratio
     # threshold and target_atr_mult (grid {1.0,1.5,2.0,3.0}) is an ATR
-    # multiplier — both floats, NOT lookbacks. stop_atr_mult (fixed 2.0) is a
-    # float multiplier. atr_fast_period (96), atr_slow_period (960) and
+    # multiplier — both floats, NOT lookbacks. stop_atr_mult (grid
+    # {0.75,1.0,1.5,2.0}, default 2.0 = the control anchor) is a float
+    # multiplier. atr_fast_period (96), atr_slow_period (960) and
     # atr_stop_period (14) are fixed plain-int lookbacks — never grid-searched
     # but threaded through build_grid() so _max_lookback_bars() returns 960.
     # `session` is a fixed param. These are the concrete set the sanity checker
@@ -166,7 +165,7 @@ DEFAULT_PARAMS = {
     "range_lookback": 24,
     "squeeze_ratio": 1.0,
     "target_atr_mult": 2.0,
-    "stop_atr_mult": STOP_ATR_MULT,
+    "stop_atr_mult": 2.0,
     "atr_fast_period": ATR_FAST_PERIOD,
     "atr_slow_period": ATR_SLOW_PERIOD,
     "atr_stop_period": ATR_STOP_PERIOD,

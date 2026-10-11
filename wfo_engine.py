@@ -42,10 +42,10 @@ class Fold:
     oos_sharpe: float = 0.0
 
 
-def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session) -> list[dict]:
+def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Three params are searched for the long-only volatility-squeeze Donchian
+    Four params are searched for the long-only volatility-squeeze Donchian
     breakout + bounded ATR target:
 
       - `range_lookback` — the Donchian channel trailing window in bars (grid
@@ -61,6 +61,11 @@ def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session) -> li
       - `target_atr_mult` — the ATR multiplier for the bounded profit target
         (grid {1.0,1.5,2.0,3.0}). An ATR multiplier (float), NOT a lookback.
         The build_grid parameter is `target_atr_mults`.
+      - `stop_atr_mult` — the ATR multiplier for the below-entry stop (grid
+        {0.75,1.0,1.5,2.0}; 2.0 is the control anchor carried over from the
+        prior fixed value). An ATR multiplier (float), NOT a lookback, so it
+        must not feed `_max_lookback_bars()`. The build_grid parameter is
+        `stop_atr_mults`.
 
     The strategy's fixed params are never searched, but the three ATR windows
     are genuine bar-count lookbacks, so they are threaded into every combo as
@@ -71,8 +76,6 @@ def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session) -> li
         fast squeeze-ratio ATR.
       - `atr_stop_period` (`strategy.ATR_STOP_PERIOD` = 14 bars) — the ATR
         window for the stop/target distance.
-    `stop_atr_mult` (`strategy.STOP_ATR_MULT` = 2.0) is a float multiplier, NOT
-    a lookback, so it is threaded as a float.
 
     `session` is fixed and threaded into every combo as-is, never searched
     (required by CLAUDE.md).
@@ -85,16 +88,16 @@ def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session) -> li
     `max_lookback + 10` = 970 bars is far below any 12-week train window at
     15min, so no fold is silently skipped.
     """
-    from strategy import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, ATR_STOP_PERIOD, STOP_ATR_MULT
+    from strategy import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, ATR_STOP_PERIOD
 
     grid = []
-    for rl, sr, tam in product(range_lookbacks, squeeze_ratios, target_atr_mults):
+    for rl, sr, tam, sam in product(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults):
         grid.append(
             {
                 "range_lookback": int(rl),
                 "squeeze_ratio": float(sr),
                 "target_atr_mult": float(tam),
-                "stop_atr_mult": float(STOP_ATR_MULT),
+                "stop_atr_mult": float(sam),
                 "atr_fast_period": int(ATR_FAST_PERIOD),
                 "atr_slow_period": int(ATR_SLOW_PERIOD),
                 "atr_stop_period": int(ATR_STOP_PERIOD),

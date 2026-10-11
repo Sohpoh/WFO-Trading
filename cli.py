@@ -87,7 +87,13 @@ def build_parser() -> argparse.ArgumentParser:
     strat.add_argument("--target-atr-mult", default="1.0,1.5,2.0,3.0",
                         help="comma-separated profit-target ATR multipliers: target = entry + "
                              "target_atr_mult * ATR(14), a bounded target that harvests the expansion "
-                             "move (stop is fixed at 2.0 * ATR(14)). An ATR multiplier (float, not a "
+                             "move (paired with a grid-searched --stop-atr-mult). An ATR multiplier "
+                             "(float, not a lookback), so it does NOT feed wfo_engine's warm-up buffer")
+    strat.add_argument("--stop-atr-mult", default="0.75,1.0,1.5,2.0",
+                        help="comma-separated stop-loss ATR multipliers: stop = entry - "
+                             "stop_atr_mult * ATR(14) for a long. 2.0 is the control anchor carried "
+                             "over from the prior fixed stop; the grid opens the tighter-stop region "
+                             "below 2.0 (the left-tail fix). An ATR multiplier (float, not a "
                              "lookback), so it does NOT feed wfo_engine's warm-up buffer")
 
     wfo = p.add_argument_group("walk-forward schedule")
@@ -141,17 +147,18 @@ def main(argv=None) -> int:
     try:
         # range_lookback is a genuine bar-count lookback (the Donchian trailing
         # window), parsed as int and fed to wfo_engine's warm-up buffer.
-        # squeeze_ratio is a vol-ratio threshold and target_atr_mult is an ATR
-        # multiplier — both floats, NOT lookbacks, so they stay out of the
-        # buffer. stop_atr_mult (fixed 2.0) and the three ATR windows
-        # (96/960/14) are fixed values threaded inside build_grid() (not CLI
-        # flags). The build_grid arguments are range_lookbacks / squeeze_ratios /
-        # target_atr_mults — the grid-search naming convention is
-        # "<param> + 's'".
+        # squeeze_ratio is a vol-ratio threshold and target_atr_mult /
+        # stop_atr_mult are ATR multipliers — all floats, NOT lookbacks, so
+        # they stay out of the buffer. The three ATR windows (96/960/14) are
+        # fixed values threaded inside build_grid() (not CLI flags). The
+        # build_grid arguments are range_lookbacks / squeeze_ratios /
+        # target_atr_mults / stop_atr_mults — the grid-search naming
+        # convention is "<param> + 's'".
         range_lookbacks = parse_num_list(args.range_lookback, int)
         squeeze_ratios = parse_num_list(args.squeeze_ratio)
         target_atr_mults = parse_num_list(args.target_atr_mult)
-        grid = build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, session)
+        stop_atr_mults = parse_num_list(args.stop_atr_mult)
+        grid = build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -192,18 +199,20 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the three grid-searched params are reported here; `session`,
-        # stop_atr_mult (fixed 2.0) and the fixed ATR windows (96/960/14) are
-        # constant across every combo, so their "distinct values" would always
-        # be 1 and carry no stability information.
+        # Only the four grid-searched params are reported here; `session` and
+        # the fixed ATR windows (96/960/14) are constant across every combo,
+        # so their "distinct values" would always be 1 and carry no stability
+        # information.
         range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
         squeeze_ratio_vals = sorted({p["squeeze_ratio"] for p in chosen})
         target_atr_mult_vals = sorted({p["target_atr_mult"] for p in chosen})
+        stop_atr_mult_vals = sorted({p["stop_atr_mult"] for p in chosen})
         print(
             f"Fold param stability: {len(range_lookback_vals)} distinct range lookbacks "
             f"{range_lookback_vals}, {len(squeeze_ratio_vals)} distinct squeeze ratios "
             f"{squeeze_ratio_vals}, {len(target_atr_mult_vals)} distinct target ATR mults "
-            f"{target_atr_mult_vals}"
+            f"{target_atr_mult_vals}, {len(stop_atr_mult_vals)} distinct stop ATR mults "
+            f"{stop_atr_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -243,6 +252,7 @@ def main(argv=None) -> int:
                 "range_lookback": f.best_params.get("range_lookback"),
                 "squeeze_ratio": f.best_params.get("squeeze_ratio"),
                 "target_atr_mult": f.best_params.get("target_atr_mult"),
+                "stop_atr_mult": f.best_params.get("stop_atr_mult"),
                 "train_sharpe": f.train_sharpe,
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
