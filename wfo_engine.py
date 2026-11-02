@@ -40,6 +40,17 @@ class Fold:
     n_oos_trades: int = 0
     oos_return: float = 0.0
     oos_sharpe: float = 0.0
+    # Pre-OOS purge: the last `purge_days` training bars nearest the test window
+    # are excluded from grid search (dropped, not trained on) to prevent any
+    # label warm-up bleeding test information backward. None means no purge.
+    train_end_effective: Optional[pd.Timestamp] = None
+    # Trial population for the Deflated Sharpe Ratio: the train Sharpe of every
+    # valid grid combo scored in this fold (used to estimate sqrt(V[SR])).
+    grid_train_sharpes: list = field(default_factory=list)
+    # Rank-stability diagnostic: logit of where this fold's IS-selected combo
+    # ranked OOS among the top-K candidates (see tools/statistics.py). None when
+    # rank-stability was disabled or not computable.
+    oos_rank_logit: Optional[float] = None
 
 
 def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults, session) -> list[dict]:
@@ -118,13 +129,29 @@ def _score_params(df: pd.DataFrame, params: dict, ann_factor: float) -> float:
     return float(ret.mean() / std * np.sqrt(ann_factor))
 
 
+def _score_all(df: pd.DataFrame, grid: list[dict], ann_factor: float) -> list[tuple[dict, float]]:
+    """Score every grid combo, sorted by train Sharpe descending.
+
+    A single pass is shared by ``optimize`` (best combo), the DSR trial
+    population (all scores), and rank-stability (top-K), so the grid is never
+    scored more than once per fold.
+    """
+    scored = [(params, _score_params(df, params, ann_factor)) for params in grid]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+
 def optimize(df: pd.DataFrame, grid: list[dict], ann_factor: float) -> tuple[Optional[dict], float]:
-    best_params, best_score = None, -np.inf
-    for params in grid:
-        score = _score_params(df, params, ann_factor)
-        if score > best_score:
-            best_score, best_params = score, params
-    return best_params, best_score
+    scored = _score_all(df, grid, ann_factor)
+    if not scored or scored[0][1] == -np.inf:
+        return None, -np.inf
+    return scored[0][0], scored[0][1]
+
+
+def optimize_top_k(df: pd.DataFrame, grid: list[dict], ann_factor: float, k: int) -> list[tuple[dict, float]]:
+    """Top-K valid (params, train_sharpe) combos, for rank-stability diagnostics."""
+    scored = _score_all(df, grid, ann_factor)
+    return [(p, s) for p, s in scored[:k] if s != -np.inf]
 
 
 def _max_lookback_bars(grid: list[dict]) -> int:
@@ -160,7 +187,21 @@ def _bars_per_day(df: pd.DataFrame) -> int:
     return int(counts.median()) if len(counts) else 0
 
 
-def generate_folds(start: pd.Timestamp, end: pd.Timestamp, train_weeks: int, test_weeks: int) -> list[Fold]:
+def generate_folds(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    train_weeks: int,
+    test_weeks: int,
+    purge_days: int = 0,
+) -> list[Fold]:
+    """Build sliding train/test folds.
+
+    ``purge_days`` implements a pre-OOS purge (Bailey & López de Prado style):
+    the last N calendar days of the nominal train window — the bars sitting
+    immediately next to the test window — are dropped from grid search, so no
+    indicator warm-up or overlapping state can leak test information backward.
+    ``test_start`` stays where it is; only the effective training end moves.
+    """
     folds = []
     train_start = start
     i = 0
@@ -170,7 +211,15 @@ def generate_folds(start: pd.Timestamp, end: pd.Timestamp, train_weeks: int, tes
         test_end = test_start + pd.Timedelta(weeks=test_weeks)
         if test_end > end:
             break
-        folds.append(Fold(index=i, train_start=train_start, train_end=train_end, test_start=test_start, test_end=test_end))
+        train_end_effective = train_end - pd.Timedelta(days=purge_days) if purge_days > 0 else None
+        folds.append(Fold(
+            index=i,
+            train_start=train_start,
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+            train_end_effective=train_end_effective,
+        ))
         train_start = train_start + pd.Timedelta(weeks=test_weeks)
         i += 1
     return folds
@@ -198,8 +247,10 @@ def run_walk_forward(
     grid: list[dict],
     ann_factor: float,
     progress_callback: Optional[Callable[[int, int, Fold], None]] = None,
+    purge_days: int = 0,
+    rank_stability_k: int = 0,
 ) -> tuple[pd.Series, pd.DataFrame, list[Fold]]:
-    folds = generate_folds(df.index[0], df.index[-1], train_weeks, test_weeks)
+    folds = generate_folds(df.index[0], df.index[-1], train_weeks, test_weeks, purge_days)
     if not folds:
         raise ValueError(
             "Not enough history for even one fold — shorten the train/test window or pick a wider date range."
@@ -212,28 +263,50 @@ def run_walk_forward(
     oos_returns = []
     oos_trades = []
     for fold in folds:
-        train_df = df.loc[(df.index >= fold.train_start) & (df.index < fold.train_end)]
+        train_end = fold.train_end_effective if fold.train_end_effective is not None else fold.train_end
+        train_df = df.loc[(df.index >= fold.train_start) & (df.index < train_end)]
         fold.n_train_bars = len(train_df)
         if len(train_df) < max_lookback + 10:
             if progress_callback:
                 progress_callback(fold.index + 1, len(folds), fold)
             continue
 
-        best_params, best_score = optimize(train_df, grid, ann_factor)
-        fold.best_params = best_params or {}
-        fold.train_sharpe = best_score if best_params else 0.0
+        # Score the grid once per fold; reuse for the best combo, the DSR trial
+        # population (all scores), and rank-stability (top-K).
+        scored = _score_all(train_df, grid, ann_factor)
+        valid = [(p, s) for p, s in scored if s != -np.inf]
+        if not valid:
+            if progress_callback:
+                progress_callback(fold.index + 1, len(folds), fold)
+            continue
 
-        if best_params:
-            test_ret, test_pos = _simulate_window(df, fold.test_start, fold.test_end, best_params, buffer_bars)
-            fold.n_test_bars = len(test_ret)
-            fold_trades = extract_trades(df["Close"], test_pos)
-            fold_trades = fold_trades.copy()
-            fold_trades["fold"] = fold.index + 1  # 1-based, matches fold_table.csv's "fold" column
-            fold.n_oos_trades = int(len(fold_trades))
-            fold.oos_return = total_return(test_ret)
-            fold.oos_sharpe = sharpe_ratio(test_ret, ann_factor)
-            oos_returns.append(test_ret)
-            oos_trades.append(fold_trades)
+        best_params, best_score = valid[0]
+        fold.best_params = best_params
+        fold.train_sharpe = best_score
+        fold.grid_train_sharpes = [s for _, s in valid]
+
+        test_ret, test_pos = _simulate_window(df, fold.test_start, fold.test_end, best_params, buffer_bars)
+        fold.n_test_bars = len(test_ret)
+        fold_trades = extract_trades(df["Close"], test_pos)
+        fold_trades = fold_trades.copy()
+        fold_trades["fold"] = fold.index + 1  # 1-based, matches fold_table.csv's "fold" column
+        fold.n_oos_trades = int(len(fold_trades))
+        fold.oos_return = total_return(test_ret)
+        fold.oos_sharpe = sharpe_ratio(test_ret, ann_factor)
+        oos_returns.append(test_ret)
+        oos_trades.append(fold_trades)
+
+        # Rank-stability: where does the IS-selected combo rank OOS among the
+        # top-K IS trials?  A logit <= 0 means argmax selection landed in the
+        # bottom half out-of-sample (selection overfit, not a real param surface).
+        if rank_stability_k > 1 and len(valid) >= 2:
+            from tools.statistics import selected_trial_rank_logit  # local import avoids engine->tools load ordering
+            top_k = valid[:rank_stability_k]
+            oos_sharpes = []
+            for p, _ in top_k:
+                r, _ = _simulate_window(df, fold.test_start, fold.test_end, p, buffer_bars)
+                oos_sharpes.append(sharpe_ratio(r, ann_factor))
+            fold.oos_rank_logit = selected_trial_rank_logit(fold.oos_sharpe, oos_sharpes)
 
         if progress_callback:
             progress_callback(fold.index + 1, len(folds), fold)

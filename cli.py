@@ -31,6 +31,7 @@ import argparse
 import math
 import sys
 
+import numpy as np
 import pandas as pd
 
 import streamlit.logger
@@ -39,6 +40,7 @@ streamlit.logger.set_log_level("ERROR")  # silence st.cache_data's "no ScriptRun
 from data_loader import BARS_PER_YEAR, list_local_symbols, list_local_timeframes, load_data
 from metrics import equity_curve, summarize
 from session import SESSION_CONFIG
+from tools import statistics as st
 from wfo_engine import build_grid, run_retail_insample, run_walk_forward
 
 
@@ -99,6 +101,16 @@ def build_parser() -> argparse.ArgumentParser:
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
     wfo.add_argument("--test-weeks", type=int, default=3)
+    wfo.add_argument("--purge-days", type=int, default=0,
+                     help="pre-OOS purge: drop the last N training days nearest each test "
+                          "window from grid search (prevents label warm-up leakage)")
+    wfo.add_argument("--rank-stability-k", type=int, default=0,
+                     help="if >1, re-backtest the top-K in-sample trials on each fold's OOS "
+                          "window and report where argmax selection ranks out-of-sample")
+    wfo.add_argument("--dsr-n-trials", type=int, default=None,
+                     help="total independent backtests to deflate the Sharpe over for DSR "
+                          "(defaults to this run's grid-combo count; set to the loop's total "
+                          "backtest count for a loop-level DSR)")
 
     out = p.add_argument_group("output")
     out.add_argument("--out-dir", default=None, help="if set, write fold_table.csv, oos_trades.csv, "
@@ -113,6 +125,57 @@ def print_progress(completed, total, fold):
         f"-> test {fold.test_start.date()}..{fold.test_end.date()}",
         file=sys.stderr,
     )
+
+
+def _statistical_validation(oos_returns, insample_stats, oos_stats, folds, ann_factor, dsr_n_trials):
+    """Ported validation layer (DSR/PSR/Sharpe-CI/overfit/decay/rank-stability).
+
+    All Sharpe inputs for DSR/PSR stay in per-period units (Bailey & López de
+    Prado require the observed Sharpe and the observation count to share a
+    periodicity); only the printed/CI values are annualized.
+    """
+    valid = [f for f in folds if f.best_params]
+    oos = np.asarray(oos_returns, dtype=float)
+    oos = oos[np.isfinite(oos)]
+
+    pp_sharpe = st.per_period_sharpe(oos)
+    n_obs = int(oos.size)
+    skew = st.skewness(oos)
+    kurt = st.raw_kurtosis(oos)
+
+    # Trial population = every grid combo's train Sharpe across folds.  These
+    # are stored annualized (what _score_params optimizes), so convert to
+    # per-bar to match the per-bar observed_sr and n_obs (Bailey & López de
+    # Prado require a single periodicity throughout).
+    trial_sharpes = [s / math.sqrt(ann_factor) for f in valid for s in f.grid_train_sharpes]
+    n_trials = int(dsr_n_trials) if dsr_n_trials else (len(trial_sharpes) or 1)
+
+    oos_sharpe_ann = float(oos_stats["Sharpe Ratio"])
+    is_sharpe_ann = float(insample_stats["Sharpe Ratio"])
+
+    psr = st.probabilistic_sharpe_ratio(pp_sharpe, benchmark_sr=0.0, n_obs=n_obs, skewness=skew, kurtosis=kurt)
+    dsr = st.deflated_sharpe(trial_sharpes, n_trials=n_trials, observed_sr=pp_sharpe, n_obs=n_obs, skewness=skew, kurtosis=kurt)
+    ci = st.bootstrap_sharpe_ci(oos, ann_factor=ann_factor)
+    oratio = st.overfit_ratio(is_sharpe_ann, oos_sharpe_ann)
+    decay = st.sharpe_decay([f.oos_sharpe for f in valid])
+    eff = st.efficiency(float(insample_stats["CAGR"]), float(oos_stats["CAGR"]))
+    logits = [f.oos_rank_logit for f in valid if f.oos_rank_logit is not None]
+    rank_fail = st.walk_forward_top_k_rank_failure_rate(logits) if logits else float("nan")
+
+    return {
+        "per_period_sharpe": pp_sharpe,
+        "n_obs": n_obs,
+        "n_trials": n_trials,
+        "psr": psr,
+        "dsr": dsr,
+        "sharpe_ci_lo": ci[0] if ci else None,
+        "sharpe_ci_hi": ci[1] if ci else None,
+        "overfit_ratio": oratio,
+        "efficiency": eff,
+        "sharpe_decay": decay,
+        "rank_failure_rate": rank_fail,
+        "n_rank_folds": len(logits),
+    }
 
 
 def main(argv=None) -> int:
@@ -178,7 +241,8 @@ def main(argv=None) -> int:
     callback = None if args.quiet else print_progress
     try:
         oos_returns, oos_trades, folds = run_walk_forward(
-            df, args.train_weeks, args.test_weeks, grid, ann_factor, progress_callback=callback
+            df, args.train_weeks, args.test_weeks, grid, ann_factor, progress_callback=callback,
+            purge_days=args.purge_days, rank_stability_k=args.rank_stability_k
         )
         insample_returns, insample_trades, insample_params = run_retail_insample(df, grid, ann_factor)
     except ValueError as e:
@@ -240,6 +304,34 @@ def main(argv=None) -> int:
             f"{idle_note}"
         )
 
+    # Statistical validation layer (ported from quantjourney-bt): DSR/PSR for
+    # selection-bias, a bootstrap Sharpe CI for "is this even nonzero?", overfit
+    # ratio + Sharpe decay for IS->OOS transfer, and rank-stability for argmax
+    # selection quality. All load-bearing for a loop whose edges are single-digit
+    # bps and whose confirmation holdouts are 12-81 trades.
+    if len(oos_returns):
+        val = _statistical_validation(oos_returns, insample_stats, oos_stats, folds, ann_factor, args.dsr_n_trials)
+        print()
+        print("Statistical validation:")
+        print(f"  OOS per-period Sharpe {val['per_period_sharpe']:.4f} over {val['n_obs']} bars "
+              f"(annualized {oos_stats['Sharpe Ratio']:.2f})")
+        print(f"  DSR (deflated over {val['n_trials']} trials): {val['dsr']:.3f} "
+              f"-> {st.interpret(val['dsr'], 'deflated_sharpe')[1]}")
+        print(f"  PSR (P[true SR > 0]): {val['psr']:.3f}")
+        if val["sharpe_ci_lo"] is not None:
+            print(f"  Sharpe 5/95% bootstrap CI: [{val['sharpe_ci_lo']:.2f}, {val['sharpe_ci_hi']:.2f}]")
+        else:
+            print("  Sharpe bootstrap CI: not computable (< 20 OOS observations)")
+        print(f"  Overfit ratio (IS/OOS Sharpe): {val['overfit_ratio']:.2f} "
+              f"-> {st.interpret(val['overfit_ratio'], 'overfit_ratio', oos_sharpe=oos_stats['Sharpe Ratio'])[1]}")
+        print(f"  Sharpe decay: {val['sharpe_decay']:+.4f}/fold "
+              f"-> {st.interpret(val['sharpe_decay'], 'sharpe_decay', oos_sharpe=oos_stats['Sharpe Ratio'])[1]}")
+        print(f"  Efficiency (OOS/IS CAGR): {val['efficiency']:.2f} "
+              f"-> {st.interpret(val['efficiency'], 'efficiency')[1]}")
+        if val["n_rank_folds"]:
+            print(f"  Rank-stability failure rate: {val['rank_failure_rate']:.2f} "
+                  f"({val['n_rank_folds']} folds) -> {st.interpret(val['rank_failure_rate'], 'rank_failure_rate')[1]}")
+
     if args.out_dir:
         import os
         os.makedirs(args.out_dir, exist_ok=True)
@@ -249,21 +341,33 @@ def main(argv=None) -> int:
                 "fold": f.index + 1,
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
+                "purged_train_end": f.train_end_effective,
                 "range_lookback": f.best_params.get("range_lookback"),
                 "squeeze_ratio": f.best_params.get("squeeze_ratio"),
                 "target_atr_mult": f.best_params.get("target_atr_mult"),
                 "stop_atr_mult": f.best_params.get("stop_atr_mult"),
                 "train_sharpe": f.train_sharpe,
+                "n_grid_combos": len(f.grid_train_sharpes),
                 "test_bars": f.n_test_bars,
                 "oos_trades": f.n_oos_trades,
                 "oos_return": f.oos_return,
                 "oos_sharpe": f.oos_sharpe,
+                "oos_rank_logit": f.oos_rank_logit,
             }
             for f in folds if f.best_params
         ]
         pd.DataFrame(fold_rows).to_csv(os.path.join(args.out_dir, "fold_table.csv"), index=False)
         oos_trades.to_csv(os.path.join(args.out_dir, "oos_trades.csv"), index=False)
         insample_trades.to_csv(os.path.join(args.out_dir, "insample_trades.csv"), index=False)
+
+        # Full grid-trial train-Sharpe population (one row per fold x valid combo),
+        # so a later DSR can be recomputed from saved artifacts without re-running.
+        trial_rows = [
+            {"fold": f.index + 1, "train_sharpe_annualized": s}
+            for f in folds if f.best_params
+            for s in f.grid_train_sharpes
+        ]
+        pd.DataFrame(trial_rows).to_csv(os.path.join(args.out_dir, "grid_train_sharpes.csv"), index=False)
 
         eq = pd.DataFrame(
             {
@@ -274,8 +378,12 @@ def main(argv=None) -> int:
         eq.to_csv(os.path.join(args.out_dir, "equity_curves.csv"))
         comparison.to_csv(os.path.join(args.out_dir, "comparison.csv"))
 
+        if len(oos_returns):
+            val_rows = {k: v for k, v in val.items()}
+            pd.DataFrame([val_rows]).to_csv(os.path.join(args.out_dir, "validation.csv"), index=False)
+
         print(f"\nWrote fold_table.csv, oos_trades.csv, insample_trades.csv, equity_curves.csv, "
-              f"comparison.csv -> {args.out_dir}/")
+              f"comparison.csv" + (", validation.csv" if len(oos_returns) else "") + f" -> {args.out_dir}/")
 
     return 0
 
