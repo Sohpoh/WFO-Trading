@@ -76,6 +76,7 @@ def apply_session_constraint_with_stops(
     stop_distance: pd.Series,
     target_price: pd.Series,
     session: str | None,
+    size: pd.Series | None = None,
 ) -> pd.Series:
     """Session-aware position walk for strategies whose exits are
     path-dependent (a stop-loss or profit-target level hit mid-trade), not
@@ -106,6 +107,12 @@ def apply_session_constraint_with_stops(
         breakout level, not off entry — so this can't be expressed as a
         simple from-entry distance the way the stop can). Only the value at
         an actual entry bar is read; elsewhere it's ignored.
+      - size: optional per-bar position size (float, > 0). Default None means
+        1.0, preserving the pre-sizing {-1,0,1} contract. When given, a long
+        opens at +size[i] and a short at -size[i], so a strategy can hand in a
+        fractional / inverse-vol-scaled exposure; stop/target direction is
+        resolved from the sign of the open size. Only read at an actual entry
+        bar, and an entry requires size[i] > 0.
       NaN in either (or a target on the wrong side of that bar's close) means
       "no valid entry this bar" — e.g. indicator warm-up not complete yet.
 
@@ -138,6 +145,7 @@ def apply_session_constraint_with_stops(
     short_v = short_signal.to_numpy()
     stop_dist_v = stop_distance.to_numpy()
     target_price_v = target_price.to_numpy()
+    size_v = size.to_numpy() if size is not None else np.ones(n)
 
     position = np.zeros(n)
     pos = 0
@@ -145,7 +153,7 @@ def apply_session_constraint_with_stops(
 
     for i in range(n):
         if pos != 0:
-            if pos == 1:
+            if pos > 0:
                 hit_stop = low_v[i] <= stop_price
                 hit_target = high_v[i] >= target_state
             else:
@@ -170,13 +178,14 @@ def apply_session_constraint_with_stops(
         if pos == 0 and in_session[i]:
             stop_ok = stop_dist_v[i] > 0 and not np.isnan(stop_dist_v[i])
             tgt_ok = not np.isnan(target_price_v[i])
-            if stop_ok and tgt_ok and long_v[i] and target_price_v[i] > close_v[i]:
-                pos = 1
+            s = float(size_v[i])
+            if stop_ok and tgt_ok and long_v[i] and target_price_v[i] > close_v[i] and s > 0:
+                pos = s
                 entry = close_v[i]
                 stop_price = entry - stop_dist_v[i]
                 target_state = target_price_v[i]
-            elif stop_ok and tgt_ok and short_v[i] and target_price_v[i] < close_v[i]:
-                pos = -1
+            elif stop_ok and tgt_ok and short_v[i] and target_price_v[i] < close_v[i] and s > 0:
+                pos = -s
                 entry = close_v[i]
                 stop_price = entry + stop_dist_v[i]
                 target_state = target_price_v[i]

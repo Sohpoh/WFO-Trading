@@ -28,6 +28,11 @@ streamlit.logger.set_log_level("ERROR")  # silence st.cache_data noise outside `
 failures: list[str] = []
 warnings: list[str] = []
 
+# Sane upper bound on |position|. The position contract is now a signed *size*
+# (fractional/inverse-vol exposure) rather than {-1,0,1}; anything beyond this is
+# treated as a runaway sizing bug, not a legitimate position.
+MAX_POSITION_SIZE = 5.0
+
 
 def fail(msg: str) -> None:
     failures.append(msg)
@@ -61,17 +66,20 @@ try:
             if position.isna().any():
                 fail(f"generate_positions() returned {int(position.isna().sum())} NaN "
                      "position value(s) — the Position Contract requires every bar to "
-                     "resolve to a concrete -1/0/1 (apply_session_constraint* should "
+                     "resolve to a concrete signed size (apply_session_constraint* should "
                      "already fill gaps with 0/ffill; NaNs here mean that delegation "
                      "is missing or broken).")
 
-            allowed = {-1.0, 0.0, 1.0}
-            seen = set(position.dropna().unique().tolist())
-            extra = seen - allowed
-            if extra:
-                fail(f"generate_positions() returned value(s) outside {{-1,0,1}}: "
-                     f"{sorted(extra)} — violates the single-position contract (no "
-                     "sizing, no pyramiding).")
+            # Position is now a signed *size* (fractional exposure), not {-1,0,1}.
+            # The contract is: one scalar per bar, finite, within a sane bound. A
+            # magnitude beyond MAX_POSITION_SIZE is a bug (runaway sizing), not a
+            # legitimate position.
+            max_abs = float(position.abs().max()) if len(position) else 0.0
+            if max_abs > MAX_POSITION_SIZE:
+                fail(f"generate_positions() returned a position magnitude {max_abs} "
+                     f"outside the sane sizing bound [0, {MAX_POSITION_SIZE}] — the "
+                     "single-position contract is a bounded signed size; a runaway "
+                     "size indicates a bug in the sizing formula.")
 except Exception as e:  # noqa: BLE001 — any exception here is itself the failure signal
     fail(f"generate_positions(**DEFAULT_PARAMS) raised {type(e).__name__}: {e}")
 

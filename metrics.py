@@ -32,30 +32,38 @@ def bar_returns_with_costs(close: pd.Series, position: pd.Series) -> pd.Series:
 
 
 def extract_trades(close: pd.Series, position: pd.Series) -> pd.DataFrame:
-    """Trade-by-trade log: one row per completed (or open) position segment."""
+    """Trade-by-trade log: one row per completed (or open) position segment.
+
+    Supports signed position *sizes* (not just {-1,0,1}): gross return scales
+    with the size at entry and the round-trip cost scales with |size|, matching
+    ``bar_returns_with_costs`` (which charges ``legs * COST_RATE`` and earns
+    ``position * ret``). For a {-1,0,1} position this is byte-for-byte identical
+    to the pre-sizing behavior.
+    """
     changes = position != position.shift(1).fillna(0.0)
     change_idx = position.index[changes]
     if len(change_idx) == 0:
         return pd.DataFrame(
-            columns=["entry_time", "exit_time", "direction", "entry_price", "exit_price", "net_return"]
+            columns=["entry_time", "exit_time", "direction", "entry_price", "exit_price", "size", "net_return"]
         )
     rows = []
     for i, start in enumerate(change_idx):
-        direction = position.loc[start]
-        if direction == 0:
+        size = float(position.loc[start])
+        if size == 0:
             continue
         end = change_idx[i + 1] if i + 1 < len(change_idx) else position.index[-1]
         entry_price = close.loc[start]
         exit_price = close.loc[end]
-        gross = (exit_price / entry_price - 1) * direction
-        net = gross - 2 * COST_RATE
+        gross = (exit_price / entry_price - 1) * size
+        net = gross - 2 * abs(size) * COST_RATE
         rows.append(
             {
                 "entry_time": start,
                 "exit_time": end,
-                "direction": "Long" if direction > 0 else "Short",
+                "direction": "Long" if size > 0 else "Short",
                 "entry_price": entry_price,
                 "exit_price": exit_price,
+                "size": size,
                 "net_return": net,
             }
         )
