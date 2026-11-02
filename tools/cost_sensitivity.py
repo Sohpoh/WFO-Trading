@@ -1,17 +1,22 @@
 """Cost-sensitivity audit: does a near-miss survive a more realistic cost model?
 
-The engine charges COST_RATE = 0.051% per leg => 10.2bp round trip, and each
-trade's saved `net_return` is `gross - 0.00102`. This script reconstructs gross
-(`net + 0.00102`) and recomputes the gate-v2 load-bearing quantities at cost
+The engine charges `metrics.COST_RATE` per leg (cost v2: FEE_RATE 0.001% +
+SLIPPAGE_RATE 0.005% = 0.006%/leg => 1.2bp round trip on NQ), and each trade's
+saved `net_return` is `gross - ROUND_TRIP`. This script reconstructs gross
+(`net + ROUND_TRIP`) and recomputes the gate-v2 load-bearing quantities at cost
 multipliers {1x, 0.5x, 0.2x, 0.1x, 0x}:
 
-    net'(m) = net + 0.00102 * (1 - m)
+    net'(m) = net + ROUND_TRIP * (1 - m)
 
 For each candidate we report PF, PF-ex-top-5 (the hard gate), win rate, total
 return, and fold consistency — the exact quantities gate v2 decides on. Sharpe
 is *not* recomputed (it needs bar-level returns; a re-run would be required for
 that), so this script answers "does the edge survive the toll?" via PF / PF_ex5
 / fold consistency, which are the accept/reject drivers.
+
+Note: the 0.051%/leg figure this script used to hardcode was cost v1, retired in
+the Aug 2026 recalibration — it now reads the live `metrics.COST_RATE` so it can
+never drift out of sync with the engine again.
 """
 import argparse
 import os
@@ -23,10 +28,10 @@ import pandas as pd
 WFO_TRADING_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, WFO_TRADING_DIR)
 
+from metrics import COST_RATE  # noqa: E402  (cost v2 — single source of truth)
 from tools.gate_v2 import _pf  # noqa: E402
 
-COST_RATE = 0.00051          # per leg
-ROUND_TRIP = 2 * COST_RATE   # 0.00102
+ROUND_TRIP = 2 * COST_RATE   # 0.00012 at cost v2 (1.2bp on NQ)
 
 # iteration -> (label, results dir)
 CANDIDATES = {
