@@ -158,8 +158,14 @@ try:
     import re
 
     cli_src = open(os.path.join(WFO_TRADING_DIR, "cli.py")).read()
-    subscript_keys = re.findall(r'\w\[\s*"([a-zA-Z_]\w*)"\s*\]', cli_src)
-    get_keys = re.findall(r'\.get\(\s*"([a-zA-Z_]\w*)"', cli_src)
+    # Strategy params are referenced off `best_params` (the fold_rows CSV writer,
+    # silent None on a rename) and the fold-stability loop variable `p` (the print
+    # block, loud KeyError). Anchor on those two carriers only — cli.py also
+    # legitimately subscripts non-strategy dicts now (the statistical-validation
+    # `val` dict, metrics `summarize()` output), which must not be treated as
+    # stale param references.
+    subscript_keys = re.findall(r'(?:p|best_params)\[\s*"([a-zA-Z_]\w*)"\s*\]', cli_src)
+    get_keys = re.findall(r'best_params\.get\(\s*"([a-zA-Z_]\w*)"', cli_src)
     referenced_keys = set(subscript_keys) | set(get_keys)
 
     stale = sorted(k for k in referenced_keys if k not in gp_params)
