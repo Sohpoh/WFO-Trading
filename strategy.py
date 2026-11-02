@@ -1,4 +1,5 @@
-"""Long-only volatility-squeeze Donchian breakout with a bounded ATR target.
+"""Long-only volatility-squeeze Donchian breakout with a bounded ATR target
+and inverse-volatility position sizing.
 
 New family (`volatility_squeeze_breakout`), following the retired KNN
 return-prediction family. Entry reads the trading-vault volatility.md
@@ -31,6 +32,15 @@ stop/target bookkeeping are delegated to `apply_session_constraint_with_stops`):
     target = entry + target_atr_mult * ATR(14). Both distances are read at the
     entry bar and the position force-flattens at session close (session.py).
 
+  - Sizing (the only change from iteration 64): a per-bar inverse-vol `size`
+    series passed to `apply_session_constraint_with_stops(size=...)`, so a long
+    opens at +size (signed exposure) instead of +1. size =
+    clip(size_cap * ATR(960)/ATR(14), SIZE_FLOOR=0.5, size_cap) — quiet
+    markets (slow ATR large relative to fast ATR) size up toward `size_cap`,
+    hot markets size down toward the 0.5 floor. `size_cap` is grid-searched
+    ({1.0,1.5,2.0,3.0}); SIZE_FLOOR and both ATR windows are hardcoded
+    (reusing ATR_SLOW_PERIOD / ATR_STOP_PERIOD — zero new lookbacks/warm-up).
+
 Warm-up: ATR_SLOW_PERIOD (960 bars) is the largest bar-count lookback and is
 threaded through build_grid() as a plain int so _max_lookback_bars() sizes the
 test-window buffer off it (960 -> (960+5)*3 = 2895 bars ~ 30 days at 15min),
@@ -39,16 +49,18 @@ comfortably covering the ATR(960) Wilder warm-up, the Donchian window
 bar-count lookback and is a plain int on purpose. squeeze_ratio and
 target_atr_mult are thresholds/multipliers, NOT lookbacks, so they are floats
 and must not inflate the warm-up buffer. stop_atr_mult (grid
-{0.75,1.0,1.5,2.0}) is also a float multiplier and must not inflate the
-buffer.
+{0.75,1.0,1.5,2.0}) and size_cap (grid {1.0,1.5,2.0,3.0}) are also float
+multipliers (an ATR distance and an exposure cap, NOT lookbacks) and must not
+inflate the buffer.
 
 Contract notes: `generate_positions` builds session-unaware raw signals and
 delegates all session gating, stop/target bookkeeping, and end-of-session
 flatten to `apply_session_constraint_with_stops`; it never reimplements the
-session mask. The delegate returns one scalar {-1,0,1} per bar, so repeat
-signals while already long are no-ops and the single-position contract holds.
-NaN/unwarmed indicators fail closed (no entry). Costs (metrics.py, cost model
-v2) are out of scope for this file.
+session mask. The delegate returns one scalar signed *size* per bar (a long of
++size, flat 0; no short branch), so repeat signals while already long are
+no-ops and the single-position contract holds — size is computed once at entry
+and never scaled in. NaN/unwarmed indicators fail closed (no entry). Costs
+(metrics.py, cost model v2) are out of scope for this file.
 """
 import numpy as np
 import pandas as pd
@@ -66,6 +78,12 @@ ATR_SLOW_PERIOD = 960   # ~10 days at 15min
 # Fixed ATR window, in BARS, for the stop/target distance. Genuine bar-count
 # lookback (subsumed by ATR_SLOW_PERIOD when sizing the warm-up buffer).
 ATR_STOP_PERIOD = 14
+
+# Hardcoded floor for the inverse-vol size series: size is clipped to
+# [SIZE_FLOOR, size_cap], so a hot market (small ATR(14) relative to ATR(960))
+# never opens a sub-half-unit long and the exposure never exceeds size_cap.
+# Never grid-searched.
+SIZE_FLOOR = 0.5
 
 
 def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
@@ -94,6 +112,7 @@ def generate_positions(
     squeeze_ratio: float,
     target_atr_mult: float,
     stop_atr_mult: float,
+    size_cap: float,
     session: str | None = "New York",
     atr_fast_period: int = ATR_FAST_PERIOD,
     atr_slow_period: int = ATR_SLOW_PERIOD,
@@ -106,7 +125,10 @@ def generate_positions(
     channel (highest High of the trailing `range_lookback` prior bars). Long
     fires on the crossing bar while squeezed; no short. Exit is a bounded
     ATR-scaled stop + target delegated to session.py, with the position
-    force-flattened at session close. Returns a {-1,0,1} position series.
+    force-flattened at session close. A long opens at +size, where size =
+    clip(size_cap * ATR(960)/ATR(14), SIZE_FLOOR, size_cap) — inverse-vol
+    exposure in [SIZE_FLOOR, size_cap]. Returns a signed-size position series
+    (positive long / 0 flat, no short).
     """
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
@@ -136,8 +158,16 @@ def generate_positions(
     stop_distance = float(stop_atr_mult) * atr_stop
     target_price = close + float(target_atr_mult) * atr_stop
 
+    # Inverse-vol size: per-bar exposure in [SIZE_FLOOR, size_cap]. ATR(960) /
+    # ATR(14) is large in quiet markets (size up toward size_cap) and small in
+    # hot markets (size down toward the 0.5 floor). NaN while either ATR is
+    # still warming fails closed inside apply_session_constraint_with_stops
+    # (an entry requires size > 0).
+    size = np.clip(float(size_cap) * atr_slow / atr_stop, SIZE_FLOOR, float(size_cap))
+
     # session.py alone decides which bars are tradable, walks the stop/target
-    # bookkeeping bar-by-bar, and force-flattens on the session's last bar.
+    # bookkeeping bar-by-bar, opens a long at +size (signed exposure) on an
+    # entry bar, and force-flattens on the session's last bar.
     return apply_session_constraint_with_stops(
         close,
         high,
@@ -147,6 +177,7 @@ def generate_positions(
         stop_distance,
         target_price,
         session,
+        size=size,
     )
 
 
@@ -157,15 +188,17 @@ DEFAULT_PARAMS = {
     # threshold and target_atr_mult (grid {1.0,1.5,2.0,3.0}) is an ATR
     # multiplier — both floats, NOT lookbacks. stop_atr_mult (grid
     # {0.75,1.0,1.5,2.0}, default 2.0 = the control anchor) is a float
-    # multiplier. atr_fast_period (96), atr_slow_period (960) and
-    # atr_stop_period (14) are fixed plain-int lookbacks — never grid-searched
-    # but threaded through build_grid() so _max_lookback_bars() returns 960.
-    # `session` is a fixed param. These are the concrete set the sanity checker
-    # runs generate_positions() against.
+    # multiplier. size_cap (grid {1.0,1.5,2.0,3.0}) is the inverse-vol
+    # exposure cap — a float multiplier, NOT a lookback. atr_fast_period (96),
+    # atr_slow_period (960) and atr_stop_period (14) are fixed plain-int
+    # lookbacks — never grid-searched but threaded through build_grid() so
+    # _max_lookback_bars() returns 960. `session` is a fixed param. These are
+    # the concrete set the sanity checker runs generate_positions() against.
     "range_lookback": 24,
     "squeeze_ratio": 1.0,
     "target_atr_mult": 2.0,
     "stop_atr_mult": 2.0,
+    "size_cap": 2.0,
     "atr_fast_period": ATR_FAST_PERIOD,
     "atr_slow_period": ATR_SLOW_PERIOD,
     "atr_stop_period": ATR_STOP_PERIOD,

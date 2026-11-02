@@ -53,11 +53,11 @@ class Fold:
     oos_rank_logit: Optional[float] = None
 
 
-def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults, session) -> list[dict]:
+def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults, size_caps, session) -> list[dict]:
     """Assemble the searched params into `strategy.generate_positions()` kwargs.
 
-    Four params are searched for the long-only volatility-squeeze Donchian
-    breakout + bounded ATR target:
+    Five params are searched for the long-only volatility-squeeze Donchian
+    breakout + bounded ATR target + inverse-vol sizing:
 
       - `range_lookback` — the Donchian channel trailing window in bars (grid
         {8,12,24,48} = 2h/3h/1d/2d at 15min). A genuine bar-count lookback,
@@ -77,6 +77,11 @@ def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults
         prior fixed value). An ATR multiplier (float), NOT a lookback, so it
         must not feed `_max_lookback_bars()`. The build_grid parameter is
         `stop_atr_mults`.
+      - `size_cap` — the inverse-vol exposure cap: size is
+        clip(size_cap * ATR(960)/ATR(14), 0.5, size_cap) (grid
+        {1.0,1.5,2.0,3.0}). An exposure-cap multiplier (float), NOT a lookback,
+        so it must not feed `_max_lookback_bars()`. The build_grid parameter is
+        `size_caps`.
 
     The strategy's fixed params are never searched, but the three ATR windows
     are genuine bar-count lookbacks, so they are threaded into every combo as
@@ -102,13 +107,14 @@ def build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults
     from strategy import ATR_FAST_PERIOD, ATR_SLOW_PERIOD, ATR_STOP_PERIOD
 
     grid = []
-    for rl, sr, tam, sam in product(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults):
+    for rl, sr, tam, sam, sc in product(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults, size_caps):
         grid.append(
             {
                 "range_lookback": int(rl),
                 "squeeze_ratio": float(sr),
                 "target_atr_mult": float(tam),
                 "stop_atr_mult": float(sam),
+                "size_cap": float(sc),
                 "atr_fast_period": int(ATR_FAST_PERIOD),
                 "atr_slow_period": int(ATR_SLOW_PERIOD),
                 "atr_stop_period": int(ATR_STOP_PERIOD),
