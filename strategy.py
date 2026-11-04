@@ -175,7 +175,7 @@ DEFAULT_PARAMS = {
     # lookback, so it is a float and must not feed _max_lookback_bars().
     # buffer_frac (grid {0.0,0.1,0.25,0.5}) is a range-buffer fraction and
     # stop_atr_mult (grid {0.75,1.0,1.5,2.0}) / target_atr_mult (grid
-    # {1.0,2.0,3.0,4.0}) are ATR multipliers — all floats, NOT lookbacks.
+    # {0.25,0.5,0.75,1.0}) are ATR multipliers — all floats, NOT lookbacks.
     # atr_stop_period (14) is a fixed plain-int lookback, threaded through
     # build_grid() so _max_lookback_bars() returns 14. `session` is a fixed
     # param. These are the concrete set the sanity checker runs
@@ -183,7 +183,7 @@ DEFAULT_PARAMS = {
     "orb_minutes": 60.0,
     "buffer_frac": 0.1,
     "stop_atr_mult": 2.0,
-    "target_atr_mult": 2.0,
+    "target_atr_mult": 0.5,
     "atr_stop_period": ATR_STOP_PERIOD,
     "session": "New York",
 }

@@ -75,7 +75,7 @@ def build_grid(orb_minutess, buffer_fracs, stop_atr_mults, target_atr_mults, ses
         {0.75,1.0,1.5,2.0}). An ATR multiplier (float), NOT a lookback. The
         build_grid parameter is `stop_atr_mults`.
       - `target_atr_mult` — the ATR multiplier for the bounded profit target
-        (grid {1.0,2.0,3.0,4.0}). An ATR multiplier (float), NOT a lookback.
+        (grid {0.25,0.5,0.75,1.0}). An ATR multiplier (float), NOT a lookback.
         The build_grid parameter is `target_atr_mults`.
 
     The strategy's fixed params are never searched, but the stop/target ATR

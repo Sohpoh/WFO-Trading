@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "stop_atr_mult * ATR(14) for a long (entry + stop_atr_mult * ATR(14) "
                              "for a short). An ATR multiplier (float, not a lookback), so it does "
                              "NOT feed wfo_engine's warm-up buffer")
-    strat.add_argument("--target-atr-mult", default="1.0,2.0,3.0,4.0",
+    strat.add_argument("--target-atr-mult", default="0.25,0.5,0.75,1.0",
                         help="comma-separated profit-target ATR multipliers: target = entry + "
                              "target_atr_mult * ATR(14) for a long (entry - target_atr_mult * ATR(14) "
                              "for a short). An ATR multiplier (float, not a lookback), so it does NOT "
