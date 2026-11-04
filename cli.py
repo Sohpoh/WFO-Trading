@@ -71,39 +71,31 @@ def build_parser() -> argparse.ArgumentParser:
     data.add_argument("--date-to", default=None, help="YYYY-MM-DD, defaults to latest available")
 
     strat = p.add_argument_group(
-        "strategy grid (long-only volatility-squeeze Donchian breakout, "
-        "bounded ATR target, inverse-vol sizing)"
+        "strategy grid (opening-range breakout, bounded ATR(14) stop/target)"
     )
     strat.add_argument("--session", default="New York", choices=list(SESSION_CONFIG.keys()) + ["none"],
                         help="day-trade session, or 'none' to disable session gating (forced for --timeframe 1d)")
-    strat.add_argument("--range-lookback", default="8,12,24,48",
-                        help="comma-separated Donchian channel lookbacks in BARS (8/12/24/48 = "
-                             "2h/3h/1d/2d at 15min). The upper channel is the highest High of the "
-                             "trailing range_lookback PRIOR bars (no lookahead). A genuine bar-count "
-                             "lookback, parsed as int and fed to wfo_engine's warm-up buffer")
-    strat.add_argument("--squeeze-ratio", default="0.8,0.9,1.0,1.1",
-                        help="comma-separated squeeze thresholds: the setup is armed when "
-                             "ATR(96)/ATR(960) <= squeeze_ratio (a multi-day realized-vol contraction). "
-                             "A vol-ratio threshold (float, not a lookback), so it does NOT feed "
-                             "wfo_engine's warm-up buffer")
-    strat.add_argument("--target-atr-mult", default="1.0,1.5,2.0,3.0",
-                        help="comma-separated profit-target ATR multipliers: target = entry + "
-                             "target_atr_mult * ATR(14), a bounded target that harvests the expansion "
-                             "move (paired with a grid-searched --stop-atr-mult). An ATR multiplier "
-                             "(float, not a lookback), so it does NOT feed wfo_engine's warm-up buffer")
+    strat.add_argument("--orb-minutes", default="30,60,90",
+                        help="comma-separated opening-range window lengths in MINUTES (30/60/90 = "
+                             "first half-hour/hour/90min of the New York cash session). The opening "
+                             "range is the per-ET-day High/Low over bars whose New-York time is in "
+                             "[09:30, 09:30 + orb_minutes). A minutes-of-day window (float, not a "
+                             "bar-count lookback), so it does NOT feed wfo_engine's warm-up buffer")
+    strat.add_argument("--buffer-frac", default="0.0,0.1,0.25,0.5",
+                        help="comma-separated range-buffer fractions: LONG threshold = OR_high + "
+                             "buffer_frac * (OR_high - OR_low), SHORT threshold = OR_low - "
+                             "buffer_frac * (OR_high - OR_low). A fraction (float, not a lookback), "
+                             "so it does NOT feed wfo_engine's warm-up buffer")
     strat.add_argument("--stop-atr-mult", default="0.75,1.0,1.5,2.0",
                         help="comma-separated stop-loss ATR multipliers: stop = entry - "
-                             "stop_atr_mult * ATR(14) for a long. 2.0 is the control anchor carried "
-                             "over from the prior fixed stop; the grid opens the tighter-stop region "
-                             "below 2.0 (the left-tail fix). An ATR multiplier (float, not a "
-                             "lookback), so it does NOT feed wfo_engine's warm-up buffer")
-
-    strat.add_argument("--size-cap", default="1.0,1.5,2.0,3.0",
-                        help="comma-separated inverse-vol exposure caps: a long opens at size = "
-                             "clip(size_cap * ATR(960)/ATR(14), 0.5, size_cap), so quiet markets size "
-                             "up toward size_cap and hot markets size down toward the hardcoded 0.5 "
-                             "floor. An exposure-cap multiplier (float, not a lookback), so it does "
+                             "stop_atr_mult * ATR(14) for a long (entry + stop_atr_mult * ATR(14) "
+                             "for a short). An ATR multiplier (float, not a lookback), so it does "
                              "NOT feed wfo_engine's warm-up buffer")
+    strat.add_argument("--target-atr-mult", default="1.0,2.0,3.0,4.0",
+                        help="comma-separated profit-target ATR multipliers: target = entry + "
+                             "target_atr_mult * ATR(14) for a long (entry - target_atr_mult * ATR(14) "
+                             "for a short). An ATR multiplier (float, not a lookback), so it does NOT "
+                             "feed wfo_engine's warm-up buffer")
 
     wfo = p.add_argument_group("walk-forward schedule")
     wfo.add_argument("--train-weeks", type=int, default=12)
@@ -215,21 +207,19 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     try:
-        # range_lookback is a genuine bar-count lookback (the Donchian trailing
-        # window), parsed as int and fed to wfo_engine's warm-up buffer.
-        # squeeze_ratio is a vol-ratio threshold and target_atr_mult /
-        # stop_atr_mult / size_cap are ATR multipliers / an exposure cap — all
-        # floats, NOT lookbacks, so they stay out of the buffer. The three ATR
-        # windows (96/960/14) are fixed values threaded inside build_grid()
-        # (not CLI flags). The build_grid arguments are range_lookbacks /
-        # squeeze_ratios / target_atr_mults / stop_atr_mults / size_caps — the
-        # grid-search naming convention is "<param> + 's'".
-        range_lookbacks = parse_num_list(args.range_lookback, int)
-        squeeze_ratios = parse_num_list(args.squeeze_ratio)
-        target_atr_mults = parse_num_list(args.target_atr_mult)
+        # orb_minutes is a minutes-of-day window (not a bar-count lookback) and
+        # buffer_frac / stop_atr_mult / target_atr_mult are a fraction / ATR
+        # multipliers — all floats, NOT lookbacks, so they stay out of the
+        # warm-up buffer. The stop/target ATR window (14) is a fixed value
+        # threaded inside build_grid() (not a CLI flag). The build_grid
+        # arguments are orb_minutess / buffer_fracs / stop_atr_mults /
+        # target_atr_mults — the grid-search naming convention is
+        # "<param> + 's'".
+        orb_minutes_list = parse_num_list(args.orb_minutes)
+        buffer_fracs = parse_num_list(args.buffer_frac)
         stop_atr_mults = parse_num_list(args.stop_atr_mult)
-        size_caps = parse_num_list(args.size_cap)
-        grid = build_grid(range_lookbacks, squeeze_ratios, target_atr_mults, stop_atr_mults, size_caps, session)
+        target_atr_mults = parse_num_list(args.target_atr_mult)
+        grid = build_grid(orb_minutes_list, buffer_fracs, stop_atr_mults, target_atr_mults, session)
     except ValueError as e:
         print(f"error parsing strategy params: {e}", file=sys.stderr)
         return 1
@@ -271,22 +261,20 @@ def main(argv=None) -> int:
 
     chosen = [f.best_params for f in folds if f.best_params]
     if chosen:
-        # Only the five grid-searched params are reported here; `session` and
-        # the fixed ATR windows (96/960/14) are constant across every combo,
-        # so their "distinct values" would always be 1 and carry no stability
+        # Only the four grid-searched params are reported here; `session` and
+        # the fixed ATR window (14) are constant across every combo, so their
+        # "distinct values" would always be 1 and carry no stability
         # information.
-        range_lookback_vals = sorted({p["range_lookback"] for p in chosen})
-        squeeze_ratio_vals = sorted({p["squeeze_ratio"] for p in chosen})
-        target_atr_mult_vals = sorted({p["target_atr_mult"] for p in chosen})
+        orb_minutes_vals = sorted({p["orb_minutes"] for p in chosen})
+        buffer_frac_vals = sorted({p["buffer_frac"] for p in chosen})
         stop_atr_mult_vals = sorted({p["stop_atr_mult"] for p in chosen})
-        size_cap_vals = sorted({p["size_cap"] for p in chosen})
+        target_atr_mult_vals = sorted({p["target_atr_mult"] for p in chosen})
         print(
-            f"Fold param stability: {len(range_lookback_vals)} distinct range lookbacks "
-            f"{range_lookback_vals}, {len(squeeze_ratio_vals)} distinct squeeze ratios "
-            f"{squeeze_ratio_vals}, {len(target_atr_mult_vals)} distinct target ATR mults "
-            f"{target_atr_mult_vals}, {len(stop_atr_mult_vals)} distinct stop ATR mults "
-            f"{stop_atr_mult_vals}, {len(size_cap_vals)} distinct size caps "
-            f"{size_cap_vals}"
+            f"Fold param stability: {len(orb_minutes_vals)} distinct OR minutes "
+            f"{orb_minutes_vals}, {len(buffer_frac_vals)} distinct buffer fracs "
+            f"{buffer_frac_vals}, {len(stop_atr_mult_vals)} distinct stop ATR mults "
+            f"{stop_atr_mult_vals}, {len(target_atr_mult_vals)} distinct target ATR mults "
+            f"{target_atr_mult_vals}"
         )
 
     # Per-fold OOS consistency: computed directly from each fold's own stitched
@@ -352,10 +340,10 @@ def main(argv=None) -> int:
                 "train_start": f.train_start, "train_end": f.train_end,
                 "test_start": f.test_start, "test_end": f.test_end,
                 "purged_train_end": f.train_end_effective,
-                "range_lookback": f.best_params.get("range_lookback"),
-                "squeeze_ratio": f.best_params.get("squeeze_ratio"),
-                "target_atr_mult": f.best_params.get("target_atr_mult"),
+                "orb_minutes": f.best_params.get("orb_minutes"),
+                "buffer_frac": f.best_params.get("buffer_frac"),
                 "stop_atr_mult": f.best_params.get("stop_atr_mult"),
+                "target_atr_mult": f.best_params.get("target_atr_mult"),
                 "train_sharpe": f.train_sharpe,
                 "n_grid_combos": len(f.grid_train_sharpes),
                 "test_bars": f.n_test_bars,

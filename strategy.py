@@ -1,89 +1,73 @@
-"""Long-only volatility-squeeze Donchian breakout with a bounded ATR target
-and inverse-volatility position sizing.
+"""Opening-Range Breakout (ORB) on ES 15min, New York session.
 
-New family (`volatility_squeeze_breakout`), following the retired KNN
-return-prediction family. Entry reads the trading-vault volatility.md
-clustering cycle ("Calm period: Low volatility ... -> Shock event: Spike in
-volatility") as a tradeable setup: a multi-day realized-vol contraction
-precedes expansion, so a breakout from a tight range *while squeezed* is a
-higher-win-rate event than an unconditional channel breakout. Long-only (the
-continuation side with demonstrated in-sample edge) and a bounded target
-harvests the expansion into "frequent small wins" rather than an uncapped
-tail.
+New family (`opening_range_breakout`), pivoting off iteration 65's
+`multiple-testing` rejection. The edge is the first hour's High/Low as an
+institutional accumulation/distribution marker: a one-bar break of a
+session-open-anchored range (with a buffer) is a higher-conviction intraday
+trend signal than an unconditional rolling-channel breakout.
 
 Rules (all computed on continuous, session-unaware bars; session gating and
 stop/target bookkeeping are delegated to `apply_session_constraint_with_stops`):
 
-  - Squeeze state (zero-param, both ATR windows hardcoded): ATR_fast =
-    ATR(96 bars ~ 1 day), ATR_slow = ATR(960 bars ~ 10 days), both Wilder
-    averages. The setup is armed on any bar where
-    ATR_fast / ATR_slow <= squeeze_ratio (a realized-vol contraction).
+  - Opening range: per-ET-day High/Low over bars whose New-York time falls in
+    [09:30, 09:30 + orb_minutes) — computed via index.tz_convert("America/
+    New_York") + ET-date grouping (bars are timestamped at their open). The
+    range level is NaN until its window closes (so no entry inside the first
+    `orb_minutes`) and is then frozen through the rest of that ET day. The
+    09:30 anchor is the strategy's signal definition, not session gating — it
+    gates nothing and flattens nothing; session.py alone decides which bars are
+    tradable and force-flattens at 16:00.
 
-  - Breakout trigger: Donchian upper channel = the highest High of the
-    trailing `range_lookback` PRIOR bars (no lookahead). A long fires on the
-    single bar where Close crosses ABOVE that channel (previous Close <=
-    previous channel, current Close > current channel) while the squeeze is
-    armed. This is a one-bar crossing, NOT a persistent above-state, so a
-    stop/target exit does not re-arm on the next in-session bar (the exact
-    churn bug that sank the prior iteration's stop variant). No short branch.
+  - Breakout trigger: a one-bar Close cross. LONG fires on the first bar where
+    Close crosses above OR_high + buffer_frac*(OR_high - OR_low) (prior Close
+    <= threshold < current Close); SHORT fires on the first bar where Close
+    crosses below OR_low - buffer_frac*(OR_high - OR_low) (prior Close >=
+    threshold > current Close). One-bar cross, not a persistent above/below
+    state, so a stop/target exit does not re-arm on the next in-session bar.
 
   - Exit: path-dependent stop + target via `apply_session_constraint_with_stops`.
-    Stop = entry - stop_atr_mult * ATR(14) (stop_atr_mult grid-searched);
-    target = entry + target_atr_mult * ATR(14). Both distances are read at the
+    Long: stop = entry - stop_atr_mult * ATR(14), target = entry +
+    target_atr_mult * ATR(14); short mirrored. Both distances are read at the
     entry bar and the position force-flattens at session close (session.py).
+    No flip exit.
 
-  - Sizing (the only change from iteration 64): a per-bar inverse-vol `size`
-    series passed to `apply_session_constraint_with_stops(size=...)`, so a long
-    opens at +size (signed exposure) instead of +1. size =
-    clip(size_cap * ATR(960)/ATR(14), SIZE_FLOOR=0.5, size_cap) — quiet
-    markets (slow ATR large relative to fast ATR) size up toward `size_cap`,
-    hot markets size down toward the 0.5 floor. `size_cap` is grid-searched
-    ({1.0,1.5,2.0,3.0}); SIZE_FLOOR and both ATR windows are hardcoded
-    (reusing ATR_SLOW_PERIOD / ATR_STOP_PERIOD — zero new lookbacks/warm-up).
-
-Warm-up: ATR_SLOW_PERIOD (960 bars) is the largest bar-count lookback and is
+Warm-up: ATR_STOP_PERIOD (14 bars) is the only bar-count lookback and is
 threaded through build_grid() as a plain int so _max_lookback_bars() sizes the
-test-window buffer off it (960 -> (960+5)*3 = 2895 bars ~ 30 days at 15min),
-comfortably covering the ATR(960) Wilder warm-up, the Donchian window
-(range_lookback grid {8,12,24,48}), and ATR(14). range_lookback is a genuine
-bar-count lookback and is a plain int on purpose. squeeze_ratio and
-target_atr_mult are thresholds/multipliers, NOT lookbacks, so they are floats
-and must not inflate the warm-up buffer. stop_atr_mult (grid
-{0.75,1.0,1.5,2.0}) and size_cap (grid {1.0,1.5,2.0,3.0}) are also float
-multipliers (an ATR distance and an exposure cap, NOT lookbacks) and must not
-inflate the buffer.
+test-window buffer to at least (14+5)*3 = 57 bars (the day-bars floor of ~96
+bars at 15min dominates), comfortably covering the Wilder ATR(14) warm-up. The
+opening-range window is within-day and is covered by the day-bars floor, so no
+extra lookback is needed. orb_minutes is a *minutes-of-day* window (not a
+bar-count lookback) and buffer_frac / stop_atr_mult / target_atr_mult are
+fractions/multipliers, so all four are floats and must not inflate the warm-up
+buffer.
 
 Contract notes: `generate_positions` builds session-unaware raw signals and
 delegates all session gating, stop/target bookkeeping, and end-of-session
 flatten to `apply_session_constraint_with_stops`; it never reimplements the
-session mask. The delegate returns one scalar signed *size* per bar (a long of
-+size, flat 0; no short branch), so repeat signals while already long are
-no-ops and the single-position contract holds — size is computed once at entry
-and never scaled in. NaN/unwarmed indicators fail closed (no entry). Costs
-(metrics.py, cost model v2) are out of scope for this file.
+session mask. No position sizing is specified, so the delegate's default 1.0
+unit exposure applies and the position is long +1 / short -1 / flat 0 — repeat
+signals while already positioned are no-ops and the single-position contract
+holds. NaN/unwarmed indicators (ATR, or a not-yet-closed opening range) fail
+closed (no entry). Costs (metrics.py, cost model v2) are out of scope for this
+file.
 """
 import numpy as np
 import pandas as pd
 
 from session import apply_session_constraint_with_stops
 
-# Fixed ATR windows, in BARS, for the squeeze state. Both are genuine bar-count
-# lookbacks (Wilder smoothing spans) and are threaded through build_grid() as
-# plain ints on purpose: ATR_SLOW_PERIOD (960) is the largest int in the grid,
-# so _max_lookback_bars() returns 960 and sizes the warm-up buffer to ~30 days
-# at 15min. Never grid-searched.
-ATR_FAST_PERIOD = 96    # ~1 day at 15min (96 bars/day)
-ATR_SLOW_PERIOD = 960   # ~10 days at 15min
-
 # Fixed ATR window, in BARS, for the stop/target distance. Genuine bar-count
-# lookback (subsumed by ATR_SLOW_PERIOD when sizing the warm-up buffer).
+# lookback, threaded through build_grid() as a plain int so _max_lookback_bars()
+# sizes the warm-up buffer to cover the Wilder warm-up. Never grid-searched.
 ATR_STOP_PERIOD = 14
 
-# Hardcoded floor for the inverse-vol size series: size is clipped to
-# [SIZE_FLOOR, size_cap], so a hot market (small ATR(14) relative to ATR(960))
-# never opens a sub-half-unit long and the exposure never exceeds size_cap.
+# Opening-range anchor, fixed: the New York cash open, in Eastern wall-clock
+# time. This is the strategy's signal definition (where the first-hour range
+# starts), NOT session gating — it is deliberately hardcoded here because
+# session.py still owns which bars are tradable and the 16:00 force-flatten.
 # Never grid-searched.
-SIZE_FLOOR = 0.5
+OR_OPEN_HOUR = 9
+OR_OPEN_MINUTE = 30
 
 
 def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
@@ -93,8 +77,8 @@ def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -
     gaps count. The Wilder average is a recursive EMA with alpha = 1/period
     (adjust=False) so it carries state rather than using a fixed trailing
     window. The first `period` bars are NaN (the recursion hasn't seen a full
-    window yet), so a squeeze ratio or stop distance built from them fails
-    closed and cannot open a position.
+    window yet), so a stop distance built from them fails closed and cannot
+    open a position.
     """
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -108,66 +92,72 @@ def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -
 
 def generate_positions(
     df: pd.DataFrame,
-    range_lookback: int,
-    squeeze_ratio: float,
-    target_atr_mult: float,
+    orb_minutes: float,
+    buffer_frac: float,
     stop_atr_mult: float,
-    size_cap: float,
+    target_atr_mult: float,
     session: str | None = "New York",
-    atr_fast_period: int = ATR_FAST_PERIOD,
-    atr_slow_period: int = ATR_SLOW_PERIOD,
     atr_stop_period: int = ATR_STOP_PERIOD,
 ) -> pd.Series:
-    """Build the long-only volatility-squeeze Donchian-breakout position series.
+    """Build the two-sided opening-range-breakout position series.
 
-    Squeeze (armed) state = ATR(atr_fast_period)/ATR(atr_slow_period) <=
-    squeeze_ratio. Breakout = a one-bar Close cross above the Donchian upper
-    channel (highest High of the trailing `range_lookback` prior bars). Long
-    fires on the crossing bar while squeezed; no short. Exit is a bounded
-    ATR-scaled stop + target delegated to session.py, with the position
-    force-flattened at session close. A long opens at +size, where size =
-    clip(size_cap * ATR(960)/ATR(14), SIZE_FLOOR, size_cap) — inverse-vol
-    exposure in [SIZE_FLOOR, size_cap]. Returns a signed-size position series
-    (positive long / 0 flat, no short).
+    Opening range = per-ET-day High/Low over bars whose New-York time is in
+    [09:30, 09:30 + orb_minutes). The level is NaN until its window closes and
+    then frozen through that ET day. LONG/SHORT fire on a one-bar Close cross of
+    the buffered range high/low; exit is a bounded ATR(14)-scaled stop + target
+    delegated to session.py, force-flattened at session close. Returns a signed
+    unit-exposure position series (+1 long / -1 short / 0 flat, no sizing).
     """
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
 
-    atr_fast = atr_series(high, low, close, int(atr_fast_period))
-    atr_slow = atr_series(high, low, close, int(atr_slow_period))
+    # ET wall-clock time per bar (bars are timestamped at their open). Grouping
+    # by the normalized ET date makes the opening range per-ET-calendar-day;
+    # tz_convert keeps this DST-safe without hardcoding UTC offsets.
+    et = df.index.tz_convert("America/New_York")
+    et_date = et.normalize().to_numpy()
+    et_min = (et.hour * 60 + et.minute).to_numpy()
 
-    # Squeeze/armed state. NaN (unwarmed ATR) compares False, so unwarmed bars
-    # fail closed; a degenerate (zero/inf) ratio also fails closed.
-    squeeze = (atr_fast / atr_slow) <= float(squeeze_ratio)
+    or_open_min = OR_OPEN_HOUR * 60 + OR_OPEN_MINUTE  # 570 = 09:30
+    or_close_min = or_open_min + int(orb_minutes)
 
-    # Donchian upper channel from the trailing `range_lookback` PRIOR bars
-    # (high.shift(1) excludes the current bar -> no lookahead). A one-bar Close
-    # cross ABOVE the channel, not a persistent above-state.
-    upper = high.shift(1).rolling(int(range_lookback), min_periods=int(range_lookback)).max()
-    cross_above = (close > upper) & (close.shift(1) <= upper.shift(1))
+    in_window = (et_min >= or_open_min) & (et_min < or_close_min)
+    range_known = et_min >= or_close_min
 
-    long_signal = squeeze & cross_above
-    short_signal = pd.Series(False, index=df.index, dtype=bool)
+    # Per-ET-day opening-range High/Low over the in-window bars only. NaN until
+    # the window closes (range_known), then frozen through the rest of that ET
+    # day (transform broadcasts the single day value to every bar of the day).
+    or_high = high.where(in_window).groupby(et_date).transform("max")
+    or_low = low.where(in_window).groupby(et_date).transform("min")
+    or_high = or_high.where(range_known)
+    or_low = or_low.where(range_known)
+
+    or_range = or_high - or_low
+    long_threshold = or_high + float(buffer_frac) * or_range
+    short_threshold = or_low - float(buffer_frac) * or_range
+
+    # One-bar cross, not a persistent above/below state. The threshold is the
+    # frozen OR level, so the first bar after the window closes can fire if the
+    # prior Close sat on the other side. NaN thresholds (pre-window) fail
+    # closed. Long and short are mutually exclusive: long_threshold >=
+    # short_threshold always, so Close cannot exceed both.
+    prior_close = close.shift(1)
+    long_signal = (close > long_threshold) & (prior_close <= long_threshold)
+    short_signal = (close < short_threshold) & (prior_close >= short_threshold)
 
     # Stop/target distances, both read at the entry bar. stop_distance is a
-    # positive from-entry distance (session.py resolves the below-entry
-    # direction for a long); target_price is absolute and already above entry
-    # because it anchors on Close + target_atr_mult * ATR(14).
-    atr_stop = atr_series(high, low, close, int(atr_stop_period))
-    stop_distance = float(stop_atr_mult) * atr_stop
-    target_price = close + float(target_atr_mult) * atr_stop
-
-    # Inverse-vol size: per-bar exposure in [SIZE_FLOOR, size_cap]. ATR(960) /
-    # ATR(14) is large in quiet markets (size up toward size_cap) and small in
-    # hot markets (size down toward the 0.5 floor). NaN while either ATR is
-    # still warming fails closed inside apply_session_constraint_with_stops
-    # (an entry requires size > 0).
-    size = np.clip(float(size_cap) * atr_slow / atr_stop, SIZE_FLOOR, float(size_cap))
+    # positive from-entry distance (session.py resolves below-entry for a long,
+    # above-entry for a short); target_price is absolute and direction-resolved
+    # (above entry on long bars, below entry on short bars).
+    atr = atr_series(high, low, close, int(atr_stop_period))
+    stop_distance = float(stop_atr_mult) * atr
+    target_price = close + float(target_atr_mult) * atr
+    target_price = target_price.where(~short_signal, close - float(target_atr_mult) * atr)
 
     # session.py alone decides which bars are tradable, walks the stop/target
-    # bookkeeping bar-by-bar, opens a long at +size (signed exposure) on an
-    # entry bar, and force-flattens on the session's last bar.
+    # bookkeeping bar-by-bar, opens +1/-1 on an entry bar, and force-flattens
+    # on the session's last bar.
     return apply_session_constraint_with_stops(
         close,
         high,
@@ -177,30 +167,23 @@ def generate_positions(
         stop_distance,
         target_price,
         session,
-        size=size,
     )
 
 
 DEFAULT_PARAMS = {
-    # range_lookback is a genuine bar-count lookback (the Donchian trailing
-    # window; grid {8,12,24,48}) and is a plain int on purpose so it feeds
-    # the warm-up buffer. squeeze_ratio (grid {0.8,0.9,1.0,1.1}) is a vol-ratio
-    # threshold and target_atr_mult (grid {1.0,1.5,2.0,3.0}) is an ATR
-    # multiplier — both floats, NOT lookbacks. stop_atr_mult (grid
-    # {0.75,1.0,1.5,2.0}, default 2.0 = the control anchor) is a float
-    # multiplier. size_cap (grid {1.0,1.5,2.0,3.0}) is the inverse-vol
-    # exposure cap — a float multiplier, NOT a lookback. atr_fast_period (96),
-    # atr_slow_period (960) and atr_stop_period (14) are fixed plain-int
-    # lookbacks — never grid-searched but threaded through build_grid() so
-    # _max_lookback_bars() returns 960. `session` is a fixed param. These are
-    # the concrete set the sanity checker runs generate_positions() against.
-    "range_lookback": 24,
-    "squeeze_ratio": 1.0,
-    "target_atr_mult": 2.0,
+    # orb_minutes (grid {30,60,90}) is a minutes-of-day window, NOT a bar-count
+    # lookback, so it is a float and must not feed _max_lookback_bars().
+    # buffer_frac (grid {0.0,0.1,0.25,0.5}) is a range-buffer fraction and
+    # stop_atr_mult (grid {0.75,1.0,1.5,2.0}) / target_atr_mult (grid
+    # {1.0,2.0,3.0,4.0}) are ATR multipliers — all floats, NOT lookbacks.
+    # atr_stop_period (14) is a fixed plain-int lookback, threaded through
+    # build_grid() so _max_lookback_bars() returns 14. `session` is a fixed
+    # param. These are the concrete set the sanity checker runs
+    # generate_positions() against.
+    "orb_minutes": 60.0,
+    "buffer_frac": 0.1,
     "stop_atr_mult": 2.0,
-    "size_cap": 2.0,
-    "atr_fast_period": ATR_FAST_PERIOD,
-    "atr_slow_period": ATR_SLOW_PERIOD,
+    "target_atr_mult": 2.0,
     "atr_stop_period": ATR_STOP_PERIOD,
     "session": "New York",
 }

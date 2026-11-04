@@ -1,0 +1,2 @@
+per_period_sharpe,n_obs,n_trials,psr,dsr,sharpe_ci_lo,sharpe_ci_hi,overfit_ratio,efficiency,sharpe_decay,rank_failure_rate,n_rank_folds
+-0.0018764056524735082,65168,9216,0.3158487117430644,3.79980160568916e-39,-1.3032989815047868,0.7342317470561317,inf,-0.13558532007003085,-0.035389710385320995,0.625,48
